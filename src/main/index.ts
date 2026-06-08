@@ -26,6 +26,7 @@ import { SlackWebhookServer } from './slack';
 import { TelemetryCollector } from './telemetry';
 import { ControlRegistry } from './control';
 import { ClaudeRuntime } from './runtime/claudeRuntime';
+import { NativeRuntime } from './runtime/nativeRuntime';
 
 const isDev = !!process.env.ELECTRON_RENDERER_URL;
 const ptyManager = new PtyManager();
@@ -140,16 +141,22 @@ const worktreeOrigins = new Map<string, string>();
  * onExit) is a harmless no-op. Best-effort — every step is wrapped so a teardown
  * error can never crash the caller (an IPC handler or node-pty's onExit).
  */
+/** Archive an agent on exit — drop its breaker state and flag it archived in the
+ *  hive. agentId-keyed, so PTY exits and native-worker exits share one lifecycle
+ *  (E003 AD-004). Best-effort. */
+function archiveAgent(agentId: string): void {
+  try { breaker.forget(agentId); } catch { /* best-effort */ }
+  if (hive.enabled()) {
+    try { hive.setArchived(agentId, true); } catch (e) { console.error('[hive] setArchived failed:', e); }
+  }
+}
+
 function teardownPty(id: string): void {
   // 1) Archive the agent — retained + flagged; only live-PTY agents are active.
   const agentId = ptyToAgent.get(id);
   if (agentId) {
     ptyToAgent.delete(id);
-    // Drop breaker state so a dead agent can't leak/zombie a tripped level.
-    try { breaker.forget(agentId); } catch { /* best-effort */ }
-    if (hive.enabled()) {
-      try { hive.setArchived(agentId, true); } catch (e) { console.error('[hive] setArchived failed:', e); }
-    }
+    archiveAgent(agentId);
   }
   // 2) Remove the isolated worktree, if any. Non-blocking; errors are logged.
   const wtPath = worktreePaths.get(id);
@@ -165,6 +172,17 @@ function teardownPty(id: string): void {
 }
 // A natural PTY exit must run the same teardown as an explicit kill.
 ptyManager.setExitHandler(teardownPty);
+
+// E003 — native (non-Claude) agents run in isolated utilityProcess workers,
+// fronted by the ProviderRuntime port. The drain runs in MAIN (single-committer
+// hive); a worker exit reuses the same archive path as a PTY exit (AD-004).
+const nativeRuntime = new NativeRuntime({
+  drainForStop: (id) => (hive.enabled() ? hive.drainForStop(id) : { block: false }),
+  onWorkerExit: (id) => { archiveAgent(id); syncKeepAwake(); },
+  usageFor: (id) => usageProvider.getAgentUsage(id),
+  maxConcurrent: 15,
+  maxOldSpaceMb: 512
+});
 
 /** Keep the system from suspending the harness while agents are running.
  *  Windows Modern Standby suspends desktop apps (and their child `claude`
@@ -1007,6 +1025,7 @@ ipcMain.handle('app:confirmClose', () => {
   try { reflector.stop(); } catch (e) { console.error('[quit] reflector.stop:', e); }
   try { persist.close(); } catch (e) { console.error('[quit] persist.close:', e); }
   try { ptyManager.killAll(); } catch (e) { console.error('[quit] killAll:', e); }
+  try { nativeRuntime.killAll(); } catch (e) { console.error('[quit] nativeRuntime killAll:', e); }
   app.quit();
 });
 ipcMain.handle('app:cancelClose', () => {

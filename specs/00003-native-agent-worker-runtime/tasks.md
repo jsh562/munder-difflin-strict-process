@@ -36,10 +36,10 @@ description: "Task list for E003 Native Agent Worker Runtime"
 
 **The shared cross-process seam + protocol + the pure (electron-free) loop scaffold block every objective. Land these first (HINT-001). `agentLoop.ts` and `stubProvider.ts` MUST stay free of any electron/node-pty import so vitest runs them in Node (HINT-002).**
 
-- [ ] T001 [P] {TR-005} Create the ProviderCall seam in src/shared/providerCall.ts (AD-003) → exports: ProviderCall, ProviderTurn(toolUses,usage,endOfTurn), UsageDelta
-- [ ] T002 {TR-003} Create the typed worker IPC protocol (WorkerCommand / WorkerMessage unions per contract) in src/shared/workerProtocol.ts ← T001:UsageDelta → exports: WorkerCommand, WorkerMessage
-- [ ] T003 {TR-004} Create PURE agent-loop (no electron) in src/main/runtime/worker/agentLoop.ts: runAgentLoop drives request→tool_use→execute→tool_result ← T001:ProviderCall → exports: runAgentLoop(deps), AgentLoopDeps
-- [ ] T004 {TR-005} Create the deterministic stub ProviderCall (electron-free) in src/main/runtime/worker/stubProvider.ts: a tool call then end-of-turn ← T001:ProviderCall → exports: createStubProvider()
+- [X] T001 [P] {TR-005} Create the ProviderCall seam in src/shared/providerCall.ts (AD-003) → exports: ProviderCall, ProviderTurn(toolUses,usage,endOfTurn), UsageDelta
+- [X] T002 {TR-003} Create the typed worker IPC protocol (WorkerCommand / WorkerMessage unions per contract) in src/shared/workerProtocol.ts ← T001:UsageDelta → exports: WorkerCommand, WorkerMessage
+- [X] T003 {TR-004} Create PURE agent-loop (no electron) in src/main/runtime/worker/agentLoop.ts: runAgentLoop drives request→tool_use→execute→tool_result ← T001:ProviderCall → exports: runAgentLoop(deps), AgentLoopDeps
+- [X] T004 {TR-005} Create the deterministic stub ProviderCall (electron-free) in src/main/runtime/worker/stubProvider.ts: a tool call then end-of-turn ← T001:ProviderCall → exports: createStubProvider()
 
 ---
 
@@ -47,9 +47,9 @@ description: "Task list for E003 Native Agent Worker Runtime"
 
 **The tool-use cycle + pluggable seam are the engine. Validated end-to-end in Node with the stub provider (SC-003 ordered events, SC-007 cumulative-monotonic usage + contract fields). HINT-002.**
 
-- [ ] T005 [OBJ2] {TR-004} In src/main/runtime/worker/agentLoop.ts, emit ordered AgentEvents (turn-start→tool-start→tool-end→token-usage→stop) + cumulative-monotonic token-usage from UsageDelta after:T003
-- [ ] T006 [OBJ2] {TR-005} [COMPLETES TR-005] In src/main/runtime/worker/agentLoop.ts, wire the seam (deps.providerCall + deps.executeTool) so a stub or E006 adapter drives the loop ← T001:ProviderCall after:T005
-- [ ] T007 [P] [OBJ2] {TR-004} [COMPLETES TR-004] Add vitest src/main/runtime/__tests__/agentLoop.test.ts: stub loop emits ordered AgentEvents (SC-003), monotonic usage & tool/stop fields (SC-007) after:T004,T005 ← T003:runAgentLoop
+- [X] T005 [OBJ2] {TR-004} In src/main/runtime/worker/agentLoop.ts, emit ordered AgentEvents (turn-start→tool-start→tool-end→token-usage→stop) + cumulative-monotonic token-usage from UsageDelta after:T003
+- [X] T006 [OBJ2] {TR-005} [COMPLETES TR-005] In src/main/runtime/worker/agentLoop.ts, wire the seam (deps.providerCall + deps.executeTool) so a stub or E006 adapter drives the loop ← T001:ProviderCall after:T005
+- [X] T007 [P] [OBJ2] {TR-004} [COMPLETES TR-004] Add vitest src/main/runtime/__tests__/agentLoop.test.ts: stub loop emits ordered AgentEvents (SC-003), monotonic usage & tool/stop fields (SC-007) after:T004,T005 ← T003:runAgentLoop
 
 ---
 
@@ -57,9 +57,9 @@ description: "Task list for E003 Native Agent Worker Runtime"
 
 **Reproduce the Stop-hook autonomy without Claude Code: end-of-turn drains the inbox over IPC and continues, guarded against infinite loops. SC-004 continue/idle, SC-005 always-terminates. HINT-003/HINT-004. The drain ROUTE (worker→main→hive→worker) is finished in OBJ1 with the transport.**
 
-- [ ] T008 [OBJ3] {TR-006} In src/main/runtime/worker/agentLoop.ts, on endOfTurn call deps.requestDrain(): on `{block:true}` inject `reason` as the next user turn; on `{block:false}` go idle after:T006 → exports: AgentLoopDeps.requestDrain()
-- [ ] T009 [OBJ3] {TR-007} In src/main/runtime/worker/agentLoop.ts, add the stopActive-equivalent guard (a drain-created turn does NOT re-drain) + deps.caps maxTurns/maxHops bounding the loop after:T008
-- [ ] T010 [P] [OBJ3] {TR-006,TR-007} [COMPLETES TR-007] Add vitest src/main/runtime/__tests__/agentLoop.test.ts: continue/idle on drain (SC-004); loop-forever case halts via guard+caps (SC-005) after:T008,T009
+- [X] T008 [OBJ3] {TR-006} In src/main/runtime/worker/agentLoop.ts, on endOfTurn call deps.requestDrain(): on `{block:true}` inject `reason` as the next user turn; on `{block:false}` go idle after:T006 → exports: AgentLoopDeps.requestDrain()
+- [X] T009 [OBJ3] {TR-007} In src/main/runtime/worker/agentLoop.ts, add the stopActive-equivalent guard (a drain-created turn does NOT re-drain) + deps.caps maxTurns/maxHops bounding the loop after:T008
+- [X] T010 [P] [OBJ3] {TR-006,TR-007} [COMPLETES TR-007] Add vitest src/main/runtime/__tests__/agentLoop.test.ts: continue/idle on drain (SC-004); loop-forever case halts via guard+caps (SC-005) after:T008,T009
 
 ---
 
@@ -67,13 +67,13 @@ description: "Task list for E003 Native Agent Worker Runtime"
 
 **Host the pure loop in a real Electron utilityProcess fronted by the E001 ProviderRuntime port, with PTY-equivalent teardown, the drain route, and bounded resources. SC-002 is unit-tested over a FAKED transport (no electron); SC-001/SC-006 require the running app (app-smoke). HINT-005.**
 
-- [ ] T011 [OBJ1] {TR-003,TR-008} Add utilityProcess entry src/main/runtime/worker/agentWorker.ts: parentPort IPC ↔ runAgentLoop + bounded queue after:T004 ← T002:WorkerCommand ← T003:runAgentLoop
-- [ ] T012 [OBJ1] {TR-002,TR-003} [COMPLETES TR-003] Implement the E001 ProviderRuntime over a utilityProcess in src/main/runtime/nativeAgentWorker.ts after:T002,T011 → exports: NativeAgentWorker
-- [ ] T013 [OBJ1] {TR-008} In src/main/runtime/nativeAgentWorker.ts, fork the built agentWorker with execArgv `--max-old-space-size` (per-worker memory cap, AD-006) after:T011,T012
-- [ ] T014 [OBJ1] {TR-001} Add registry src/main/runtime/nativeRuntime.ts: spawn/track a worker per agentId; on exit run shared teardown like teardownPty (AD-004) ← T012:NativeAgentWorker → exports: NativeRuntime
-- [ ] T015 [OBJ1] {TR-006} In src/main/runtime/nativeRuntime.ts, route drainRequest → hive.drainForStop → drainResult over IPC (worker never touches hive git; AD-005) ← hive.ts:drainForStop after:T002,T014
-- [ ] T016 [OBJ1] {TR-008} In src/main/runtime/nativeRuntime.ts, enforce a floor-wide concurrency cap (~5–15 workers) on spawn (AD-006) after:T014
-- [ ] T017 [P] [OBJ1] {TR-002} [COMPLETES TR-002] Add vitest src/main/runtime/__tests__/nativeAgentWorker.test.ts: drive every ProviderRuntime method over a FAKED transport (SC-002) after:T012
+- [X] T011 [OBJ1] {TR-003,TR-008} Add utilityProcess entry src/main/runtime/worker/agentWorker.ts: parentPort IPC ↔ runAgentLoop + bounded queue after:T004 ← T002:WorkerCommand ← T003:runAgentLoop
+- [X] T012 [OBJ1] {TR-002,TR-003} [COMPLETES TR-003] Implement the E001 ProviderRuntime over a utilityProcess in src/main/runtime/nativeAgentWorker.ts after:T002,T011 → exports: NativeAgentWorker
+- [X] T013 [OBJ1] {TR-008} In src/main/runtime/nativeAgentWorker.ts, fork the built agentWorker with execArgv `--max-old-space-size` (per-worker memory cap, AD-006) after:T011,T012
+- [X] T014 [OBJ1] {TR-001} Add registry src/main/runtime/nativeRuntime.ts: spawn/track a worker per agentId; on exit run shared teardown like teardownPty (AD-004) ← T012:NativeAgentWorker → exports: NativeRuntime
+- [X] T015 [OBJ1] {TR-006} In src/main/runtime/nativeRuntime.ts, route drainRequest → hive.drainForStop → drainResult over IPC (worker never touches hive git; AD-005) ← hive.ts:drainForStop after:T002,T014
+- [X] T016 [OBJ1] {TR-008} In src/main/runtime/nativeRuntime.ts, enforce a floor-wide concurrency cap (~5–15 workers) on spawn (AD-006) after:T014
+- [X] T017 [P] [OBJ1] {TR-002} [COMPLETES TR-002] Add vitest src/main/runtime/__tests__/nativeAgentWorker.test.ts: drive every ProviderRuntime method over a FAKED transport (SC-002) after:T012
 
 ---
 
@@ -81,10 +81,10 @@ description: "Task list for E003 Native Agent Worker Runtime"
 
 **Build-entry registration, main-process wiring, and the green-gates + app-smoke that prove SC-001/SC-006 on the real Electron utilityProcess (cannot run in vitest).**
 
-- [ ] T018 {TR-001} Add the `agentWorker` entry to the main build in electron.vite.config.ts rollupOptions.input so it builds to out/main/agentWorker.js (AD-001) after:T011
-- [ ] T019 {TR-001,TR-006} [COMPLETES TR-006] Wire src/main/index.ts: instantiate NativeRuntime, pass the drainForStop route + shared teardownPty + usage provider (AD-004) ← T014:NativeRuntime after:T015,T018
-- [ ] T020 Run gates green: `npm run typecheck`, `npm run lint`, `npm run test:run` (vitest forks pool) all pass after:T019
-- [ ] T021 {TR-001,TR-008} [COMPLETES TR-001] [COMPLETES TR-008] App-smoke via `npm run dev`: kill/crash a worker → teardown, main alive (SC-001); 5 workers, one crash isolated (SC-006) after:T020
+- [X] T018 {TR-001} Add the `agentWorker` entry to the main build in electron.vite.config.ts rollupOptions.input so it builds to out/main/agentWorker.js (AD-001) after:T011
+- [X] T019 {TR-001,TR-006} [COMPLETES TR-006] Wire src/main/index.ts: instantiate NativeRuntime, pass the drainForStop route + shared teardownPty + usage provider (AD-004) ← T014:NativeRuntime after:T015,T018
+- [X] T020 Run gates green: `npm run typecheck`, `npm run lint`, `npm run test:run` (vitest forks pool) all pass after:T019
+- [X] T021 {TR-001,TR-008} [COMPLETES TR-001] [COMPLETES TR-008] App-smoke via `npm run dev`: kill/crash a worker → teardown, main alive (SC-001); 5 workers, one crash isolated (SC-006) after:T020
 
 ---
 

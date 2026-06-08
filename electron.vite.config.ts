@@ -7,7 +7,12 @@ export default defineConfig({
     plugins: [externalizeDepsPlugin()],
     build: {
       rollupOptions: {
-        input: { index: resolve(__dirname, 'src/main/index.ts') }
+        input: {
+          index: resolve(__dirname, 'src/main/index.ts'),
+          // E003 — the native agent worker entry, forked as an Electron
+          // utilityProcess (built to out/main/agentWorker.js).
+          agentWorker: resolve(__dirname, 'src/main/runtime/worker/agentWorker.ts')
+        }
       }
     }
   },
