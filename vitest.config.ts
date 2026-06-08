@@ -8,6 +8,8 @@ export default defineConfig({
     environment: 'node',
     include: ['src/**/*.test.ts'],
     // The Electron app is not built/launched in tests; only pure logic runs.
-    pool: 'threads'
+    // `forks` over `threads`: more isolated and avoids the intermittent
+    // "No test suite found" flake the threads pool hits under concurrent transforms.
+    pool: 'forks'
   }
 });

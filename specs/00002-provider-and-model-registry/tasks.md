@@ -35,7 +35,7 @@
 
 **The single repo-config change: keep the new registry test out of the web typecheck (HINT-005, AD-002). Land it early so subsequent test work doesn't break `npm run typecheck`.**
 
-- [ ] T001 Add `"exclude": ["src/**/__tests__/**", "src/**/*.test.ts"]` to tsconfig.web.json so the `src/shared` registry test is not pulled into the web typecheck (node tsconfig already excludes it)
+- [X] T001 Add `"exclude": ["src/**/__tests__/**", "src/**/*.test.ts"]` to tsconfig.web.json so the `src/shared` registry test is not pulled into the web typecheck (node tsconfig already excludes it)
 
 ---
 
@@ -43,8 +43,8 @@
 
 **The registry module is one shared file consumed by all three objectives; create its types + empty module skeleton first so OBJ1/OBJ2/OBJ3 tasks have a stable surface to extend (HINT-001). Blocks every delivery phase.**
 
-- [ ] T002 {TR-001} Create registry type definitions (Provider, Model, PriceRow, ProviderModelRegistry, PriceLookupKey) in src/shared/providerRegistry.ts, re-using the E001 CapabilityDescriptor + pricing.ts TokenSplit shapes after:T001 → see data-model.md
-- [ ] T003 {TR-001,TR-004} Add `normalizeModel` (reuse the variant-suffix regex) and lookup scaffolding (`listProviders`, `lookupModel` returning null on miss) in src/shared/providerRegistry.ts ← T002:Provider,Model → exports: listProviders(), lookupModel(providerId,modelId), normalizeModel(model)
+- [X] T002 {TR-001} Create registry type definitions (Provider, Model, PriceRow, ProviderModelRegistry, PriceLookupKey) in src/shared/providerRegistry.ts, re-using the E001 CapabilityDescriptor + pricing.ts TokenSplit shapes after:T001 → see data-model.md
+- [X] T003 {TR-001,TR-004} Add `normalizeModel` (reuse the variant-suffix regex) and lookup scaffolding (`listProviders`, `lookupModel` returning null on miss) in src/shared/providerRegistry.ts ← T002:Provider,Model → exports: listProviders(), lookupModel(providerId,modelId), normalizeModel(model)
 
 ---
 
@@ -52,9 +52,9 @@
 
 **Canonical, extensible provider/model catalog with metadata lookup (context window, endpoint, origin). Satisfies TR-001 and the metadata half of seed TR-006; validated by SC-001.**
 
-- [ ] T004 [OBJ1] {TR-006} Seed Provider+Model metadata for anthropic/Claude (opus/sonnet/haiku 4.x), deepseek (V4-class), minimax (M3) — id, displayName, contextWindow, defaultEndpoint, originLabel — in src/shared/providerRegistry.ts after:T003 ← T002:Provider,Model → exports: PROVIDER_REGISTRY
-- [ ] T005 [OBJ1] {TR-001} Implement metadata query so `lookupModel(providerId, modelId)` returns context window / endpoint / origin and unseeded ids resolve only as data edits (no consumer-code change) in src/shared/providerRegistry.ts after:T004 ← T004:PROVIDER_REGISTRY → exports: lookupModel
-- [ ] T006 [P] [OBJ1] {TR-001} Test: SC-001 — seeded models return metadata (context window/endpoint/origin) and a registry-data-added model resolves with no consumer-code change, in src/shared/__tests__/providerRegistry.test.ts after:T005 ← T005:lookupModel
+- [X] T004 [OBJ1] {TR-006} Seed Provider+Model metadata for anthropic/Claude (opus/sonnet/haiku 4.x), deepseek (V4-class), minimax (M3) — id, displayName, contextWindow, defaultEndpoint, originLabel — in src/shared/providerRegistry.ts after:T003 ← T002:Provider,Model → exports: PROVIDER_REGISTRY
+- [X] T005 [OBJ1] {TR-001} Implement metadata query so `lookupModel(providerId, modelId)` returns context window / endpoint / origin and unseeded ids resolve only as data edits (no consumer-code change) in src/shared/providerRegistry.ts after:T004 ← T004:PROVIDER_REGISTRY → exports: lookupModel
+- [X] T006 [P] [OBJ1] {TR-001} Test: SC-001 — seeded models return metadata (context window/endpoint/origin) and a registry-data-added model resolves with no consumer-code change, in src/shared/__tests__/providerRegistry.test.ts after:T005 ← T005:lookupModel
 
 ---
 
@@ -62,15 +62,15 @@
 
 **Dated, cache-split, context-tiered price rows; a fail-loud price lookup; cost = token split × selected row, replacing the Sonnet default while preserving Claude values. Satisfies TR-002/003/004/007/008; validated by SC-002/003/005/006/007.**
 
-- [ ] T007 [OBJ2] {TR-002} Seed dated PriceRow arrays per model (input/output/cacheRead/cacheWrite perM + effectiveDate); Claude rows EXACTLY match pricing.ts OPUS/SONNET/HAIKU values; DeepSeek cache hit/miss split; flag confirm-at-build-time figures — in src/shared/providerRegistry.ts after:T004 ← T002:PriceRow,Model
-- [ ] T008 [OBJ2] {TR-003} Seed Minimax M3 two-tier rows (base + long-context `contextTierThreshold ≈ 512_000`, higher rate) in src/shared/providerRegistry.ts after:T007 ← T002:PriceRow
-- [ ] T009 [OBJ2] {TR-002,TR-003} Implement `lookupPrice(modelId, opts?)` row selection — normalize id, date filter (latest effectiveDate ≤ `at`, VR-3), deterministic tier match (VR-4) — in src/shared/providerRegistry.ts after:T008 ← T002:PriceRow → exports: lookupPrice(modelId,opts)
-- [ ] T010 [OBJ2] {TR-004} Add fail-loud branch to lookupPrice: unknown/unseeded id emits a loud warning + returns the `{ unknown: true }` sentinel (never another model's row, never a throw that crashes the reconciler), removing DEFAULT_PRICE=SONNET — in src/shared/providerRegistry.ts after:T009 ← T009:lookupPrice → exports: lookupPrice
-- [ ] T011 [OBJ2] {TR-007,TR-008} Implement `computeCost(modelId, tokens, opts?)` = Σ tokens_k × price_k / 1e6 from the selected row (VR-6); return `{ usd, bestEffort }` with bestEffort+surfaced gap on a missing required field, never a wrong default (VR-7) — in src/shared/providerRegistry.ts after:T010 → exports: computeCost(modelId,tokens,opts)
-- [ ] T012 [P] [OBJ2] {TR-002,TR-003} Test: SC-002 — known-model lookup returns the correct dated/tiered row, exercising DeepSeek cache hit/miss and Minimax context-tier selection, in src/shared/__tests__/providerRegistry.test.ts after:T011 ← T009:lookupPrice
-- [ ] T013 [P] [OBJ2] {TR-004} Test: SC-003 — unknown model id produces a loud failure (warning + sentinel) and zero silent wrong-price defaults, in src/shared/__tests__/providerRegistry.test.ts after:T011 ← T010:lookupPrice
-- [ ] T014 [P] [OBJ2] {TR-007} Test: SC-005 — cost from token split × selected row matches expected provider-accurate values within tolerance for seeded providers, in src/shared/__tests__/providerRegistry.test.ts after:T011 ← T011:computeCost
-- [ ] T015 [P] [OBJ2] {TR-008} [COMPLETES TR-008] Test: SC-007 — missing required usage field degrades to documented best-effort (bestEffort flag + surfaced gap), never a wrong-vendor default, in src/shared/__tests__/providerRegistry.test.ts after:T011 ← T011:computeCost
+- [X] T007 [OBJ2] {TR-002} Seed dated PriceRow arrays per model (input/output/cacheRead/cacheWrite perM + effectiveDate); Claude rows EXACTLY match pricing.ts OPUS/SONNET/HAIKU values; DeepSeek cache hit/miss split; flag confirm-at-build-time figures — in src/shared/providerRegistry.ts after:T004 ← T002:PriceRow,Model
+- [X] T008 [OBJ2] {TR-003} Seed Minimax M3 two-tier rows (base + long-context `contextTierThreshold ≈ 512_000`, higher rate) in src/shared/providerRegistry.ts after:T007 ← T002:PriceRow
+- [X] T009 [OBJ2] {TR-002,TR-003} Implement `lookupPrice(modelId, opts?)` row selection — normalize id, date filter (latest effectiveDate ≤ `at`, VR-3), deterministic tier match (VR-4) — in src/shared/providerRegistry.ts after:T008 ← T002:PriceRow → exports: lookupPrice(modelId,opts)
+- [X] T010 [OBJ2] {TR-004} Add fail-loud branch to lookupPrice: unknown/unseeded id emits a loud warning + returns the `{ unknown: true }` sentinel (never another model's row, never a throw that crashes the reconciler), removing DEFAULT_PRICE=SONNET — in src/shared/providerRegistry.ts after:T009 ← T009:lookupPrice → exports: lookupPrice
+- [X] T011 [OBJ2] {TR-007,TR-008} Implement `computeCost(modelId, tokens, opts?)` = Σ tokens_k × price_k / 1e6 from the selected row (VR-6); return `{ usd, bestEffort }` with bestEffort+surfaced gap on a missing required field, never a wrong default (VR-7) — in src/shared/providerRegistry.ts after:T010 → exports: computeCost(modelId,tokens,opts)
+- [X] T012 [P] [OBJ2] {TR-002,TR-003} Test: SC-002 — known-model lookup returns the correct dated/tiered row, exercising DeepSeek cache hit/miss and Minimax context-tier selection, in src/shared/__tests__/providerRegistry.test.ts after:T011 ← T009:lookupPrice
+- [X] T013 [P] [OBJ2] {TR-004} Test: SC-003 — unknown model id produces a loud failure (warning + sentinel) and zero silent wrong-price defaults, in src/shared/__tests__/providerRegistry.test.ts after:T011 ← T010:lookupPrice
+- [X] T014 [P] [OBJ2] {TR-007} Test: SC-005 — cost from token split × selected row matches expected provider-accurate values within tolerance for seeded providers, in src/shared/__tests__/providerRegistry.test.ts after:T011 ← T011:computeCost
+- [X] T015 [P] [OBJ2] {TR-008} [COMPLETES TR-008] Test: SC-007 — missing required usage field degrades to documented best-effort (bestEffort flag + surfaced gap), never a wrong-vendor default, in src/shared/__tests__/providerRegistry.test.ts after:T011 ← T011:computeCost
 
 ---
 
@@ -78,9 +78,9 @@
 
 **Per-model CapabilityDescriptor (image / MCP / web-search / caching) conforming to the E001 shape, queryable by consumers. Satisfies TR-005; validated by SC-004.**
 
-- [ ] T016 [OBJ3] {TR-006} Seed CapabilityDescriptor per seeded model — Claude all `true`; DeepSeek and Minimax all `false` (VR-9) — attached to each Model in src/shared/providerRegistry.ts after:T004 ← T002:CapabilityDescriptor
-- [ ] T017 [OBJ3] {TR-005} Implement `lookupCapabilities(modelId)` returning the model's E001 CapabilityDescriptor, or `EMPTY_CAPABILITY_DESCRIPTOR` for an unknown id, in src/shared/providerRegistry.ts after:T016 ← src/shared/providerRuntime.ts:EMPTY_CAPABILITY_DESCRIPTOR → exports: lookupCapabilities(modelId)
-- [ ] T018 [P] [OBJ3] {TR-005} Test: SC-004 — capabilities for 100% of seeded providers are queryable and correctly declare image/MCP/web-search/caching, including an unsupported-feature case returning `false`, in src/shared/__tests__/providerRegistry.test.ts after:T017 ← T017:lookupCapabilities
+- [X] T016 [OBJ3] {TR-006} Seed CapabilityDescriptor per seeded model — Claude all `true`; DeepSeek and Minimax all `false` (VR-9) — attached to each Model in src/shared/providerRegistry.ts after:T004 ← T002:CapabilityDescriptor
+- [X] T017 [OBJ3] {TR-005} Implement `lookupCapabilities(modelId)` returning the model's E001 CapabilityDescriptor, or `EMPTY_CAPABILITY_DESCRIPTOR` for an unknown id, in src/shared/providerRegistry.ts after:T016 ← src/shared/providerRuntime.ts:EMPTY_CAPABILITY_DESCRIPTOR → exports: lookupCapabilities(modelId)
+- [X] T018 [P] [OBJ3] {TR-005} Test: SC-004 — capabilities for 100% of seeded providers are queryable and correctly declare image/MCP/web-search/caching, including an unsupported-feature case returning `false`, in src/shared/__tests__/providerRegistry.test.ts after:T017 ← T017:lookupCapabilities
 
 ---
 
@@ -88,10 +88,10 @@
 
 **Wire pricing.ts to the registry (compat shim, AD-002), prove no Claude regression, and run the repo gates. Cross-cuts OBJ1/OBJ2/OBJ3 because the shim depends on the full lookup/cost surface.**
 
-- [ ] T019 {TR-007} Convert src/main/pricing.ts to a thin shim: `estimateCostUsd`/`priceFor` delegate to registry computeCost/lookupPrice; re-export `normalizeModel`; keep `ModelPrice`/`TokenSplit` so transcript.ts/telemetry.ts imports are unchanged (HINT-004) after:T011 → exports: estimateCostUsd, normalizeModel, priceFor
-- [ ] T020 {TR-007} [COMPLETES TR-007] Test: SC-006 — `estimateCostUsd` is bit-identical to the prior family-string table for seeded Claude models (OPUS/SONNET/HAIKU regression comparison), in src/shared/__tests__/providerRegistry.test.ts after:T019 ← T019:estimateCostUsd
-- [ ] T021 [P] {TR-001,TR-006} [COMPLETES TR-006] Test: registry shim contract — transcript.ts/telemetry.ts still resolve `normalizeModel`/`estimateCostUsd`; assert seed structural invariants (provider/model/priceRow non-empty, contextWindow>0, all perM≥0, valid ISO effectiveDate — VR-10) in src/shared/__tests__/providerRegistry.test.ts after:T019 ← T019:normalizeModel
-- [ ] T022 Run repo gates — `npm run typecheck`, `npm run lint`, `npm run test:run` — and resolve any failures so the registry + shim land green (constraint: all three stay green) after:T020 after:T021
+- [X] T019 {TR-007} Convert src/main/pricing.ts to a thin shim: `estimateCostUsd`/`priceFor` delegate to registry computeCost/lookupPrice; re-export `normalizeModel`; keep `ModelPrice`/`TokenSplit` so transcript.ts/telemetry.ts imports are unchanged (HINT-004) after:T011 → exports: estimateCostUsd, normalizeModel, priceFor
+- [X] T020 {TR-007} [COMPLETES TR-007] Test: SC-006 — `estimateCostUsd` is bit-identical to the prior family-string table for seeded Claude models (OPUS/SONNET/HAIKU regression comparison), in src/shared/__tests__/providerRegistry.test.ts after:T019 ← T019:estimateCostUsd
+- [X] T021 [P] {TR-001,TR-006} [COMPLETES TR-006] Test: registry shim contract — transcript.ts/telemetry.ts still resolve `normalizeModel`/`estimateCostUsd`; assert seed structural invariants (provider/model/priceRow non-empty, contextWindow>0, all perM≥0, valid ISO effectiveDate — VR-10) in src/shared/__tests__/providerRegistry.test.ts after:T019 ← T019:normalizeModel
+- [X] T022 Run repo gates — `npm run typecheck`, `npm run lint`, `npm run test:run` — and resolve any failures so the registry + shim land green (constraint: all three stay green) after:T020 after:T021
 
 ---
 
