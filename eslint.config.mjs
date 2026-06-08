@@ -1,9 +1,11 @@
-// Flat ESLint config (ESLint 9 + typescript-eslint). Lints the app source under
+// Flat ESLint config (ESLint 10 + typescript-eslint). Lints the app source under
 // /src. Pragmatic ruleset for an existing prototype: recommended correctness
-// rules as errors; stylistic/strictness noise relaxed to warnings or off so the
-// gate is meaningful without drowning the never-linted existing codebase.
+// rules as errors; stylistic/strictness noise that the never-linted existing
+// codebase trips is relaxed to warnings or off so the gate is meaningful without
+// a mass rewrite. Tighten incrementally (the TODO(LINTER) ratchet).
 import js from '@eslint/js';
 import tseslint from 'typescript-eslint';
+import reactHooks from 'eslint-plugin-react-hooks';
 
 export default tseslint.config(
   {
@@ -30,7 +32,21 @@ export default tseslint.config(
       '@typescript-eslint/no-explicit-any': 'off',
       '@typescript-eslint/no-unused-vars': ['warn', { argsIgnorePattern: '^_', varsIgnorePattern: '^_' }],
       '@typescript-eslint/no-empty-function': 'off',
-      'no-empty': ['warn', { allowEmptyCatch: true }]
+      'no-empty': ['warn', { allowEmptyCatch: true }],
+      // Existing pragmatic patterns in the v0.2.x codebase — surface, don't block.
+      'no-useless-assignment': 'warn',
+      // Terminal/ANSI parsing intentionally matches control chars (e.g. \x1b).
+      'no-control-regex': 'off'
+    }
+  },
+  {
+    // The renderer already annotates hooks deps; register the plugin so those
+    // directives resolve. Kept as warnings (incremental adoption).
+    files: ['src/renderer/**/*.{ts,tsx}'],
+    plugins: { 'react-hooks': reactHooks },
+    rules: {
+      'react-hooks/rules-of-hooks': 'warn',
+      'react-hooks/exhaustive-deps': 'warn'
     }
   }
 );

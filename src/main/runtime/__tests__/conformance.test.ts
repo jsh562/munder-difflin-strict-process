@@ -8,7 +8,7 @@ describe('ProviderRuntime conformance (Claude adapter)', () => {
   it('exercises start/send/stop/kill/getUsage/subscribe/capabilities', async () => {
     const written: string[] = [];
     let killed = false;
-    let usage = usageSnapshot({ input: 5 });
+    const usage = usageSnapshot({ input: 5 });
 
     const port: ProviderRuntime = new ClaudeAdapter({
       agentId: 'agent.conform',
