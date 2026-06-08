@@ -1,0 +1,10 @@
+# Research — Provider runtime and event bus (E001)
+
+## Ports-and-adapters for multi-LLM runtimes
+Mature multi-provider agent stacks isolate vendor differences behind one port and normalize each provider's native format into a canonical representation before dispatching to shared consumers. The harness applies this as a `ProviderRuntime` port: a Claude adapter wraps the existing PTY+hooks path; future native adapters run an SDK loop. Keeping provider-specific types inside adapters is what lets avatars, telemetry, budgets, and the breaker stay provider-agnostic and makes "add a provider" additive. Sources: dev.to provider-strategy pattern; strongdm/attractor unified-llm-spec.
+
+## Normalized agent-event contract design
+A single internal event vocabulary must carry enough to drive four consumers at once: station-mapping (avatars), token/cost (telemetry), the autonomy loop (hive), and the transcript view. Minimum set: turn start/end, thinking, text-delta, tool-start/tool-end, token-usage, api-error, stop, needs-input. Token-usage must be cumulative and monotonic because the breaker diffs consecutive samples for velocity. Provider divergences (cumulative-vs-delta usage, reasoning/thinking, streamed tool-call assembly) are normalized inside adapters, never on the bus. OTel GenAI span/metric conventions are a useful reference vocabulary. Sources: OpenTelemetry GenAI semantic conventions; HIVE/SAD event model.
+
+## Behavior-preserving refactor (parity)
+Routing an already-shipping runtime behind a new boundary risks silent regressions in consumers that depend on current signal shapes. The accepted mitigation is a parity baseline: capture current avatar station transitions, per-agent token/cost telemetry, budget/breaker behavior, and terminal output, then assert the post-refactor Claude adapter reproduces them with zero change. Design the contract for additive versioning so later adapters extend it without breaking consumers. Sources: SAD ADR-0001/0002; project Testing & Quality Policy (typecheck gate + critical-path tests).

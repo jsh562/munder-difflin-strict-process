@@ -25,6 +25,7 @@ import { listIssues, listCIRuns } from './github';
 import { SlackWebhookServer } from './slack';
 import { TelemetryCollector } from './telemetry';
 import { ControlRegistry } from './control';
+import { ClaudeRuntime } from './runtime/claudeRuntime';
 
 const isDev = !!process.env.ELECTRON_RENDERER_URL;
 const ptyManager = new PtyManager();
@@ -66,9 +67,24 @@ let breakerBeatTimer: ReturnType<typeof setInterval> | null = null;
 // Feed the breaker's api_error-storm trip from Oscar's OTel api_error spans —
 // Jim's one breaker input with no on-branch source (telemetry.onApiError seam).
 telemetry.onApiError((agentId) => breaker.recordError(agentId));
+// E001 — provider-runtime seam: one Claude adapter per agent behind the
+// ProviderRuntime port, fed additively by the hook + PTY signals below. The
+// adapter emits the normalized AgentEvent stream; the translator can reproduce
+// the legacy hive:hookEvent payload but its live send stays OFF here, so the
+// existing IPC + autonomy paths are byte-identical (zero behavior change).
+const claudeRuntime = new ClaudeRuntime({
+  usage: usageProvider,
+  ptyWrite: (id, text) => { ptyManager.write(id, text); },
+  ptyKill: (id) => { ptyManager.kill(id); },
+  sessionIdFor: (id) => hive.registry().agents[id]?.sessionId ?? null
+});
+ptyManager.setDataObserver((id, data) => claudeRuntime.ingestPtyData(id, data));
 // HookServer needs BOTH: Oscar's control registry (HITL pause/gate/steer/halt via
 // hook returns) AND Jim's breaker (feed recordToolUse on each PostToolUse).
-const hookServer = new HookServer(hive, () => liveWebContents(), () => readConfig(), control, breaker);
+const hookServer = new HookServer(
+  hive, () => liveWebContents(), () => readConfig(), control, breaker,
+  (p) => claudeRuntime.ingestHook(p)
+);
 const memory = new MemoryManager(
   () => readConfig().harnessHome,
   () => { const c = readConfig(); return { enabled: c.semanticMemory !== false, model: c.embeddingModel ?? 'minilm' }; }

@@ -53,7 +53,11 @@ export class HookServer {
     private control?: ControlRegistry,
     /** Circuit breaker (Lane A #6.6b) — fed the hook-derived signals (session id,
      *  repeated identical tool calls). Optional so the server still runs without it. */
-    private breaker?: CircuitBreaker
+    private breaker?: CircuitBreaker,
+    /** E001 — additive sink that feeds the Claude ProviderRuntime adapter the raw
+     *  hook payload, so it can emit the normalized AgentEvent stream. Does NOT
+     *  change any existing IPC send or the Stop-drain autonomy below. */
+    private onHook?: (p: HookPayload) => void
   ) {}
 
   start(): void {
@@ -98,6 +102,10 @@ export class HookServer {
     if (agentId && typeof p.transcript_path === 'string' && p.transcript_path) {
       this.transcriptPaths.set(agentId, p.transcript_path);
     }
+
+    // E001 — additively feed the provider-runtime adapter the raw payload. Guarded
+    // so it can never alter the hook response or throw into the socket handler.
+    try { this.onHook?.(p); } catch { /* observer must never affect the hook */ }
 
     // Status-line payloads carry the session's EXACT context accounting —
     // current tokens AND the real window size (200k vs 1M, which nothing else
