@@ -33,9 +33,9 @@
 
 **The `providerKeys` config field + the pure `credentials.ts` module skeleton block OBJ1, OBJ2, and OBJ3 and all downstream wiring (HINT-001). Land them first.**
 
-- [ ] T001 {TR-001,TR-005} Add optional `providerKeys?: Record<string,string>` to `HarnessConfig` in src/main/config.ts (persisted in config.json under app.getPath('userData'), beside slack* secrets, outside any repo) → exports: HarnessConfig.providerKeys
-- [ ] T002 {TR-006} Create electron-free pure module src/main/credentials.ts with `import type { HarnessConfig } from './config'` and NO hive/telemetry/transcript import; declare `SafeConfig = Omit<HarnessConfig,'providerKeys'> & { providerKeyPresence: Record<string,boolean> }` (AD-004, HINT-002) after:T001 ← T001:HarnessConfig.providerKeys → exports: SafeConfig
-- [ ] T003 Create vitest scaffold src/main/__tests__/credentials.test.ts importing src/main/credentials.ts and a fake known-provider id list (no electron) (AD-004) after:T002
+- [X] T001 {TR-001,TR-005} Add optional `providerKeys?: Record<string,string>` to `HarnessConfig` in src/main/config.ts (persisted in config.json under app.getPath('userData'), beside slack* secrets, outside any repo) → exports: HarnessConfig.providerKeys
+- [X] T002 {TR-006} Create electron-free pure module src/main/credentials.ts with `import type { HarnessConfig } from './config'` and NO hive/telemetry/transcript import; declare `SafeConfig = Omit<HarnessConfig,'providerKeys'> & { providerKeyPresence: Record<string,boolean> }` (AD-004, HINT-002) after:T001 ← T001:HarnessConfig.providerKeys → exports: SafeConfig
+- [X] T003 Create vitest scaffold src/main/__tests__/credentials.test.ts importing src/main/credentials.ts and a fake known-provider id list (no electron) (AD-004) after:T002
 
 ---
 
@@ -43,10 +43,10 @@
 
 **Set/get/clear over a passed config object, keyed by E002 provider id, with unknown-provider rejection. Pure functions on `HarnessConfig` (vitest-tested).**
 
-- [ ] T004 [OBJ1] {TR-001} Implement `setKeyInConfig(cfg,providerId,key,knownProviderIds)` (returns new config; throws when providerId ∉ knownProviderIds), `getKeyFromConfig(cfg,providerId)` (key|null), `clearKeyInConfig(cfg,providerId)` (new config sans key) in src/main/credentials.ts after:T002 → exports: setKeyInConfig(), getKeyFromConfig(), clearKeyInConfig()
-- [ ] T005 [OBJ1] {TR-002,TR-001} [COMPLETES TR-002] Add `keyPresence(cfg,knownProviderIds): Record<string,boolean>` (presence only, values never included) in src/main/credentials.ts after:T004 → exports: keyPresence()
-- [ ] T006 [P] [OBJ1] {TR-001} Vitest SC-001: set→get→clear over a config object round-trips; updated config carries `providerKeys` so it persists across a readConfig/writeConfig cycle (config-object level) in src/main/__tests__/credentials.test.ts after:T004 ← T004:setKeyInConfig,getKeyFromConfig,clearKeyInConfig
-- [ ] T007 [P] [OBJ1] {TR-002} Vitest SC-002: `setKeyInConfig` rejects an unknown provider id and leaves the config unchanged; `keyPresence` keyed only by known providers in src/main/__tests__/credentials.test.ts after:T005 ← T005:keyPresence
+- [X] T004 [OBJ1] {TR-001} Implement `setKeyInConfig(cfg,providerId,key,knownProviderIds)` (returns new config; throws when providerId ∉ knownProviderIds), `getKeyFromConfig(cfg,providerId)` (key|null), `clearKeyInConfig(cfg,providerId)` (new config sans key) in src/main/credentials.ts after:T002 → exports: setKeyInConfig(), getKeyFromConfig(), clearKeyInConfig()
+- [X] T005 [OBJ1] {TR-002,TR-001} [COMPLETES TR-002] Add `keyPresence(cfg,knownProviderIds): Record<string,boolean>` (presence only, values never included) in src/main/credentials.ts after:T004 → exports: keyPresence()
+- [X] T006 [P] [OBJ1] {TR-001} Vitest SC-001: set→get→clear over a config object round-trips; updated config carries `providerKeys` so it persists across a readConfig/writeConfig cycle (config-object level) in src/main/__tests__/credentials.test.ts after:T004 ← T004:setKeyInConfig,getKeyFromConfig,clearKeyInConfig
+- [X] T007 [P] [OBJ1] {TR-002} Vitest SC-002: `setKeyInConfig` rejects an unknown provider id and leaves the config unchanged; `keyPresence` keyed only by known providers in src/main/__tests__/credentials.test.ts after:T005 ← T005:keyPresence
 
 ---
 
@@ -54,9 +54,9 @@
 
 **The single function that returns the spawn env for a provider (key → env, no key → null). The swap point a future OS-keychain backend replaces (TR-006).**
 
-- [ ] T008 [OBJ2] {TR-003,TR-007} Implement `injectionEnvForProvider(cfg,providerId): Record<string,string>|null` returning `{ NATIVE_PROVIDER_API_KEY:<key>, NATIVE_PROVIDER_ID:<providerId> }` or null when no key (no empty/garbage env) in src/main/credentials.ts after:T004 ← T004:getKeyFromConfig → exports: injectionEnvForProvider()
-- [ ] T009 [P] [OBJ2] {TR-003} Vitest SC-003: `injectionEnvForProvider` returns the generic key→env map for a stored key (AD-003) in src/main/__tests__/credentials.test.ts after:T008 ← T008:injectionEnvForProvider
-- [ ] T010 [P] [OBJ2] {TR-007} [COMPLETES TR-007] Vitest SC-006: `injectionEnvForProvider` returns null (not an empty/garbage object, no throw) when the provider has no key in src/main/__tests__/credentials.test.ts after:T008 ← T008:injectionEnvForProvider
+- [X] T008 [OBJ2] {TR-003,TR-007} Implement `injectionEnvForProvider(cfg,providerId): Record<string,string>|null` returning `{ NATIVE_PROVIDER_API_KEY:<key>, NATIVE_PROVIDER_ID:<providerId> }` or null when no key (no empty/garbage env) in src/main/credentials.ts after:T004 ← T004:getKeyFromConfig → exports: injectionEnvForProvider()
+- [X] T009 [P] [OBJ2] {TR-003} Vitest SC-003: `injectionEnvForProvider` returns the generic key→env map for a stored key (AD-003) in src/main/__tests__/credentials.test.ts after:T008 ← T008:injectionEnvForProvider
+- [X] T010 [P] [OBJ2] {TR-007} [COMPLETES TR-007] Vitest SC-006: `injectionEnvForProvider` returns null (not an empty/garbage object, no throw) when the provider has no key in src/main/__tests__/credentials.test.ts after:T008 ← T008:injectionEnvForProvider
 
 ---
 
@@ -64,10 +64,10 @@
 
 **Redaction of `providerKeys` to `SafeConfig` + the value-absence test, the source-scan import-boundary test, and the store-location path assertion (SC-004/005/007).**
 
-- [ ] T011 [OBJ3] {TR-008,TR-004} Implement `redactConfig(cfg): SafeConfig` — strips `providerKeys`, adds `providerKeyPresence` (presence only); the ONLY shape sent to the renderer in src/main/credentials.ts after:T005 ← T005:keyPresence ← T002:SafeConfig → exports: redactConfig()
-- [ ] T012 [P] [OBJ3] {TR-004,TR-008} Vitest SC-004 (value-absence): a set key's value appears NOWHERE in `JSON.stringify(redactConfig(cfg))`; `providerKeyPresence` is true without exposing the value in src/main/__tests__/credentials.test.ts after:T011 ← T011:redactConfig
-- [ ] T013 [P] [OBJ3] {TR-004} [COMPLETES TR-004] Vitest SC-004 (import boundary, E001-style source scan): assert src/main/credentials.ts source imports none of `hive`/`telemetry`/`transcript` (and no electron) in src/main/__tests__/credentials.test.ts after:T002
-- [ ] T014 [P] [OBJ3] {TR-005} [COMPLETES TR-005] Vitest SC-005 (path assertion): assert the credential store resolves under `app.getPath('userData')/config.json` (config.ts `configPath`) — outside any registered repo in src/main/__tests__/credentials.test.ts after:T001
+- [X] T011 [OBJ3] {TR-008,TR-004} Implement `redactConfig(cfg): SafeConfig` — strips `providerKeys`, adds `providerKeyPresence` (presence only); the ONLY shape sent to the renderer in src/main/credentials.ts after:T005 ← T005:keyPresence ← T002:SafeConfig → exports: redactConfig()
+- [X] T012 [P] [OBJ3] {TR-004,TR-008} Vitest SC-004 (value-absence): a set key's value appears NOWHERE in `JSON.stringify(redactConfig(cfg))`; `providerKeyPresence` is true without exposing the value in src/main/__tests__/credentials.test.ts after:T011 ← T011:redactConfig
+- [X] T013 [P] [OBJ3] {TR-004} [COMPLETES TR-004] Vitest SC-004 (import boundary, E001-style source scan): assert src/main/credentials.ts source imports none of `hive`/`telemetry`/`transcript` (and no electron) in src/main/__tests__/credentials.test.ts after:T002
+- [X] T014 [P] [OBJ3] {TR-005} [COMPLETES TR-005] Vitest SC-005 (path assertion): assert the credential store resolves under `app.getPath('userData')/config.json` (config.ts `configPath`) — outside any registered repo in src/main/__tests__/credentials.test.ts after:T001
 
 ---
 
@@ -75,12 +75,12 @@
 
 **Live electron-coupled wiring (thin): redact the `config:get` IPC, add the credentials IPC, inject env at the native spawn, move preload + the renderer to `SafeConfig`, and gate. No new pure logic here.**
 
-- [ ] T015 {TR-008} [COMPLETES TR-008] Change the `config:get` handler (~L821) to return `redactConfig(readConfig())` and type it `SafeConfig` in src/main/index.ts; do NOT widen the pre-existing Slack-secret exposure (AD-002, HINT-003) after:T011 ← T011:redactConfig
-- [ ] T016 {TR-001,TR-002} Add IPC handlers `credentials:set(providerId,key)` / `credentials:clear(providerId)` (validate vs `listProviders()`, apply the pure fn, `writeConfig`) and `credentials:presence()` (→ `keyPresence`) in src/main/index.ts after:T005 ← T005:setKeyInConfig,clearKeyInConfig,keyPresence ← src/shared/providerRegistry.ts:listProviders
-- [ ] T017 {TR-003} [COMPLETES TR-003] Thread an optional `providerId` into `makeElectronWorkerTransport` and pass `env: injectionEnvForProvider(readConfig(),providerId) ?? undefined` to `utilityProcess.fork` (additive; no providerId ⇒ no key env) in src/main/runtime/electronWorkerTransport.ts after:T008 ← T008:injectionEnvForProvider
-- [ ] T018 {TR-008} Change `getConfig` to return `SafeConfig` and add `credentials.set/clear/presence` bridges in src/preload/index.ts after:T015 after:T016
-- [ ] T019 {TR-001,TR-008} Add a minimal Settings surface (per-provider key presence from `credentials:presence`; enter sends value renderer→main via `credentials:set`; clear via `credentials:clear`; value never received main→renderer) in src/renderer/src/components/SettingsModal.tsx after:T018
-- [ ] T020 Run `npm run typecheck` && `npm run lint` && `npm run test:run` (vitest, forks) and fix any failures until all three are green
+- [X] T015 {TR-008} [COMPLETES TR-008] Change the `config:get` handler (~L821) to return `redactConfig(readConfig())` and type it `SafeConfig` in src/main/index.ts; do NOT widen the pre-existing Slack-secret exposure (AD-002, HINT-003) after:T011 ← T011:redactConfig
+- [X] T016 {TR-001,TR-002} Add IPC handlers `credentials:set(providerId,key)` / `credentials:clear(providerId)` (validate vs `listProviders()`, apply the pure fn, `writeConfig`) and `credentials:presence()` (→ `keyPresence`) in src/main/index.ts after:T005 ← T005:setKeyInConfig,clearKeyInConfig,keyPresence ← src/shared/providerRegistry.ts:listProviders
+- [X] T017 {TR-003} [COMPLETES TR-003] Thread an optional `providerId` into `makeElectronWorkerTransport` and pass `env: injectionEnvForProvider(readConfig(),providerId) ?? undefined` to `utilityProcess.fork` (additive; no providerId ⇒ no key env) in src/main/runtime/electronWorkerTransport.ts after:T008 ← T008:injectionEnvForProvider
+- [X] T018 {TR-008} Change `getConfig` to return `SafeConfig` and add `credentials.set/clear/presence` bridges in src/preload/index.ts after:T015 after:T016
+- [X] T019 {TR-001,TR-008} Add a minimal Settings surface (per-provider key presence from `credentials:presence`; enter sends value renderer→main via `credentials:set`; clear via `credentials:clear`; value never received main→renderer) in src/renderer/src/components/SettingsModal.tsx after:T018
+- [X] T020 Run `npm run typecheck` && `npm run lint` && `npm run test:run` (vitest, forks) and fix any failures until all three are green
 
 ---
 

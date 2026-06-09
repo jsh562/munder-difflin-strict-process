@@ -27,6 +27,8 @@ import { TelemetryCollector } from './telemetry';
 import { ControlRegistry } from './control';
 import { ClaudeRuntime } from './runtime/claudeRuntime';
 import { NativeRuntime } from './runtime/nativeRuntime';
+import { redactConfig, injectionEnvForProvider, keyPresence, setKeyInConfig, clearKeyInConfig, type SafeConfig } from './credentials';
+import { listProviders } from '../shared/providerRegistry';
 
 const isDev = !!process.env.ELECTRON_RENDERER_URL;
 const ptyManager = new PtyManager();
@@ -180,6 +182,7 @@ const nativeRuntime = new NativeRuntime({
   drainForStop: (id) => (hive.enabled() ? hive.drainForStop(id) : { block: false }),
   onWorkerExit: (id) => { archiveAgent(id); syncKeepAwake(); },
   usageFor: (id) => usageProvider.getAgentUsage(id),
+  credentialEnvFor: (providerId) => injectionEnvForProvider(readConfig(), providerId),
   maxConcurrent: 15,
   maxOldSpaceMb: 512
 });
@@ -818,8 +821,30 @@ ipcMain.handle('terminal:openAtFolder', async (_evt, cwd: unknown) => {
 });
 
 // ─── IPC: config ────────────────────────────────────────────────────────────
-ipcMain.handle('config:get', (): HarnessConfig => readConfig());
+// E004 — config:get is REDACTED: the renderer never receives provider key values,
+// only presence (providerKeyPresence). Keys live in config.json + a worker's
+// spawn env, never anywhere the renderer can read.
+ipcMain.handle('config:get', (): SafeConfig => redactConfig(readConfig()));
 ipcMain.handle('config:update', (_evt, patch: Partial<HarnessConfig>) => writeConfig(patch));
+
+// E004 — provider credentials. Set/clear validate against the E002 registry; the
+// renderer only ever learns presence, never values.
+ipcMain.handle('credentials:set', (_evt, providerId: unknown, key: unknown) => {
+  if (typeof providerId !== 'string' || typeof key !== 'string' || !key) return { ok: false, error: 'invalid' };
+  try {
+    const known = listProviders().map((p) => p.id);
+    writeConfig({ providerKeys: setKeyInConfig(readConfig(), providerId, key, known).providerKeys });
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+});
+ipcMain.handle('credentials:clear', (_evt, providerId: unknown) => {
+  if (typeof providerId !== 'string') return { ok: false, error: 'invalid' };
+  writeConfig({ providerKeys: clearKeyInConfig(readConfig(), providerId).providerKeys });
+  return { ok: true };
+});
+ipcMain.handle('credentials:presence', () => keyPresence(readConfig(), listProviders().map((p) => p.id)));
 ipcMain.handle('config:ensureHome', (_evt, path: unknown) => {
   if (typeof path !== 'string' || path.length === 0) return { ok: false, error: 'invalid path' };
   return ensureHarnessHome(path);

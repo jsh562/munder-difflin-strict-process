@@ -151,6 +151,12 @@ export interface HarnessConfig {
   slackChannelId?: string;
   /** Local HTTP port the webhook server binds to (default 3847). */
   slackPort?: number;
+  /** Per-provider API keys for native (non-Claude) providers (E004), keyed by
+   *  provider id (src/shared/providerRegistry). Plaintext at rest — an ACCEPTED
+   *  MVP risk (ADR-0007). NEVER sent to the renderer (redacted via redactConfig),
+   *  the git hive, transcripts, or telemetry; injected only into a native worker's
+   *  spawn env. A future OS-keychain backend swaps in behind the injection seam. */
+  providerKeys?: Record<string, string>;
 
   // ─── Memory reflection (the janitor's condense half) ───────────────────────
   /** Master toggle for the in-process MemoryReflector. Default on. */

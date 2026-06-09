@@ -123,6 +123,9 @@ export interface HarnessConfig {
   circuitBreaker?: CircuitBreakerConfig;
   /** Terminal theme, mirrored into each agent's per-session Claude settings. */
   terminalTheme?: 'light' | 'dark';
+  /** E004 — redacted presence map (true ⇒ a key is stored) the renderer receives
+   *  from `config:get`. Raw provider keys never cross the bridge. */
+  providerKeyPresence?: Record<string, boolean>;
 }
 
 export interface MemoryStatus {
@@ -303,6 +306,18 @@ const api = {
    *  on failure (e.g. copy error) returns { ok: false, error }. */
   changeHome: (newHome: string, mode: 'move' | 'fresh'): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('config:changeHome', { newHome, mode }),
+
+  // ─── Provider credentials (E004) ─────────────────────────────────────────
+  /** Store/clear/inspect provider API keys. Keys travel main→store only; the
+   *  renderer can set a key and read presence, but never read a key back. */
+  credentials: {
+    set: (providerId: string, key: string): Promise<{ ok: boolean; error?: string }> =>
+      ipcRenderer.invoke('credentials:set', providerId, key),
+    clear: (providerId: string): Promise<{ ok: boolean; error?: string }> =>
+      ipcRenderer.invoke('credentials:clear', providerId),
+    presence: (): Promise<Record<string, boolean>> =>
+      ipcRenderer.invoke('credentials:presence')
+  },
 
   // ─── Filesystem (sandboxed to cwd) ───────────────────────────────────────
   listDir: (root: string, rel: string): Promise<

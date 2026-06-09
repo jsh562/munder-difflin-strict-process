@@ -119,6 +119,44 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
   const [slackBusy, setSlackBusy] = useState(false);
   const [slackNote, setSlackNote] = useState('');
 
+  // Provider API keys (E004). The renderer only ever learns *presence* (true ⇒ a
+  // key is stored) — raw key values never cross the bridge. Drafts are write-only.
+  const [keyPresence, setKeyPresence] = useState<Record<string, boolean>>({});
+  const [keyDraft, setKeyDraft] = useState<Record<string, string>>({});
+  const [keyBusy, setKeyBusy] = useState<string | null>(null);
+  const [keyNote, setKeyNote] = useState('');
+  const refreshPresence = () =>
+    window.cth.credentials.presence().then(setKeyPresence).catch(() => { /* keep last */ });
+
+  const saveKey = async (providerId: string) => {
+    const key = (keyDraft[providerId] ?? '').trim();
+    if (!key) return;
+    setKeyBusy(providerId); setKeyNote('');
+    try {
+      const res = await window.cth.credentials.set(providerId, key);
+      if (res.ok) {
+        setKeyDraft((d) => ({ ...d, [providerId]: '' }));
+        setKeyNote(`${providerId} key saved`);
+        await refreshPresence();
+      } else {
+        setKeyNote(res.error ?? 'failed to save');
+      }
+    } catch (e) {
+      setKeyNote(e instanceof Error ? e.message : String(e));
+    } finally { setKeyBusy(null); }
+  };
+
+  const removeKey = async (providerId: string) => {
+    setKeyBusy(providerId); setKeyNote('');
+    try {
+      await window.cth.credentials.clear(providerId);
+      setKeyNote(`${providerId} key cleared`);
+      await refreshPresence();
+    } catch (e) {
+      setKeyNote(e instanceof Error ? e.message : String(e));
+    } finally { setKeyBusy(null); }
+  };
+
   // Re-seed every editable field from the on-disk config when the modal opens.
   // App's `config` prop is loaded once and never refreshed after a save, so
   // without this the saved budget / velocity / slack values show blank on reopen.
@@ -135,6 +173,7 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
       setSlackChannel(cc.slackChannelId ?? '');
       setSlackPort(String(cc.slackPort ?? 3847));
     }).catch(() => { /* keep prop-seeded values */ });
+    window.cth.credentials.presence().then((p) => { if (alive) setKeyPresence(p); }).catch(() => { /* none */ });
     return () => { alive = false; };
   }, []);
 
@@ -475,6 +514,58 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
                     </span>
                   </div>
                 )}
+              </div>
+
+              <div style={{ height: 2, background: 'var(--cth-ink-300)' }} />
+
+              {/* Provider API keys (E004) */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                  <span style={{ fontSize: 14, lineHeight: '20px', color: 'var(--cth-ink-900)' }}>
+                    Provider API keys
+                  </span>
+                  <span style={{ fontSize: 12, lineHeight: '16px', color: 'var(--cth-ink-500)' }}>
+                    Keys for native providers (DeepSeek, Minimax). Stored locally outside the
+                    hive and injected only into an agent's worker — never shown back or sent to git.
+                  </span>
+                </div>
+                {Object.keys(keyPresence).length === 0 ? (
+                  <span style={{ fontSize: 12, color: 'var(--cth-ink-500)' }}>No native providers registered.</span>
+                ) : (
+                  Object.keys(keyPresence).sort().map((providerId) => (
+                    <div key={providerId} style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}>
+                      <label style={{ display: 'flex', flexDirection: 'column', gap: 4, flex: 1 }}>
+                        <span style={slackLabelStyle}>
+                          {providerId}{keyPresence[providerId] ? ' — key set' : ' — no key'}
+                        </span>
+                        <input
+                          type="password"
+                          value={keyDraft[providerId] ?? ''}
+                          onChange={(e) => setKeyDraft((d) => ({ ...d, [providerId]: e.target.value }))}
+                          placeholder={keyPresence[providerId] ? '•••••• (enter to replace)' : `${providerId} API key`}
+                          style={{ ...slackInputStyle, fontFamily: 'var(--cth-font-mono)' }}
+                        />
+                      </label>
+                      <PixelButton
+                        variant="primary"
+                        size="sm"
+                        onClick={() => saveKey(providerId)}
+                        disabled={keyBusy === providerId || !(keyDraft[providerId] ?? '').trim()}
+                      >
+                        {keyBusy === providerId ? '…' : 'save'}
+                      </PixelButton>
+                      <PixelButton
+                        variant="secondary"
+                        size="sm"
+                        onClick={() => removeKey(providerId)}
+                        disabled={keyBusy === providerId || !keyPresence[providerId]}
+                      >
+                        clear
+                      </PixelButton>
+                    </div>
+                  ))
+                )}
+                {keyNote && <span style={{ fontSize: 12, color: 'var(--cth-ink-500)' }}>{keyNote}</span>}
               </div>
 
               <div style={{ height: 2, background: 'var(--cth-ink-300)' }} />

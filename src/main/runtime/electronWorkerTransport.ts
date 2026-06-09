@@ -10,12 +10,19 @@ import { join } from 'node:path';
 import type { WorkerCommand, WorkerMessage } from '../../shared/workerProtocol';
 import type { WorkerTransport } from './nativeAgentWorker';
 
-export function makeElectronWorkerTransport(opts: { agentId: string; maxOldSpaceMb?: number }): WorkerTransport {
+export function makeElectronWorkerTransport(opts: {
+  agentId: string;
+  maxOldSpaceMb?: number;
+  /** E004 — the provider credential env injected at spawn (e.g. NATIVE_PROVIDER_API_KEY). */
+  env?: Record<string, string>;
+}): WorkerTransport {
   // The worker entry is built beside index.js by electron-vite (out/main/agentWorker.js).
   const workerPath = join(__dirname, 'agentWorker.js');
   const child = utilityProcess.fork(workerPath, [], {
     serviceName: `native-agent-${opts.agentId}`,
-    execArgv: opts.maxOldSpaceMb ? [`--max-old-space-size=${opts.maxOldSpaceMb}`] : []
+    execArgv: opts.maxOldSpaceMb ? [`--max-old-space-size=${opts.maxOldSpaceMb}`] : [],
+    // Inject the credential over the normal env; absent ⇒ inherit (no key env).
+    env: opts.env ? ({ ...process.env, ...opts.env } as NodeJS.ProcessEnv) : undefined
   });
   return {
     post: (cmd: WorkerCommand) => { child.postMessage(cmd); },

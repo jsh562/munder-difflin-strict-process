@@ -21,6 +21,9 @@ export interface NativeRuntimeDeps {
   maxConcurrent?: number;
   /** Per-worker heap cap, MB (execArgv --max-old-space-size). */
   maxOldSpaceMb?: number;
+  /** E004 — the credential injection seam: provider id → spawn env, or null when
+   *  no key is set. Wired to `injectionEnvForProvider(readConfig(), providerId)`. */
+  credentialEnvFor?: (providerId: string) => Record<string, string> | null;
 }
 
 export class NativeRuntime {
@@ -28,14 +31,16 @@ export class NativeRuntime {
 
   constructor(private readonly deps: NativeRuntimeDeps) {}
 
-  spawn(agentId: string): { ok: boolean; error?: string } {
+  spawn(agentId: string, providerId?: string): { ok: boolean; error?: string } {
     if (this.workers.has(agentId)) return { ok: false, error: `native worker exists: ${agentId}` };
     const cap = this.deps.maxConcurrent ?? 15;
     if (this.workers.size >= cap) return { ok: false, error: `native concurrency cap (${cap}) reached` };
 
+    // E004 — inject the provider credential at spawn (none ⇒ no key env).
+    const env = providerId ? (this.deps.credentialEnvFor?.(providerId) ?? undefined) : undefined;
     const worker = new NativeAgentWorker({
       agentId,
-      transportFactory: () => makeElectronWorkerTransport({ agentId, maxOldSpaceMb: this.deps.maxOldSpaceMb }),
+      transportFactory: () => makeElectronWorkerTransport({ agentId, maxOldSpaceMb: this.deps.maxOldSpaceMb, env }),
       usageFallback: () => this.deps.usageFor?.(agentId) ?? null,
       onExit: (id) => { this.workers.delete(id); this.deps.onWorkerExit(id); },
       onDrainRequest: async (id) => this.deps.drainForStop(id)
