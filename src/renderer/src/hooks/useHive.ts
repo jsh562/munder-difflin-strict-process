@@ -523,4 +523,18 @@ export function useHive(config: HarnessConfig | null): void {
       }
     });
   }, [config?.onboardingComplete]);
+
+  // E005 {FR-013 / DR-10} — apply a GOD-forwarded assignment through the SAME
+  // agent-update path the operator uses: `reassignAgentModel` writes `model` +
+  // `assignmentSource='explicit'` and persists (survives restart). The provider was
+  // already derived + recorded main-side; the renderer only stores the model id
+  // (DR-1). The desk's PTY keeps its current `--model` until next (re)spawn — this
+  // records the assignment; live hot-swap is out of scope for E005 (CAP-019).
+  useEffect(() => {
+    return window.cth.agent.onAgentAssign(({ agentId, modelId }) => {
+      const { agents, reassignAgentModel } = useStore.getState();
+      if (!agents.some((a) => a.id === agentId)) return;
+      reassignAgentModel(agentId, modelId);
+    });
+  }, []);
 }

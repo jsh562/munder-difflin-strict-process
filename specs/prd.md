@@ -209,4 +209,6 @@ Context that downstream architecture design or governance work must preserve.
 
 ## Project Context Baseline Updates
 
-- (none yet — populated as downstream runs promote reusable project-level product context.)
+- **Agent assignment model**: A desk's provider/model is a per-agent setting with a house-wide **fleet default** that newly created agents inherit; existing agents keep their explicit choice and are never retroactively re-assigned when the default changes. This `AgentAssignment` (per-agent + fleet default) is a shared product concept consumed by later provider-execution and rendering work.
+- **Warn-at-assignment guardrail**: "Degrade gracefully, never silently break" has an assignment-time half — when an operator assigns a model that lacks a capability (images, MCP tools, web search, caching), a clear, non-blocking warning names the gap so the choice is informed; the warning never blocks the assignment (runtime degradation is the separate execution-time half).
+- **GOD-agent parity for operator actions**: Operator-facing configuration actions (e.g., assigning a provider/model) are also reachable programmatically by the GOD agent through the same mechanism, so orchestration and manual control stay consistent.

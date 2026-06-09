@@ -300,12 +300,50 @@ const api = {
     ipcRenderer.invoke('config:update', patch),
   ensureHarnessHome: (path: string): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('config:ensureHome', path),
+
+  // ─── Fleet default model (E005 / FR-005) ───────────────────────────────────
+  /** The house-wide default MODEL id (`HarnessConfig.defaultModel`) applied to new
+   *  agents that pick no explicit model. Thin passthrough over the existing
+   *  `config:get`/`config:update` IPC — NO new secret path; the provider is derived
+   *  from the id (DR-1), never stored. `getFleetDefault` returns the stored id (or
+   *  undefined ⇒ role-based fallback); `setFleetDefault` writes it (a blank string
+   *  clears it). Changing it is non-retroactive — existing agents keep their
+   *  creation-time snapshot (DR-4). */
+  fleetDefault: {
+    get: async (): Promise<string | undefined> => {
+      const cfg: HarnessConfig = await ipcRenderer.invoke('config:get');
+      const id = (cfg.defaultModel ?? '').trim();
+      return id.length ? id : undefined;
+    },
+    set: (modelId: string | undefined): Promise<HarnessConfig> =>
+      ipcRenderer.invoke('config:update', { defaultModel: (modelId ?? '').trim() || undefined } as Partial<HarnessConfig>)
+  },
   /** Change the harness home folder. 'move' copies the existing hive + palace
    *  into the new folder (old kept as a safety net); 'fresh' just re-points and
    *  bootstraps an empty home. On success the app relaunches (never resolves);
    *  on failure (e.g. copy error) returns { ok: false, error }. */
   changeHome: (newHome: string, mode: 'move' | 'fresh'): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('config:changeHome', { newHome, mode }),
+
+  // ─── Per-agent assignment seam (E005 / FR-013, DR-10) ──────────────────────
+  /** The GOD assignment seam. GOD assigns a provider+model to an agent
+   *  programmatically through the SAME mechanism the operator uses: `assign`
+   *  records the derived provider (main-side, for the E006 runtime seam) and
+   *  forwards the model to the renderer, which applies it via the existing
+   *  agent-update path (writing `model` + `assignmentSource='explicit'`, then
+   *  persisting). The provider is DERIVED from the model id (DR-1), never stored;
+   *  no secret path. `onAgentAssign` is the renderer-side subscription that applies
+   *  a forwarded assignment; returns an unsubscribe fn. */
+  agent: {
+    assign: (agentId: string, modelId: string | undefined):
+      Promise<{ ok: boolean; providerId: string | null; error?: string }> =>
+      ipcRenderer.invoke('agent:assign', agentId, modelId),
+    onAgentAssign: (cb: (e: { agentId: string; modelId: string }) => void): (() => void) => {
+      const listener = (_e: IpcRendererEvent, payload: { agentId: string; modelId: string }) => cb(payload);
+      ipcRenderer.on('agent:assigned', listener);
+      return () => ipcRenderer.removeListener('agent:assigned', listener);
+    }
+  },
 
   // ─── Provider credentials (E004) ─────────────────────────────────────────
   /** Store/clear/inspect provider API keys. Keys travel main→store only; the

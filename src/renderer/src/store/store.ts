@@ -10,6 +10,13 @@ export type ToolKind =
 export type StationKind =
   | 'shelf' | 'terminal' | 'web' | 'board' | 'mailbox' | 'mcp' | 'desk';
 
+/** E005 — the persisted half of an AgentAssignment's provenance. `'explicit'` =
+ *  the operator/GOD picked the model directly; `'fleet-default'` = inherited from
+ *  the house default at creation. Absent ⇒ the role-based fallback (never persisted
+ *  as `'role-based'`, DR-8/DR-9). The provider is DERIVED from `model`, never stored
+ *  (DR-1). Mirrors `StoredAssignmentSource` in `src/shared/assignment.ts`. */
+export type AssignmentSource = 'explicit' | 'fleet-default';
+
 export interface BlockReason {
   summary: string;                 // short headline shown on banner
   detail: string;                  // longer explanation
@@ -53,6 +60,13 @@ export interface Agent {
   /** the model this agent runs on (e.g. 'claude-sonnet-4-6[1m]'); drives the
    *  model selector + the --model arg used when (re)spawning the agent */
   model?: string;
+  /** E005 — provenance of this agent's `model` (DR-9): `'explicit'` when the
+   *  operator/GOD picked it, `'fleet-default'` when inherited from the house
+   *  default at creation. Absent ⇒ role-based fallback. Additive + independently
+   *  keyed (never touches E004's `providerKeys`, HINT-004); the provider is
+   *  derived from `model`, not stored here (DR-1). Survives the localStorage
+   *  round-trip via the `PersistedAgent` mapping below. */
+  assignmentSource?: AssignmentSource;
   /** the last prompt the user submitted to this agent in Claude Code —
    *  shown on the floor as a card above the seated avatar */
   lastPrompt?: string;
@@ -136,6 +150,20 @@ interface State {
   setGodStatus: (status: GodStatus) => void;
   select: (id: string) => void;
   updateAgent: (id: string, patch: Partial<Agent>) => void;
+  /** E005 {FR-003} — re-assign an existing desk to an explicit model (DR-1 state
+   *  machine: explicit/fleet-default → explicit). Overwrites `model` and sets
+   *  `assignmentSource='explicit'`, then PERSISTS the roster so the new binding
+   *  survives the localStorage round-trip (SC-006). The provider is DERIVED from
+   *  `model`, never stored here (DR-1). A stale model id is preserved verbatim —
+   *  this helper never resolves or remaps it (DR-5). No-op for an unknown id. */
+  reassignAgentModel: (id: string, modelId: string | undefined) => void;
+  /** E005 {FR-004} — revert a desk to inheriting the fleet default (DR-1 state
+   *  machine: explicit → fleet-default). Re-resolves the CURRENT fleet default onto
+   *  `model` and sets `assignmentSource='fleet-default'` (re-inherit, DR-4), then
+   *  PERSISTS. Pass the current default id (read from `cth.fleetDefault.get()` /
+   *  config `defaultModel`); `undefined` clears the desk back to the role-based
+   *  fallback (no `model`, no `assignmentSource`). No-op for an unknown id. */
+  revertAgentToFleetDefault: (id: string, fleetDefaultModelId: string | undefined) => void;
   pushFeed: (id: string, line: string) => void;
   addAgent: (agent: Agent) => void;
   removeAgent: (id: string) => void;
@@ -364,8 +392,48 @@ export const useStore = create<State>((set) => ({
     set((s) => ({ toolCounts: { ...s.toolCounts, [id]: (s.toolCounts[id] ?? 0) + 1 } })),
   setGodStatus: (status) => set({ godStatus: status }),
   select: (id) => set((s) => { persistAgents(s.agents, id); return { selectedId: id }; }),
+  // E005 INVARIANT (DR-4/DR-9/SC-004) — an agent's `model`/`assignmentSource` are a
+  // creation-time SNAPSHOT of the fleet default (or an explicit pick), frozen onto
+  // the record. The store NEVER re-derives an existing agent's model from the
+  // current fleet default: `addAgent` appends the already-resolved record (the
+  // drawer snapshots via resolveEffectiveModel, T017), and `updateAgent` applies
+  // only the explicit patch it is given. Therefore changing `config.defaultModel`
+  // later mutates NO existing agent — the change is non-retroactive (FR-006).
   updateAgent: (id, patch) =>
     set((s) => ({ agents: s.agents.map(a => a.id === id ? { ...a, ...patch } : a) })),
+  // E005 {FR-003} — re-assign per desk. Unlike `updateAgent` (used for transient
+  // run-state that needn't survive a reload), an assignment is a DURABLE choice, so
+  // we PERSIST the roster after applying it (SC-006 round-trip). The model id is
+  // stored verbatim — a stale id is preserved, never resolved/remapped (DR-5); the
+  // provider is derived from `model` downstream, never stored (DR-1).
+  reassignAgentModel: (id, modelId) =>
+    set((s) => {
+      if (!s.agents.some((a) => a.id === id)) return s;
+      const agents = s.agents.map((a) =>
+        a.id === id ? { ...a, model: modelId, assignmentSource: 'explicit' as const } : a
+      );
+      persistAgents(agents, s.selectedId);
+      return { agents };
+    }),
+  // E005 {FR-004} — revert to fleet default. Re-inherit the CURRENT default by
+  // snapshotting the passed-in id onto the record and marking the source
+  // 'fleet-default' (DR-4); an absent default clears the desk to the role-based
+  // fallback (no model / no source). PERSISTED like a re-assignment.
+  revertAgentToFleetDefault: (id, fleetDefaultModelId) =>
+    set((s) => {
+      if (!s.agents.some((a) => a.id === id)) return s;
+      const trimmed = (fleetDefaultModelId ?? '').trim();
+      const hasDefault = trimmed.length > 0;
+      const agents = s.agents.map((a) =>
+        a.id === id
+          ? hasDefault
+            ? { ...a, model: trimmed, assignmentSource: 'fleet-default' as const }
+            : { ...a, model: undefined, assignmentSource: undefined }
+          : a
+      );
+      persistAgents(agents, s.selectedId);
+      return { agents };
+    }),
   pushFeed: (id, line) =>
     set((s) => ({ feeds: { ...s.feeds, [id]: [...(s.feeds[id] ?? []), line] } })),
   addAgent: (agent) =>

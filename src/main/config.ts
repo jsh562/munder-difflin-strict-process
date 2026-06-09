@@ -102,7 +102,14 @@ export interface HarnessConfig {
   autoMode: boolean;
   /** The command we run when spawning a new agent. */
   defaultCommand: string;
-  /** Default model for newly spawned agents (e.g. 'claude-sonnet-4-6[1m]'); unset = CLI default. */
+  /** Default model for newly spawned agents (e.g. 'claude-sonnet-4-6[1m]'); unset = CLI default.
+   *  E005 FleetDefault (DR-1): this is the canonical, house-wide default MODEL id —
+   *  the single stored value of the fleet default. The provider is NOT stored here;
+   *  it is DERIVED from this model id at read time via the E002 registry
+   *  (`lookupModelInfo`), so the two never drift. Absence ⇒ the role-based fallback
+   *  applies (DR-8); a present-but-unresolvable id is a STALE default and falls
+   *  through to the role-based fallback at creation, never auto-remapped (DR-11).
+   *  Changing it is NON-RETROACTIVE — existing agents keep their snapshot (DR-4). */
   defaultModel?: string;
   /** Enable semantic memory (MemPalace CLI). No-op if mempalace isn't installed. */
   semanticMemory: boolean;
@@ -262,6 +269,21 @@ export function modelForRole(meta: RoleHint): string | undefined {
   const hay = `${meta.role ?? ''} ${(meta.capabilities ?? []).join(' ')}`.toLowerCase();
   if (/\b(triage|rout|verif|lint|format|summar|classif|label)/.test(hay)) return MODEL_HELPER;
   return MODEL_WORKER;
+}
+
+/** E005 {FR-005} — the configured FleetDefault MODEL id, or undefined when unset
+ *  (⇒ role-based fallback, DR-8). This reads the SINGLE stored value
+ *  (`defaultModel`) of the house default; the provider is DERIVED from the model id
+ *  at read time via the E002 registry (DR-1/HINT-001), never stored as a second
+ *  editable field, so they cannot drift. A blank string is treated as unset. The
+ *  id is returned VERBATIM — a present-but-unresolvable (stale) id is preserved and
+ *  surfaced for re-selection, never auto-remapped (DR-11); honoring DR-11 at
+ *  creation precedence is the resolver's job (src/shared/assignment.ts), which
+ *  treats a stale fleet default as absent. */
+export function fleetDefaultModel(config?: HarnessConfig): string | undefined {
+  const cfg = config ?? readConfig();
+  const id = (cfg.defaultModel ?? '').trim();
+  return id.length ? id : undefined;
 }
 
 /** Auto-suggested command string given current autoMode preference. */

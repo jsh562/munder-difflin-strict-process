@@ -3,6 +3,8 @@ import type { HarnessConfig } from '@/store/config';
 import { PixelPanel } from './PixelPanel';
 import { PixelButton } from './PixelButton';
 import { Icon } from './Icon';
+import { ProviderModelPicker } from './ProviderModelPicker';
+import { isAssignmentStale } from '@shared/assignment';
 
 export interface SettingsModalProps {
   config: HarnessConfig;
@@ -157,6 +159,43 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
     } finally { setKeyBusy(null); }
   };
 
+  // ─── Fleet default model (E005 / FR-005, FR-014) ─────────────────────────────
+  // The house-wide default MODEL id (HarnessConfig.defaultModel). Reuses the same
+  // ProviderModelPicker as the Add-Agent drawer; the provider is DERIVED from the
+  // id (DR-1), never stored. Persisted via the existing config:update IPC (no new
+  // secret path). Seeded from current config on open. Changing it is
+  // NON-RETROACTIVE — only agents created afterward inherit it (DR-4/FR-006), which
+  // the scope note below makes legible at the point of change (FR-014).
+  const [fleetDefault, setFleetDefault] = useState<string | undefined>(config.defaultModel);
+  const [fleetBusy, setFleetBusy] = useState(false);
+  const [fleetNote, setFleetNote] = useState('');
+  // A present-but-unresolvable stored default is STALE — preserve + flag it for
+  // re-selection, never auto-remap (DR-5/DR-11).
+  const fleetStale = isAssignmentStale(fleetDefault);
+
+  const saveFleetDefault = async () => {
+    setFleetBusy(true); setFleetNote('');
+    try {
+      await window.cth.fleetDefault.set(fleetDefault);
+      setFleetNote('saved');
+      setTimeout(() => setFleetNote(''), 1500);
+    } catch (e) {
+      setFleetNote(e instanceof Error ? e.message : String(e));
+    } finally { setFleetBusy(false); }
+  };
+
+  const clearFleetDefault = async () => {
+    setFleetBusy(true); setFleetNote('');
+    try {
+      await window.cth.fleetDefault.set(undefined);
+      setFleetDefault(undefined);
+      setFleetNote('cleared');
+      setTimeout(() => setFleetNote(''), 1500);
+    } catch (e) {
+      setFleetNote(e instanceof Error ? e.message : String(e));
+    } finally { setFleetBusy(false); }
+  };
+
   // Re-seed every editable field from the on-disk config when the modal opens.
   // App's `config` prop is loaded once and never refreshed after a save, so
   // without this the saved budget / velocity / slack values show blank on reopen.
@@ -172,6 +211,10 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
       setSlackSecret(cc.slackSigningSecret ?? '');
       setSlackChannel(cc.slackChannelId ?? '');
       setSlackPort(String(cc.slackPort ?? 3847));
+      // E005 — seed the fleet default from the freshly-read config (the prop is
+      // loaded once and never refreshed after a save).
+      const dm = (cc.defaultModel ?? '').trim();
+      setFleetDefault(dm.length ? dm : undefined);
     }).catch(() => { /* keep prop-seeded values */ });
     window.cth.credentials.presence().then((p) => { if (alive) setKeyPresence(p); }).catch(() => { /* none */ });
     return () => { alive = false; };
@@ -566,6 +609,55 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
                   ))
                 )}
                 {keyNote && <span style={{ fontSize: 12, color: 'var(--cth-ink-500)' }}>{keyNote}</span>}
+              </div>
+
+              <div style={{ height: 2, background: 'var(--cth-ink-300)' }} />
+
+              {/* Fleet default model (E005 / FR-005, FR-014) */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                  <span style={{ fontSize: 14, lineHeight: '20px', color: 'var(--cth-ink-900)' }}>
+                    Fleet default model
+                  </span>
+                  <span style={{ fontSize: 12, lineHeight: '16px', color: 'var(--cth-ink-500)' }}>
+                    The house default every new agent inherits when it doesn&rsquo;t pick its own
+                    model. The provider is derived from the model. Leave unset to fall back to the
+                    role-based default.
+                  </span>
+                  {/* FR-014 — non-retroactive scope note, legible at the point of change. */}
+                  <span style={{ fontSize: 12, lineHeight: '16px', color: 'var(--cth-ink-700)' }}>
+                    Changing this applies to agents created afterward only — existing agents keep
+                    their current model and are not changed.
+                  </span>
+                </div>
+
+                <ProviderModelPicker
+                  selectedModelId={fleetDefault}
+                  onChange={setFleetDefault}
+                  accent="mint"
+                />
+
+                {fleetStale && (
+                  <span style={{ fontSize: 12, lineHeight: '16px', color: '#6E1423' }}>
+                    The saved default (<code>{fleetDefault}</code>) is no longer in the registry —
+                    pick a current model. New agents fall back to the role-based default until you do.
+                  </span>
+                )}
+
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                  <PixelButton variant="secondary" size="sm" onClick={saveFleetDefault} disabled={fleetBusy}>
+                    {fleetBusy ? '…' : 'save'}
+                  </PixelButton>
+                  <PixelButton
+                    variant="ghost"
+                    size="sm"
+                    onClick={clearFleetDefault}
+                    disabled={fleetBusy || !fleetDefault}
+                  >
+                    clear
+                  </PixelButton>
+                  {fleetNote && <span style={{ fontSize: 12, color: 'var(--cth-mint)' }}>{fleetNote}</span>}
+                </div>
               </div>
 
               <div style={{ height: 2, background: 'var(--cth-ink-300)' }} />

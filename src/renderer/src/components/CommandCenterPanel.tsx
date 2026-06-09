@@ -9,11 +9,13 @@ import { TasksKanban } from './TasksKanban';
 import { disposeTerminal } from './terminalPool';
 import { Icon } from './Icon';
 import { MemoryGraphPanel } from './MemoryGraphPanel';
+import { ProviderModelPicker } from './ProviderModelPicker';
 import { useFleetTelemetry } from '@/hooks/useTelemetry';
 import { COMMAND_GROUPS } from '@shared/claudeCommands';
 import { useStore, type Agent } from '@/store/store';
 import { usePtyParser } from '@/hooks/usePtyParser';
-import { buildSpawnCommand, AGENT_MODELS } from '@/store/config';
+import { buildSpawnCommand } from '@/store/config';
+import { assignmentProvenance, isAssignmentStale } from '@shared/assignment';
 
 /** Michael's control surface. Shown instead of the plain terminal/files panel
  *  when the god agent is selected: terminal + queue, the floor roster (with
@@ -214,6 +216,11 @@ function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
   const agents = useStore((s) => s.agents);
   const select = useStore((s) => s.select);
   const updateAgent = useStore((s) => s.updateAgent);
+  // E005 {FR-003/FR-004} — per-desk re-assign + revert-to-default helpers. These
+  // persist the new binding (survives restart, SC-006); `restartWithModel` below
+  // also restarts the live PTY so the change takes effect immediately.
+  const reassignAgentModel = useStore((s) => s.reassignAgentModel);
+  const revertAgentToFleetDefault = useStore((s) => s.revertAgentToFleetDefault);
   const enrichEnabled = useStore((s) => s.enrichEnabled);
   const setEnrichEnabled = useStore((s) => s.setEnrichEnabled);
   const toolCounts = useStore((s) => s.toolCounts);
@@ -222,6 +229,10 @@ function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
   // AND live cost/usage in one place).
   const { samples, spark, rate, lastTool, breakers } = useFleetTelemetry();
   const [repos, setRepos] = useState<string[]>([]);
+  // E005 {FR-004} — the current house default model id (config `defaultModel`),
+  // read from the bridge. Drives the "revert to fleet default" action + the
+  // provenance label so a desk reads "fleet default" vs "custom".
+  const [fleetDefault, setFleetDefault] = useState<string | undefined>(undefined);
   // Floor-wide token budget (drives the breaker); also the token-meter denominator.
   const [tokenCap, setTokenCap] = useState<number | undefined>(undefined);
   // Per-agent token limit (overrides the floor budget for that agent), keyed by id.
@@ -248,6 +259,9 @@ function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
       setRepos(c.registeredRepos ?? []);
       setTokenCap(c.costCapTokens);
       setAgentTokenCaps(c.agentTokenCaps ?? {});
+      // E005 — the house default id (provider derived from it, DR-1); blank ⇒ unset.
+      const def = (c.defaultModel ?? '').trim();
+      setFleetDefault(def.length ? def : undefined);
     }).catch(() => { /* noop */ });
     window.cth.listMissions().then(setMissions).catch(() => { /* noop */ });
     // Refresh "last fired" when the scheduler stamps a beat/dispatch (#2.3).
@@ -290,7 +304,18 @@ function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
     to === 'broadcast' ? 'everyone' : to === 'god' ? 'Michael' : agents.find((a) => a.id === to)?.name ?? to;
   const intervalLabel = (ms: number) => INTERVAL_OPTS.find((o) => o.ms === ms)?.label ?? `${Math.round(ms / 3600000)}h`;
 
-  const restartWithModel = async (a: Agent, model: string | undefined) => {
+  // E005 {FR-003/FR-004} — change a desk's model (or revert it to the fleet
+  // default) AND restart its live PTY so the new `--model` takes effect. `source`
+  // records provenance: 'explicit' for an operator/GOD pick (re-assign), or
+  // 'fleet-default' when re-inheriting the house default. The persisted assignment
+  // (model + assignmentSource) is written via the store helpers below so it
+  // survives the localStorage round-trip (SC-006); `updateAgent` then carries the
+  // transient run-state (command/status) that needn't persist.
+  const restartWithModel = async (
+    a: Agent,
+    model: string | undefined,
+    source: 'explicit' | 'fleet-default'
+  ) => {
     if (!a.ptyId) return;
     setRestarting(a.id);
     try {
@@ -305,7 +330,14 @@ function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
         ? { id: a.id, name: a.name, cwd: a.cwd, isAssistant: true, role: "Michael's prep assistant" }
         : { id: a.id, name: a.name, cwd: a.cwd, role: a.description };
       const res = await window.cth.spawnPty({ id: a.ptyId, cwd: a.cwd, command: exe, args, cols: 100, rows: 30, hive });
-      if (res.ok) updateAgent(a.id, { command: command.trim(), model, status: 'idle', action: 'restarting…' });
+      if (res.ok) {
+        // Persist the durable assignment (model + provenance), then the transient
+        // run-state. Revert with no default clears the desk to the role-based
+        // fallback; otherwise it snapshots the chosen/default id.
+        if (source === 'fleet-default') revertAgentToFleetDefault(a.id, model);
+        else reassignAgentModel(a.id, model);
+        updateAgent(a.id, { command: command.trim(), status: 'idle', action: 'restarting…' });
+      }
     } catch { /* noop */ } finally {
       setRestarting(null);
     }
@@ -519,20 +551,13 @@ function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
                 </span>
               )}
             </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-              <Select
-                value={a.model ?? ''}
-                disabled={restarting === a.id}
-                onChange={(v) => restartWithModel(a, v || undefined)}
-              >
-                {AGENT_MODELS.map((m) => (
-                  <option key={m.label} value={m.id ?? ''}>{m.label}</option>
-                ))}
-              </Select>
-              <span style={{ fontSize: 11, color: 'var(--cth-ink-500)' }}>
-                {restarting === a.id ? 'restarting…' : 'model (restarts agent)'}
-              </span>
-            </div>
+            <AgentModelControl
+              agent={a}
+              fleetDefault={fleetDefault}
+              busy={restarting === a.id}
+              onPick={(id) => restartWithModel(a, id, 'explicit')}
+              onRevert={() => restartWithModel(a, fleetDefault, 'fleet-default')}
+            />
           </div>
           );
         })}
@@ -718,6 +743,142 @@ function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
         )}
       </Section>
     </Scroll>
+  );
+}
+
+// ─── Per-desk model assignment (E005 / FR-003, FR-004, US3) ──────────────────
+
+/** The per-agent provider+model change surface on the Floor roster — the REAL
+ *  per-desk edit-assignment control (the plan named AddAgentModal, but that is
+ *  creation-only; an EXISTING desk's model is changed here). Surfaces:
+ *   - a default-vs-custom provenance badge via `assignmentProvenance` (FR-004): a
+ *     desk reads "custom" when it carries an explicit pick, "fleet default" when it
+ *     inherits the house default, "role default" when neither is set, and "stale"
+ *     when its stored model id no longer resolves (DR-5, preserved + flagged);
+ *   - the shared `ProviderModelPicker` (FR-001/FR-009) to re-assign — provider
+ *     grouped, capability tags, non-blocking gap warning; picking restarts the PTY;
+ *   - a "revert to fleet default" action (FR-004) shown only when the desk is
+ *     custom AND a fleet default exists. Provider is DERIVED from the model (DR-1). */
+function AgentModelControl({
+  agent,
+  fleetDefault,
+  busy,
+  onPick,
+  onRevert
+}: {
+  agent: Agent;
+  fleetDefault: string | undefined;
+  busy: boolean;
+  onPick: (modelId: string) => void;
+  onRevert: () => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const stale = isAssignmentStale(agent.model);
+  // The persisted `assignmentSource` is the source of truth for the badge (a desk
+  // frozen as fleet-default reads "fleet default" even if resolution shifts). With
+  // no stored source and no model, the desk is on the role-based fallback.
+  const resolved = agent.assignmentSource ?? (agent.model ? 'explicit' : 'role-based');
+  const prov = assignmentProvenance(resolved, agent.assignmentSource);
+  const canRevert = prov.isCustom && !!fleetDefault;
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+        {/* Provenance badge — custom vs fleet default vs role default (FR-004). */}
+        <span
+          title={
+            stale
+              ? `This desk's model (${agent.model}) is no longer in the registry — pick a new one.`
+              : prov.isCustom
+              ? `Custom model for this desk: ${agent.model}`
+              : prov.isFleetDefault
+              ? `Inheriting the fleet default${agent.model ? ` (${agent.model})` : ''}`
+              : 'Using the role-based default model'
+          }
+          style={{
+            padding: '1px 6px 0',
+            fontFamily: 'var(--cth-font-ui)',
+            fontSize: 11,
+            lineHeight: '16px',
+            color: 'var(--cth-ink-900)',
+            background: stale
+              ? 'var(--cth-coral-light)'
+              : prov.isFleetDefault
+              ? 'var(--cth-mint-light)'
+              : 'var(--cth-cream-200)',
+            boxShadow: `inset 0 0 0 1px ${stale ? 'var(--cth-coral)' : 'var(--cth-ink-700)'}`
+          }}
+        >
+          {stale ? 'stale' : prov.label}
+        </span>
+        <span
+          style={{
+            flex: 1,
+            minWidth: 0,
+            fontFamily: 'var(--cth-font-mono)',
+            fontSize: 11,
+            color: 'var(--cth-ink-500)',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap'
+          }}
+        >
+          {agent.model ?? 'role default'}
+        </span>
+        <button
+          onClick={() => setEditing((v) => !v)}
+          disabled={busy}
+          style={{
+            flexShrink: 0,
+            padding: '2px 8px 1px',
+            border: 'none',
+            cursor: busy ? 'default' : 'pointer',
+            background: editing ? 'var(--cth-sky)' : 'var(--cth-cream-200)',
+            boxShadow: `inset 0 0 0 1px ${editing ? 'var(--cth-ink-900)' : 'var(--cth-ink-700)'}`,
+            fontFamily: 'var(--cth-font-ui)',
+            fontSize: 11,
+            color: 'var(--cth-ink-900)',
+            opacity: busy ? 0.6 : 1
+          }}
+        >
+          {busy ? 'restarting…' : editing ? 'close' : 'change model'}
+        </button>
+        {canRevert && (
+          <button
+            onClick={onRevert}
+            disabled={busy}
+            title={`Revert this desk to the fleet default (${fleetDefault})`}
+            style={{
+              flexShrink: 0,
+              padding: '2px 8px 1px',
+              border: 'none',
+              cursor: busy ? 'default' : 'pointer',
+              background: 'var(--cth-cream-200)',
+              boxShadow: 'inset 0 0 0 1px var(--cth-ink-700)',
+              fontFamily: 'var(--cth-font-ui)',
+              fontSize: 11,
+              color: 'var(--cth-ink-900)',
+              opacity: busy ? 0.6 : 1
+            }}
+          >
+            revert to default
+          </button>
+        )}
+      </div>
+      {editing && (
+        <ProviderModelPicker
+          selectedModelId={agent.model}
+          accent={agent.accent}
+          onChange={(id) => {
+            setEditing(false);
+            onPick(id);
+          }}
+        />
+      )}
+      <span style={{ fontSize: 11, color: 'var(--cth-ink-500)' }}>
+        changing the model restarts the agent
+      </span>
+    </div>
   );
 }
 

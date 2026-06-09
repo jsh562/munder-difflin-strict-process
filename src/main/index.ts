@@ -29,12 +29,63 @@ import { ClaudeRuntime } from './runtime/claudeRuntime';
 import { NativeRuntime } from './runtime/nativeRuntime';
 import { redactConfig, injectionEnvForProvider, keyPresence, setKeyInConfig, clearKeyInConfig, type SafeConfig } from './credentials';
 import { listProviders } from '../shared/providerRegistry';
+import { deriveProviderId } from '../shared/assignment';
 
 const isDev = !!process.env.ELECTRON_RENDERER_URL;
 const ptyManager = new PtyManager();
 /** Live PTY id → its hive agent id, recorded at spawn. The pty:kill handler only
  *  gets the PTY id, so this lets a closed tab archive the right registry agent. */
 const ptyToAgent = new Map<string, string>();
+/** E005 {FR-008} — agent id → the providerId DERIVED from the model the agent was
+ *  spawned with (explicit `--model` → defaultModel → role-based). Provider is
+ *  DERIVED from the model via the E002 registry, NOT stored on the agent record
+ *  (DR-1). Recorded at the spawn seam so the E006 native runtime
+ *  (`nativeRuntime.spawn(agentId, providerId?)`) can consume it; E005 records only
+ *  — it does not wire native execution. Absent ⇒ unresolvable/role-based model. */
+const agentProviderIds = new Map<string, string>();
+/** E005 {FR-008} — the providerId derived from an agent's spawned model, or
+ *  `undefined` when none resolved (role-based/unresolvable). The E006 native
+ *  runtime seam reads this to call `nativeRuntime.spawn(agentId, providerId)`. */
+export function providerIdForAgent(agentId: string): string | undefined {
+  return agentProviderIds.get(agentId);
+}
+
+/** E005 {FR-013 / DR-10} — the GOD assignment seam. Records a programmatic
+ *  per-agent provider+model assignment and forwards it to the renderer to apply
+ *  through the SAME agent-update path the operator uses (the renderer store's
+ *  `reassignAgentModel`, which writes `model` + `assignmentSource='explicit'` and
+ *  persists). Provider is DERIVED from the model id, NEVER stored on the record
+ *  (DR-1): here it is only recorded in `agentProviderIds` for the E006 native
+ *  runtime seam, exactly like the spawn path. No separate programmatic path and no
+ *  secret channel — same persistence + warning behavior as an operator pick (the
+ *  renderer's ProviderModelPicker surfaces the capability-gap warning on the next
+ *  open). `modelId` undefined/blank is rejected (an assignment must name a model);
+ *  a stale id is forwarded verbatim and preserved+flagged by the renderer, never
+ *  remapped (DR-5).
+ *
+ *  GOD invokes this via the `agent:assign` IPC channel (see the handler below) or
+ *  by importing this function in-process. Returns the derived providerId (or null
+ *  for an unresolvable/stale model — still recorded as a pending assignment). */
+export function assignAgentModel(agentId: string, modelId: string | undefined):
+  { ok: boolean; providerId: string | null; error?: string } {
+  if (typeof agentId !== 'string' || !agentId.trim()) {
+    return { ok: false, providerId: null, error: 'agentId required' };
+  }
+  const id = (modelId ?? '').trim();
+  if (!id) return { ok: false, providerId: null, error: 'modelId required' };
+  // Derive + record the provider for the E006 native runtime seam (DR-1); a stale
+  // model derives null and records nothing, but the assignment still forwards.
+  const providerId = deriveProviderId(id);
+  if (providerId) agentProviderIds.set(agentId, providerId);
+  else agentProviderIds.delete(agentId);
+  // Forward to the renderer to apply via the existing agent-update path. The
+  // renderer's useHive subscriber calls reassignAgentModel(agentId, id), so the
+  // GOD path writes the SAME fields and persists the SAME way as an operator pick.
+  // (Distinct channel from the `agent:assign` INVOKE handler — this is the push.)
+  try { liveWebContents()?.send('agent:assigned', { agentId, modelId: id }); }
+  catch { /* window tore down — the recorded providerId still stands */ }
+  return { ok: true, providerId };
+}
 const hive = new HiveManager(
   () => readConfig().harnessHome,
   (channel, payload) => { try { liveWebContents()?.send(channel, payload); } catch { /* window tore down */ } }
@@ -158,6 +209,8 @@ function teardownPty(id: string): void {
   const agentId = ptyToAgent.get(id);
   if (agentId) {
     ptyToAgent.delete(id);
+    // E005 — drop the derived-provider record alongside the agent (no leak).
+    agentProviderIds.delete(agentId);
     archiveAgent(agentId);
   }
   // 2) Remove the isolated worktree, if any. Non-blocking; errors are logged.
@@ -731,12 +784,25 @@ ipcMain.handle('pty:spawn', async (_evt, opts: SpawnOptions & { hive?: AgentMeta
   if (opts.hive) {
     const cfg = readConfig();
     const args = opts.args ?? [];
-    // Model precedence: an explicit per-agent --model (from the renderer) wins;
-    // else the user's global defaultModel; else the role-based default tier.
-    if (!args.includes('--model')) {
+    // Model precedence (UNCHANGED, DR-8): an explicit per-agent --model (from the
+    // renderer) wins; else the user's global defaultModel; else the role-based
+    // default tier. Track the explicit value so we can record its provider below.
+    const explicitIdx = args.indexOf('--model');
+    const explicitModel = explicitIdx >= 0 ? args[explicitIdx + 1] : undefined;
+    if (explicitIdx < 0) {
       const m = cfg.defaultModel ?? modelForRole(opts.hive);
       if (m) args.push('--model', m);
     }
+    // E005 {FR-008} — derive + record the providerId for the resolved model (the
+    // explicit --model when present, else the precedence result just pushed) so the
+    // E006 native runtime seam can consume it. Provider is DERIVED, never stored on
+    // the agent record (DR-1); an unresolvable/role-based model derives null and we
+    // simply record nothing. This does NOT change spawn behavior (Claude/PTY path
+    // is unaffected) — it only records a derivation for downstream.
+    const resolvedModel = explicitModel ?? cfg.defaultModel ?? modelForRole(opts.hive);
+    const providerId = deriveProviderId(resolvedModel);
+    if (providerId) agentProviderIds.set(opts.hive.id, providerId);
+    else agentProviderIds.delete(opts.hive.id);
     // Coarse runaway cap.
     if (typeof cfg.maxTurns === 'number' && cfg.maxTurns > 0 && !args.includes('--max-turns')) {
       args.push('--max-turns', String(cfg.maxTurns));
@@ -1240,6 +1306,20 @@ ipcMain.handle('slack:setConfig', (_evt, patch: unknown) => {
   const cfg = readConfig();
   if (!cfg.slackEnabled || !cfg.slackSigningSecret) stopSlackServer();
   return { ok: true };
+});
+
+// E005 {FR-013 / DR-10} — the GOD assignment seam over IPC. GOD assigns a
+// provider+model to an agent through the SAME mechanism as the operator: this
+// records the derived provider and forwards the model to the renderer, which
+// applies it via the existing agent-update path (reassignAgentModel). Provider is
+// derived, never stored (DR-1); no secret channel. Args are validated at the
+// boundary (defensive coding) before delegating to assignAgentModel.
+ipcMain.handle('agent:assign', (_evt, agentId: unknown, modelId: unknown) => {
+  if (typeof agentId !== 'string') return { ok: false, providerId: null, error: 'invalid agentId' };
+  if (modelId != null && typeof modelId !== 'string') {
+    return { ok: false, providerId: null, error: 'invalid modelId' };
+  }
+  return assignAgentModel(agentId, typeof modelId === 'string' ? modelId : undefined);
 });
 
 /** Start every hive-bound background service against the current harnessHome.

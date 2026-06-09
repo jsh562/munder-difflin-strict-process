@@ -1,12 +1,15 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { PixelPanel } from './PixelPanel';
 import { PixelButton } from './PixelButton';
 import { SpritePortrait } from './SpritePortrait';
 import { Icon } from './Icon';
+import { ProviderModelPicker } from './ProviderModelPicker';
 import { useStore, type Agent } from '@/store/store';
 import { OFFICE_CAST, DEFAULT_CHARACTER, type OfficeCharacterName } from '@/scene/office/cast';
 import { type AccentColorName } from '@/design/tokens';
-import { type HarnessConfig, buildSpawnCommand, AGENT_MODELS } from '@/store/config';
+import { type HarnessConfig, buildSpawnCommand } from '@/store/config';
+import { listProviders } from '@shared/providerRegistry';
+import { resolveEffectiveModel } from '@shared/assignment';
 
 const ACCENTS: AccentColorName[] = ['coral', 'mint', 'sky', 'lemon', 'lilac', 'peach'];
 
@@ -30,14 +33,28 @@ export function AddAgentModal({ onClose, config }: AddAgentModalProps) {
   const [character, setCharacter] = useState<OfficeCharacterName>(DEFAULT_CHARACTER);
   const [accent, setAccent] = useState<AccentColorName>('sky');
   const [cwd, setCwd] = useState<string>(config.registeredRepos[0] ?? '');
+  // The picker shows the fleet default pre-highlighted so the operator sees what a
+  // new agent will inherit; `explicitlyPicked` tracks whether they actually CHOSE a
+  // model (vs leaving the inherited default). This is what makes the
+  // snapshot-at-creation provenance honest (DR-4/HINT-002): inheriting the default
+  // is recorded as 'fleet-default', a deliberate pick as 'explicit' — even when the
+  // picked id equals the current default.
   const [model, setModel] = useState<string | undefined>(config.defaultModel);
+  const [explicitlyPicked, setExplicitlyPicked] = useState(false);
   const [command, setCommand] = useState(buildSpawnCommand(config, config.defaultModel));
   const [description, setDescription] = useState('a fresh harness');
 
-  // Picking a model rebuilds the command; the command field stays editable for
-  // power users (it's the source of truth for the actual spawn).
+  // E005 — whether the registry exposes any pickable model. When empty, the picker
+  // shows its empty-state and agent creation falls back to the existing role-based
+  // default (no explicit assignment recorded — DR-7/FR-012, T011).
+  const hasModels = useMemo(() => listProviders().some((p) => p.models.length > 0), []);
+
+  // Picking a model rebuilds the command and marks the choice EXPLICIT; the command
+  // field stays editable for power users (it's the source of truth for the actual
+  // spawn).
   const pickModel = (id?: string) => {
     setModel(id);
+    setExplicitlyPicked(true);
     setCommand(buildSpawnCommand(config, id));
   };
   const [goal, setGoal] = useState('');
@@ -87,6 +104,25 @@ export function AddAgentModal({ onClose, config }: AddAgentModalProps) {
       return;
     }
 
+    // E005 {FR-006} — snapshot the effective model + provenance onto the record AT
+    // CREATION (DR-4/HINT-002). An EXPLICIT pick wins; otherwise we inherit the
+    // current fleet default (config.defaultModel) and FREEZE it as a value — we
+    // store the resolved id, never a live reference, so a later change to the
+    // default does NOT mutate this agent (non-retroactive). With an empty registry
+    // (or nothing to resolve) the agent carries no assignment and falls through to
+    // the existing role-based default behavior (T011/DR-7). Provider is derived
+    // from `model`, not stored (DR-1).
+    const resolved = hasModels
+      ? resolveEffectiveModel({
+          explicitModelId: explicitlyPicked ? model : undefined,
+          fleetDefaultModelId: config.defaultModel
+        })
+      : { modelId: undefined, source: 'none' as const };
+    const assignmentSource =
+      resolved.source === 'explicit' || resolved.source === 'fleet-default'
+        ? resolved.source
+        : undefined;
+
     const agent: Agent = {
       id,
       name: name.trim(),
@@ -103,7 +139,11 @@ export function AddAgentModal({ onClose, config }: AddAgentModalProps) {
       currentStation: 'desk',
       ptyId,
       command: command.trim(),
-      model,
+      // The snapshotted effective model (explicit pick → fleet default), or the
+      // operator's raw `model` when nothing resolved (empty registry → still feeds
+      // the command they may have hand-edited).
+      model: resolved.modelId ?? model,
+      assignmentSource,
       recentTextTs: Date.now()
     };
     addAgent(agent);
@@ -179,29 +219,11 @@ export function AddAgentModal({ onClose, config }: AddAgentModalProps) {
             </Row>
 
             <Row label="Model">
-              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-                {AGENT_MODELS.map((m) => {
-                  const active = (model ?? '') === (m.id ?? '');
-                  return (
-                    <button
-                      key={m.label}
-                      onClick={() => pickModel(m.id)}
-                      title={m.id ?? 'CLI default model'}
-                      style={{
-                        padding: '3px 8px 1px',
-                        background: active ? `var(--cth-${accent}-light)` : 'var(--cth-cream-100)',
-                        boxShadow: active
-                          ? 'inset 0 0 0 2px var(--cth-ink-900)'
-                          : 'inset 0 0 0 1px var(--cth-ink-700)',
-                        fontFamily: 'var(--cth-font-ui)', fontSize: 13,
-                        color: 'var(--cth-ink-900)', cursor: 'pointer', border: 'none'
-                      }}
-                    >
-                      {m.label}
-                    </button>
-                  );
-                })}
-              </div>
+              <ProviderModelPicker
+                selectedModelId={model}
+                onChange={pickModel}
+                accent={accent}
+              />
             </Row>
 
             <Row label={config.autoMode ? 'Command (auto mode on)' : 'Command'}>
