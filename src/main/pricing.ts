@@ -9,7 +9,13 @@
  * `estimateCostUsd` unchanged. Claude cost is bit-identical to the prior table
  * because the registry's Claude rows are the same constants (SC-006).
  */
-import { computeCost, lookupPrice, type PriceRow } from '../shared/providerRegistry';
+import {
+  computeCost,
+  lookupPrice,
+  type PriceLookupOpts,
+  type PriceRow,
+  type TokenSplit as RegistryTokenSplit
+} from '../shared/providerRegistry';
 
 // Re-exported from the registry — the one canonical normalizer.
 export { normalizeModel } from '../shared/providerRegistry';
@@ -53,4 +59,42 @@ export function priceFor(model: string | undefined | null): ModelPrice {
  */
 export function estimateCostUsd(model: string | undefined | null, tokens: TokenSplit): number {
   return computeCost(model, tokens).usd;
+}
+
+/**
+ * Seam price resolution (E007 AD-003 / FR-006 / FR-007). The ONE place the usage
+ * seam resolves token counts → USD, distinguishing the two failure modes the
+ * registry's `computeCost {usd, bestEffort}` conflates:
+ *
+ *   - UNKNOWN MODEL id (`lookupPrice` → `{unknown:true}`): there is NO price row,
+ *     so NO price is billed. Returns `usd = null` (unpriced — explicitly NOT $0)
+ *     and `unknownModel = true`, so the seam writes `AgentUsageSample.usd = null`
+ *     and raises the parity warning. The registry has already `console.warn`ed
+ *     the unknown id (fail-loud) — never a wrong-vendor default.
+ *   - KNOWN MODEL, MISSING usage FIELD: the model has a price row, so the price is
+ *     never substituted. The absent field degrades to 0 for THIS computation only
+ *     (registry `computeCost` already treats a nullish field as 0); `usd` is the
+ *     best-effort number and `bestEffort = true`.
+ *
+ * The context size (the call's input/prompt length, AD-004/HINT-003) is threaded
+ * into the lookup opts so the Minimax context-length tier row is selected, then
+ * the WHOLE call (input+output+cache) is repriced at that selected dated row.
+ *
+ * USD is computed ONCE here from the registry; consumers never recompute (FR-002).
+ */
+export function resolvePrice(
+  model: string | undefined | null,
+  tokens: RegistryTokenSplit,
+  opts?: PriceLookupOpts
+): { usd: number | null; unknownModel: boolean; bestEffort: boolean } {
+  // Distinguish unknown-model FIRST — `computeCost`'s bestEffort flag conflates
+  // an unknown id with a missing field, so check the row directly (HINT-002).
+  const row = lookupPrice(model, opts);
+  if ('unknown' in row) {
+    // Unpriced: no default/substituted price. `null`, NOT 0 (FR-006).
+    return { usd: null, unknownModel: true, bestEffort: false };
+  }
+  // Known model: price is fixed; a missing token field degrades to 0 only (FR-007).
+  const { usd, bestEffort } = computeCost(model, tokens, opts);
+  return { usd, unknownModel: false, bestEffort };
 }

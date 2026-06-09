@@ -7,7 +7,7 @@
  * concurrency.
  */
 import type { UsageSnapshot } from '../../shared/providerRuntime';
-import { NativeAgentWorker } from './nativeAgentWorker';
+import { NativeAgentWorker, type NativeTelemetrySink } from './nativeAgentWorker';
 import { makeElectronWorkerTransport } from './electronWorkerTransport';
 import { NATIVE_PROVIDER_MODEL_ENV } from '../credentials';
 
@@ -35,6 +35,11 @@ export interface NativeRuntimeDeps {
   /** E004 — the credential injection seam: provider id → spawn env, or null when
    *  no key is set. Wired to `injectionEnvForProvider(readConfig(), providerId)`. */
   credentialEnvFor?: (providerId: string) => Record<string, string> | null;
+  /** E007 T011/T017 {FR-008/011} — the telemetry forward sink. Each spawned worker's
+   *  native usage + tool spans are normalized into the loopback collector's gen_ai.*
+   *  branch (single-writer in main, AD-002), so a native desk reaches telemetry
+   *  parity. Wired to the live `TelemetryCollector` in `index.ts`. */
+  telemetry?: NativeTelemetrySink;
 }
 
 export class NativeRuntime {
@@ -75,7 +80,10 @@ export class NativeRuntime {
       onDrainRequest: async (id) => this.deps.drainForStop(id),
       onToolRequest: this.deps.executeToolFor
         ? async (id, req) => this.deps.executeToolFor!(id, req)
-        : undefined
+        : undefined,
+      // E007 T011 — forward this worker's usage/tool spans into the collector's
+      // gen_ai branch so a native desk reaches telemetry parity (FR-008/011).
+      telemetry: this.deps.telemetry
     });
     this.workers.set(agentId, worker);
     void worker.start();

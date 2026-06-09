@@ -2,9 +2,22 @@ import { defineConfig, externalizeDepsPlugin } from 'electron-vite';
 import react from '@vitejs/plugin-react';
 import { resolve } from 'node:path';
 
+// E007 T010 {FR-009} — pin the EXPERIMENTAL OTel GenAI semantic-convention version
+// for the main process + the native worker (built under `main`). Emission and the
+// collector's gen_ai.* normalization both stay locked to this pin; it MUST match
+// `PINNED_SEMCONV` in `src/main/telemetry.ts`. Injected as a compile-time define so
+// the native worker can set `process.env.OTEL_SEMCONV_STABILITY_OPT_IN` at spawn.
+const PINNED_SEMCONV = 'gen_ai_latest_experimental';
+
 export default defineConfig({
   main: {
     plugins: [externalizeDepsPlugin()],
+    define: {
+      // Compile-time pin readable as `import.meta.env.OTEL_SEMCONV_STABILITY_OPT_IN`
+      // (and asserted against telemetry.ts PINNED_SEMCONV) so the native worker
+      // emits on the pinned semconv version (T010 / FR-009).
+      'import.meta.env.OTEL_SEMCONV_STABILITY_OPT_IN': JSON.stringify(PINNED_SEMCONV)
+    },
     build: {
       rollupOptions: {
         input: {

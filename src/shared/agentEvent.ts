@@ -56,7 +56,9 @@ export interface TokenUsageEvent extends AgentEventBase {
   cacheRead: number;
   cacheCreation: number;
   model: string | null;
-  usd: number;
+  /** Passthrough of the seam's registry-computed cost. `null` = unpriced
+   *  (unknown model); excluded from billed totals, never 0 (FR-006/FR-014). */
+  usd: number | null;
 }
 
 export interface ApiErrorEvent extends AgentEventBase {
@@ -113,18 +115,25 @@ export function isKnownAgentEventKind(kind: string): kind is AgentEventKind {
   return (KNOWN_AGENT_EVENT_KINDS as readonly string[]).includes(kind);
 }
 
-/** The five cumulative numeric fields of token-usage that must never decrease. */
-const CUMULATIVE_FIELDS = ['input', 'output', 'cacheRead', 'cacheCreation', 'usd'] as const;
+/** The cumulative numeric token fields that must never decrease. `usd` is
+ *  handled separately because it may be `null` (unpriced — unknown model,
+ *  FR-006), which is monotonicity-neutral, not a decrease. */
+const CUMULATIVE_TOKEN_FIELDS = ['input', 'output', 'cacheRead', 'cacheCreation'] as const;
 
 /**
  * TR-003 guard: a token-usage sample is monotonic relative to the prior sample
  * for the same session when no cumulative field decreased. Returns true when
- * `prev` is null (first sample is trivially monotonic).
+ * `prev` is null (first sample is trivially monotonic). A `null` `usd` on either
+ * side is treated as monotonicity-neutral (an unpriced sample is not a billed
+ * value and must not be judged a cumulative decrease, FR-006/FR-014).
  */
 export function isMonotonicTokenUsage(
   prev: TokenUsageEvent | null,
   next: TokenUsageEvent
 ): boolean {
   if (!prev) return true;
-  return CUMULATIVE_FIELDS.every((f) => next[f] >= prev[f]);
+  if (!CUMULATIVE_TOKEN_FIELDS.every((f) => next[f] >= prev[f])) return false;
+  // usd: only a real decrease between two priced values breaks monotonicity.
+  if (prev.usd != null && next.usd != null && next.usd < prev.usd) return false;
+  return true;
 }

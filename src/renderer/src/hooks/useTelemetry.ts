@@ -22,7 +22,9 @@ export interface AgentUsageSample {
   cacheRead: number;
   cacheCreation: number;
   model: string;
-  usd: number;
+  /** `null` = unpriced (unknown model); excluded from billed totals, never 0
+   *  (FR-006/FR-014). */
+  usd: number | null;
 }
 
 export interface ToolSpan {
@@ -46,7 +48,10 @@ export interface BreakerState {
 type TelemetryEvent =
   | { kind: 'usage'; sample: AgentUsageSample }
   | { kind: 'tool_result'; span: ToolSpan }
-  | { kind: 'api_error'; agentId: string; sessionId: string; ts: number; error: string };
+  | { kind: 'api_error'; agentId: string; sessionId: string; ts: number; error: string }
+  /** Operator-visible parity warning for an unknown/unpriced model (usd = null;
+   *  no price billed). Bounded to the model id alone (FR-006/FR-013). */
+  | { kind: 'parity_warning'; model: string; ts: number };
 
 /** Total tokens across all kinds — the sparkline/velocity basis. */
 export function totalTokens(s: AgentUsageSample): number {

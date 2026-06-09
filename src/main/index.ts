@@ -240,6 +240,11 @@ const nativeRuntime = new NativeRuntime({
   onWorkerExit: (id) => { archiveAgent(id); syncKeepAwake(); },
   usageFor: (id) => usageProvider.getAgentUsage(id),
   credentialEnvFor: (providerId) => injectionEnvForProvider(readConfig(), providerId),
+  // E007 T011/T017 {FR-008/011} — forward each native worker's usage + tool spans
+  // into the loopback collector's gen_ai.* branch (single-writer in main, AD-002),
+  // so a DeepSeek/Minimax desk produces the SAME AgentUsageSample + ToolSpan as a
+  // Claude desk and reaches telemetry parity through the unchanged consumers.
+  telemetry,
   maxConcurrent: 15,
   maxOldSpaceMb: 512
 });
@@ -532,7 +537,9 @@ function writeFleetSnapshot(): void {
           isAssistant: !!a.isAssistant,
           breaker: breaker.levelFor(id),
           tokens,
-          usd: u ? Number(u.usd.toFixed(4)) : 0,
+          // `u.usd === null` = unpriced (unknown model): surface null, never $0,
+          // so the fleet snapshot doesn't read an unpriced desk as free (FR-006).
+          usd: u && u.usd != null ? Number(u.usd.toFixed(4)) : null,
           lastTool: spans.length ? spans[spans.length - 1].tool : null,
           lastActiveSecAgo: u ? Math.round((now - u.ts) / 1000) : null,
           inboxBacklog: hive.inboxBacklog(id)

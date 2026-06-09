@@ -171,7 +171,9 @@ export interface AgentUsage {
 }
 
 /** Live cumulative cost/token snapshot from the OTel collector (the locked
- *  cross-lane seam). PII-free by construction. Mirrors telemetry.ts. */
+ *  cross-lane seam). PII-free by construction. Mirrors telemetry.ts.
+ *  `usd` is `number | null` — `null` = unpriced (unknown model); consumers
+ *  exclude it from billed totals, never treat it as 0 (FR-006/FR-014). */
 export interface AgentUsageSample {
   agentId: string;
   sessionId: string;
@@ -181,7 +183,7 @@ export interface AgentUsageSample {
   cacheRead: number;
   cacheCreation: number;
   model: string;
-  usd: number;
+  usd: number | null;
 }
 
 /** One tool invocation for the per-agent span waterfall (#7B.2). Ephemeral. */
@@ -216,7 +218,11 @@ export interface BreakerState {
 export type TelemetryEvent =
   | { kind: 'usage'; sample: AgentUsageSample }
   | { kind: 'tool_result'; span: ToolSpan }
-  | { kind: 'api_error'; agentId: string; sessionId: string; ts: number; error: string };
+  | { kind: 'api_error'; agentId: string; sessionId: string; ts: number; error: string }
+  /** E007 T020 {FR-006} — operator-visible telemetry-parity warning for an unknown/
+   *  unpriced model id (the sample's `usd` is `null`, no price billed). Bounded to
+   *  the model id alone — no prompt/tokens/headers/secret (FR-006/FR-013). */
+  | { kind: 'parity_warning'; model: string; ts: number };
 
 /** Cold-start backfill from the collector. */
 export interface TelemetrySnapshot {

@@ -48,7 +48,10 @@ export interface UsageSnapshot {
   cacheRead: number;
   cacheCreation: number;
   model: string | null;
-  usd: number;
+  /** Registry-computed cost passed through from the seam (`AgentUsageSample.usd`).
+   *  `null` = unpriced (unknown model) — billed by no one, never read as 0
+   *  (FR-006/FR-014). Never recomputed here (FR-002). */
+  usd: number | null;
 }
 
 export type AgentEventListener = (e: AgentEvent) => void;

@@ -26,7 +26,9 @@ export function ToolWaterfall({ agentId }: { agentId: string }) {
       }}>
         {sample ? (
           <>
-            <span><strong>${sample.usd.toFixed(2)}</strong></span>
+            {/* `usd === null` = unpriced (unknown model): show a parity marker,
+                never $0.00 — an unpriced desk is not free (FR-006/FR-014). */}
+            <span><strong>{sample.usd != null ? `$${sample.usd.toFixed(2)}` : '$—'}</strong></span>
             <span style={{ color: 'var(--cth-ink-700)' }}>
               fresh {fmtTokens(sample.input + sample.cacheCreation)}t
             </span>

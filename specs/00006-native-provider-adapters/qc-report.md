@@ -4,6 +4,20 @@
 **Verdict**: PASSED
 **Required categories** (project-instructions.md): linting (PASS), performance (PASS)
 
+## Changes from Prior Run
+
+Re-verification (2026-06-09T22:52:26Z) under a working tree carrying **uncommitted feature-007** changes to shared files (`index.ts`, `nativeRuntime.ts`, `nativeAgentWorker.ts`, plus 007-owned `telemetry.ts`/`pricing.ts`/`usage.ts`/`breaker.ts`/cost suites). Confirms no regression to E006.
+
+| Metric | Previous | Current | Delta |
+|--------|----------|---------|-------|
+| Verdict | PASSED | PASSED | — |
+| Typecheck (node+web) | 0 errors | 0 errors | — |
+| Lint | 0 errors, 9 warnings | 0 errors, 9 warnings | — (same allowlisted set; none in E006 files) |
+| Tests | 170/170 | 203/203 | +33 (all from in-progress 007 suites; the 91 E006-suite tests unchanged, all green) |
+| Bug tasks | None | None | — |
+
+No regressions. The three shared files 007 modified that E006 also touches compile, lint clean, and their E006 tests (`nativeRuntimeSpawn`, `nativeAgentWorker`, spawn-router via `selectAdapter`/`nativePeerLoop`) all pass.
+
 ## Category Verdicts
 
 | Category | Verdict | Notes |

@@ -174,7 +174,11 @@ export class CircuitBreaker {
     if (typeof cfg.costCapUsd === 'number' && cfg.costCapUsd > 0) {
       let total = 0; let max = -1;
       for (const i of inputs) {
-        const usd = i.sample?.usd ?? 0;
+        // `usd === null` is UNPRICED (unknown model) — exclude from the billed
+        // total and never blame it; treating null as 0 would silently bill it
+        // free (FR-006/FR-014).
+        const usd = i.sample?.usd;
+        if (usd == null) continue;
         total += usd;
         if (usd > max) { max = usd; topSpender = i.agentId; }
       }
@@ -250,6 +254,7 @@ export class CircuitBreaker {
     // (a) cost cap — floor total over cap, this agent is the biggest spender
     if (isTopSpender && typeof costCapUsd === 'number') {
       return { tripping: true, reason: `cost cap: floor total over $${costCapUsd} (top spender $${(input.sample?.usd ?? 0).toFixed(2)})` };
+      // (input.sample?.usd is non-null here: only a priced agent can be topSpender.)
     }
     // (a) token cap — floor total tokens over cap, this agent is the biggest spender
     if (isTopTokenSpender && typeof costCapTokens === 'number') {
