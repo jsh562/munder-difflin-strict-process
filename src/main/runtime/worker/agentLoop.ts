@@ -18,6 +18,11 @@ import type {
   ToolUseRequest,
   UsageDelta
 } from '../../../shared/providerCall';
+import {
+  ReliabilityError,
+  withReliability,
+  type ReliabilityOptions
+} from './adapters/reliability';
 
 export interface ToolResult {
   toolCallId: string;
@@ -30,6 +35,19 @@ export interface AgentLoopCaps {
   maxTurns: number;
   /** Hard bound on tool round-trips within one turn. */
   maxHops: number;
+  /**
+   * Per-turn wall-clock budget in ms (ADR-0009 / FR-012). When a single turn —
+   * across its provider round-trips and tool hops — exceeds this, the turn is
+   * stopped with a terminal `stop reason:'turn-budget-exhausted'`. Optional and
+   * additive: omitted (or non-finite) means no wall-clock bound (prior behavior).
+   */
+  turnBudgetMs?: number;
+  /**
+   * Optional reliability tuning passed to `withReliability` around the provider
+   * call (attempts/backoff and injectable clock/sleep/random for tests). Omitted
+   * = ADR-0009 defaults. The loop fills `now` from `deps.now` when not set here.
+   */
+  reliability?: ReliabilityOptions;
 }
 
 export interface AgentLoopDeps {
@@ -83,19 +101,40 @@ export async function runAgentLoop(deps: AgentLoopDeps, initialInput: string): P
     });
   };
 
+  // Wall-clock budget knob (additive): non-finite/absent ⇒ no bound (prior behavior).
+  const turnBudgetMs = deps.caps.turnBudgetMs;
+  const hasBudget = typeof turnBudgetMs === 'number' && Number.isFinite(turnBudgetMs) && turnBudgetMs > 0;
+
   while (turns < deps.caps.maxTurns) {
     turns++;
     deps.emit({ ...env(), kind: 'turn-start' });
+    const turnStartedAt = now();
+    // True once this turn ended terminally on its own wall-clock budget — it then
+    // emits a terminal `stop` and the session goes idle (never loops further).
+    let budgetExhausted = false;
 
     let hops = 0;
     for (;;) {
       hops++;
       let turn: ProviderTurn;
       try {
-        turn = await deps.providerCall({ messages, tools: deps.tools ?? [] });
+        // Wrap the provider call with the ADR-0009 reliability policy (FR-012):
+        // retryable transients (429/5xx/timeouts) are retried silently with
+        // jittered backoff; only an exhausted-or-terminal failure surfaces here.
+        // The scoped `emit` lets a streaming adapter push text/thinking/tool
+        // deltas as the stream arrives (AD-001); the loop forwards them as-is.
+        turn = await withReliability(
+          () => deps.providerCall({ messages, tools: deps.tools ?? [] }, deps.emit),
+          reliabilityOpts(deps, now)
+        );
       } catch (e) {
-        deps.emit({ ...env(), kind: 'api-error', retryable: true, message: errMsg(e) });
-        turn = { toolUses: [], usage: { ...ZERO }, endOfTurn: true }; // end turn; retry is E009
+        // Map exhausted/non-retryable to a single `api-error`. A terminal class
+        // (400/401/403, context overflow) is `retryable:false` → feeds the breaker;
+        // an exhausted-retryable transient stays `retryable:true` (it was transient,
+        // it just ran out of room) so the breaker is not false-tripped.
+        const retryable = e instanceof ReliabilityError ? e.retryable : true;
+        deps.emit({ ...env(), kind: 'api-error', retryable, message: errMsg(e) });
+        turn = { toolUses: [], usage: { ...ZERO }, endOfTurn: true }; // end the turn cleanly
       }
 
       cumulative.input += turn.usage.input;
@@ -116,16 +155,32 @@ export async function runAgentLoop(deps: AgentLoopDeps, initialInput: string): P
         try {
           res = await deps.executeTool(use);
         } catch (e) {
+          // A malformed/partial tool call (FR-011): the adapter never executed the
+          // partial — surface a machine-readable `api-error` AND feed a failed tool
+          // result back so the model can self-correct, rather than crashing the desk.
+          deps.emit({ ...env(), kind: 'api-error', retryable: false, message: `tool '${use.toolName}' failed: ${errMsg(e)}` });
           res = { toolCallId: use.toolCallId, content: errMsg(e), success: false };
         }
-        deps.emit({ ...env(), kind: 'tool-end', toolCallId: use.toolCallId, success: res.success, durationMs: now() - start });
+        deps.emit({ ...env(), kind: 'tool-end', toolCallId: use.toolCallId, success: res.success, durationMs: now() - start, ...(res.success ? {} : { error: res.content }) });
         messages.push({ role: 'tool', content: res.content, toolCallId: use.toolCallId });
+      }
+
+      // Per-turn wall-clock budget (ADR-0009): stop this turn terminally if it has
+      // run past its budget across provider round-trips + tool hops.
+      if (hasBudget && now() - turnStartedAt >= (turnBudgetMs as number)) {
+        budgetExhausted = true;
+        break;
       }
 
       if (hops >= deps.caps.maxHops) break; // safety: bound tool round-trips
     }
 
     deps.emit({ ...env(), kind: 'turn-end' });
+    if (budgetExhausted) {
+      // Terminal — distinct reason from a clean end-of-turn or a non-retryable error.
+      deps.emit({ ...env(), kind: 'stop', reason: 'turn-budget-exhausted', stopActive: true });
+      return;
+    }
     deps.emit({ ...env(), kind: 'stop', reason: 'end-of-turn', stopActive });
 
     // A drain-created turn does not re-drain — it goes idle (guard).
@@ -146,4 +201,20 @@ export async function runAgentLoop(deps: AgentLoopDeps, initialInput: string): P
 
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+/**
+ * Resolve the reliability options for a turn: caller-supplied `caps.reliability`
+ * takes precedence, with the loop's injected clock (`deps.now`) filled in when the
+ * caller did not pin one — so a test's fake clock drives backoff deterministically.
+ */
+function reliabilityOpts(deps: AgentLoopDeps, now: () => number): ReliabilityOptions {
+  const supplied = deps.caps.reliability;
+  return {
+    ...supplied,
+    now: supplied?.now ?? now,
+    // Default the reliability per-turn budget to the loop's turn budget when set,
+    // so the two bounds agree unless the caller overrides explicitly.
+    turnBudgetMs: supplied?.turnBudgetMs ?? deps.caps.turnBudgetMs
+  };
 }

@@ -40,6 +40,15 @@ export interface NativeAgentWorkerDeps {
   onExit?: (agentId: string) => void;
   /** End-of-turn autonomy: the registry routes this to `hive.drainForStop`. */
   onDrainRequest?: (agentId: string, turnId: number) => Promise<{ block: boolean; reason?: string }>;
+  /**
+   * E006 {FR-009} — the worker's tool-execution seam. The worker REQUESTS a tool;
+   * MAIN executes it against the hive tool handlers (single-committer preserved) and
+   * resolves the result. The registry routes this to the hive tool dispatcher.
+   */
+  onToolRequest?: (
+    agentId: string,
+    req: { toolCallId: string; toolName: string; toolInput: unknown }
+  ) => Promise<{ content: string; success: boolean }>;
 }
 
 export class NativeAgentWorker implements ProviderRuntime {
@@ -100,6 +109,29 @@ export class NativeAgentWorker implements ProviderRuntime {
       case 'drainRequest': {
         const result = (await this.deps.onDrainRequest?.(this.deps.agentId, msg.turnId)) ?? { block: false };
         this.transport?.post({ type: 'drainResult', turnId: msg.turnId, block: result.block, reason: result.reason });
+        break;
+      }
+      case 'toolRequest': {
+        // E006 {FR-009} — MAIN executes the tool against the hive (single-committer)
+        // and replies. No handler ⇒ a clean failed result so the loop self-corrects
+        // (it never crashes the desk; mirrors the drain no-handler default).
+        let result: { content: string; success: boolean };
+        try {
+          result = (await this.deps.onToolRequest?.(this.deps.agentId, {
+            toolCallId: msg.toolCallId,
+            toolName: msg.toolName,
+            toolInput: msg.toolInput
+          })) ?? { content: `no tool handler for '${msg.toolName}'`, success: false };
+        } catch (e) {
+          result = { content: e instanceof Error ? e.message : String(e), success: false };
+        }
+        this.transport?.post({
+          type: 'toolResult',
+          callId: msg.callId,
+          toolCallId: msg.toolCallId,
+          content: result.content,
+          success: result.success
+        });
         break;
       }
       case 'ready':

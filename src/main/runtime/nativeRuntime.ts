@@ -9,10 +9,21 @@
 import type { UsageSnapshot } from '../../shared/providerRuntime';
 import { NativeAgentWorker } from './nativeAgentWorker';
 import { makeElectronWorkerTransport } from './electronWorkerTransport';
+import { NATIVE_PROVIDER_MODEL_ENV } from '../credentials';
 
 export interface NativeRuntimeDeps {
   /** Runs in MAIN — the worker requests it over IPC at end-of-turn. */
   drainForStop: (agentId: string) => { block: boolean; reason?: string };
+  /**
+   * E006 {FR-009} — runs in MAIN: execute one tool the worker requested against the
+   * hive tool handlers (single-committer preserved). Absent ⇒ the worker gets a
+   * clean failed result and self-corrects (no crash). Wired to the hive tool
+   * dispatcher in `index.ts`.
+   */
+  executeToolFor?: (
+    agentId: string,
+    req: { toolCallId: string; toolName: string; toolInput: unknown }
+  ) => Promise<{ content: string; success: boolean }>;
   /** Shared teardown/archive (same path a PTY exit runs). */
   onWorkerExit: (agentId: string) => void;
   /** Usage seam fallback. */
@@ -31,19 +42,40 @@ export class NativeRuntime {
 
   constructor(private readonly deps: NativeRuntimeDeps) {}
 
-  spawn(agentId: string, providerId?: string): { ok: boolean; error?: string } {
+  /**
+   * Spawn a native worker for an assigned desk. `providerId` selects the credential
+   * env (E004); `model` is the desk's ASSIGNED model id, threaded to the worker via
+   * `NATIVE_PROVIDER_MODEL` so `selectAdapter` builds the right adapter (FR-008).
+   *
+   * Returns `{ ok:false, error:'needs-credentials' }` when a providerId is given but
+   * no key is stored (E004 presence false): the desk is NOT started on a broken loop
+   * — the caller surfaces a clear "needs credentials" state (T021 / FR-008 edge case).
+   */
+  spawn(agentId: string, providerId?: string, model?: string): { ok: boolean; error?: string } {
     if (this.workers.has(agentId)) return { ok: false, error: `native worker exists: ${agentId}` };
     const cap = this.deps.maxConcurrent ?? 15;
     if (this.workers.size >= cap) return { ok: false, error: `native concurrency cap (${cap}) reached` };
 
     // E004 — inject the provider credential at spawn (none ⇒ no key env).
-    const env = providerId ? (this.deps.credentialEnvFor?.(providerId) ?? undefined) : undefined;
+    const credEnv = providerId ? this.deps.credentialEnvFor?.(providerId) : undefined;
+    // Missing-key guard (T021 / FR-008): a native provider with no stored key must
+    // not start a broken loop — surface "needs credentials" rather than spawning.
+    if (providerId && !credEnv) return { ok: false, error: 'needs-credentials' };
+    // Thread the assigned model id alongside the key/id env (no secret) so the
+    // worker's selectAdapter targets the right model + endpoint (FR-008).
+    const env =
+      credEnv && model
+        ? { ...credEnv, [NATIVE_PROVIDER_MODEL_ENV]: model }
+        : (credEnv ?? undefined);
     const worker = new NativeAgentWorker({
       agentId,
       transportFactory: () => makeElectronWorkerTransport({ agentId, maxOldSpaceMb: this.deps.maxOldSpaceMb, env }),
       usageFallback: () => this.deps.usageFor?.(agentId) ?? null,
       onExit: (id) => { this.workers.delete(id); this.deps.onWorkerExit(id); },
-      onDrainRequest: async (id) => this.deps.drainForStop(id)
+      onDrainRequest: async (id) => this.deps.drainForStop(id),
+      onToolRequest: this.deps.executeToolFor
+        ? async (id, req) => this.deps.executeToolFor!(id, req)
+        : undefined
     });
     this.workers.set(agentId, worker);
     void worker.start();

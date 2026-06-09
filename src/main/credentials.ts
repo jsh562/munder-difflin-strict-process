@@ -13,6 +13,10 @@ import type { HarnessConfig } from './config';
 /** Env var names a native worker / E006 adapter reads at spawn. */
 export const NATIVE_PROVIDER_KEY_ENV = 'NATIVE_PROVIDER_API_KEY';
 export const NATIVE_PROVIDER_ID_ENV = 'NATIVE_PROVIDER_ID';
+/** E006 {FR-008} — the desk's ASSIGNED model id, threaded to the worker so
+ *  `selectAdapter` can build the adapter for the right model (endpoint + tier).
+ *  Set by the spawn router alongside the key/id env; carries no secret. */
+export const NATIVE_PROVIDER_MODEL_ENV = 'NATIVE_PROVIDER_MODEL';
 
 /** HarnessConfig with provider key VALUES removed — the only shape sent to the
  *  renderer (TR-008). Presence (has-key per provider) is exposed instead. */

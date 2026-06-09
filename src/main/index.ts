@@ -27,6 +27,7 @@ import { TelemetryCollector } from './telemetry';
 import { ControlRegistry } from './control';
 import { ClaudeRuntime } from './runtime/claudeRuntime';
 import { NativeRuntime } from './runtime/nativeRuntime';
+import { executeHiveTool } from './runtime/hiveTools';
 import { redactConfig, injectionEnvForProvider, keyPresence, setKeyInConfig, clearKeyInConfig, type SafeConfig } from './credentials';
 import { listProviders } from '../shared/providerRegistry';
 import { deriveProviderId } from '../shared/assignment';
@@ -233,6 +234,9 @@ ptyManager.setExitHandler(teardownPty);
 // hive); a worker exit reuses the same archive path as a PTY exit (AD-004).
 const nativeRuntime = new NativeRuntime({
   drainForStop: (id) => (hive.enabled() ? hive.drainForStop(id) : { block: false }),
+  // E006 {FR-009} — a native worker requests a tool; MAIN executes it against the
+  // hive (single-committer) and replies, so a native desk is a full hive peer.
+  executeToolFor: async (id, req) => executeHiveTool(hive, id, req),
   onWorkerExit: (id) => { archiveAgent(id); syncKeepAwake(); },
   usageFor: (id) => usageProvider.getAgentUsage(id),
   credentialEnvFor: (providerId) => injectionEnvForProvider(readConfig(), providerId),
@@ -803,6 +807,35 @@ ipcMain.handle('pty:spawn', async (_evt, opts: SpawnOptions & { hive?: AgentMeta
     const providerId = deriveProviderId(resolvedModel);
     if (providerId) agentProviderIds.set(opts.hive.id, providerId);
     else agentProviderIds.delete(opts.hive.id);
+    // E006 {FR-008} — spawn router: a desk assigned to a NATIVE provider (a derived
+    // providerId that is not Claude/anthropic) LAUNCHES on that provider via the
+    // native worker + the adapter selected from the injected env, NOT the Claude PTY
+    // path. A Claude/anthropic desk (or an unresolvable/role-based model) falls
+    // through to the existing PTY spawn below, unchanged.
+    if (providerId && providerId !== 'anthropic') {
+      // T021 {FR-008} — missing-key guard: nativeRuntime.spawn returns
+      // 'needs-credentials' when no key is stored (E004 presence false); surface a
+      // clear "needs credentials" state to the operator rather than a broken loop.
+      const spawnRes = nativeRuntime.spawn(opts.hive.id, providerId, resolvedModel ?? undefined);
+      if (!spawnRes.ok) {
+        if (spawnRes.error === 'needs-credentials') {
+          try {
+            liveWebContents()?.send('agent:needsCredentials', {
+              agentId: opts.hive.id,
+              providerId,
+              model: resolvedModel ?? null
+            });
+          } catch { /* window tore down — the operator still sees the failed spawn */ }
+          // Drop the PTY→agent record we never created and report the gap.
+          ptyToAgent.delete(opts.id);
+          return { ok: false, error: `needs credentials for provider "${providerId}"` };
+        }
+        return { ok: false, error: spawnRes.error };
+      }
+      // Native desk launched on its provider; the Claude PTY path is bypassed.
+      // (No PTY ⇒ no keep-awake change here; native exit teardown runs syncKeepAwake.)
+      return { ok: true, native: true };
+    }
     // Coarse runaway cap.
     if (typeof cfg.maxTurns === 'number' && cfg.maxTurns > 0 && !args.includes('--max-turns')) {
       args.push('--max-turns', String(cfg.maxTurns));

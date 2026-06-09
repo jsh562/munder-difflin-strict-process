@@ -90,8 +90,22 @@ const ALL_CAPS: CapabilityDescriptor = {
   supportsWebSearch: true,
   supportsCaching: true
 };
+// FR-014 capability-flag basis (E006 T027). Each native flag below is set from the
+// provider's published documentation and is CONFIRMED ONLY by manual app-smoke
+// (no live keys in CI). The seeds are internally consistent with the price rows:
+// a real cache-read discount ⇒ caching supported; flat cache pricing ⇒ not. If a
+// flag is found to misrepresent real support, correct it HERE as a static source
+// edit (AD-007) — never a runtime/worker write.
+//
+// MiniMax M3 (`minimax-m3`): the text M-series model exposes neither provider-hosted
+// image input, MCP-server hosting, nor a provider web-search tool, and its price rows
+// carry NO distinct cache pricing (cacheRead/Write == input, 0.6/0.6 base, 1.2/1.2
+// long) — so no prompt caching. All four flags are false (NO_CAPS).
 const NO_CAPS: CapabilityDescriptor = { ...EMPTY_CAPABILITY_DESCRIPTOR };
-// DeepSeek has context caching (hit/miss pricing) but no image/MCP/web-search.
+// DeepSeek V4 (`deepseek-v4-flash` / `deepseek-v4-pro`): documented context caching
+// with a real hit/miss discount (cacheReadPerM ≪ inputPerM in the rows below) ⇒
+// supportsCaching:true; the chat/reasoner models are text-only with no MCP-server
+// hosting and no provider web-search tool ⇒ images/MCP/web-search false.
 const DEEPSEEK_CAPS: CapabilityDescriptor = { ...EMPTY_CAPABILITY_DESCRIPTOR, supportsCaching: true };
 
 const CLAUDE_EFFECTIVE = '2025-01-01';
