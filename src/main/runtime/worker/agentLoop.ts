@@ -61,6 +61,15 @@ export interface AgentLoopDeps {
   requestDrain: () => Promise<{ block: boolean; reason?: string }>;
   caps: AgentLoopCaps;
   tools?: ToolSpec[];
+  /**
+   * Optional system preamble prepended to the conversation as the first `system`
+   * message (the hive protocol + toolkit briefing for a native desk). Absent ⇒ the
+   * loop starts from the user input alone (prior behavior). Both native adapters
+   * handle a `system` role — DeepSeek passes it through, Minimax hoists it into the
+   * Anthropic `system` field — so this teaches a native desk how to use the toolkit
+   * the way `--append-system-prompt` teaches a Claude desk.
+   */
+  systemPrompt?: string;
   now?: () => number;
 }
 
@@ -72,7 +81,13 @@ const ZERO: UsageDelta = { input: 0, output: 0, cacheRead: 0, cacheCreation: 0 }
  * (they become `api-error` events); never loops forever (guard + caps).
  */
 export async function runAgentLoop(deps: AgentLoopDeps, initialInput: string): Promise<void> {
-  const messages: ChatMessage[] = [{ role: 'user', content: initialInput }];
+  const preamble = deps.systemPrompt?.trim();
+  const messages: ChatMessage[] = [
+    // The system preamble (when present) leads the conversation so it persists every
+    // round — the adapters route a `system` message to the provider's system channel.
+    ...(preamble ? [{ role: 'system' as const, content: preamble }] : []),
+    { role: 'user', content: initialInput }
+  ];
   const cumulative: UsageDelta = { ...ZERO };
   const now = deps.now ?? Date.now;
 

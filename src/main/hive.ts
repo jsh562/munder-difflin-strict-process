@@ -648,6 +648,21 @@ export class HiveManager {
     const p = join(this.agentDir(id), 'memory.md');
     return existsSync(p) ? readFileSync(p, 'utf8') : '';
   }
+  /** Append a timestamped block to an agent's memory.md and single-commit it. This
+   *  is the single-committer write path behind a native desk's `write_memory` tool
+   *  (Principle III) — it mirrors what a Claude desk does by editing the file with
+   *  its own tools, so a native desk's durable notes survive a reload and are mined
+   *  into the MemPalace exactly the same way. No-op on empty text or no hive root. */
+  appendMemory(id: string, text: string): void {
+    const t = (text ?? '').trim();
+    if (!t || !this.root()) return;
+    const dir = this.agentDir(id);
+    try { mkdirSync(dir, { recursive: true }); } catch { /* exists */ }
+    const block = `\n\n## ${new Date().toISOString()}\n${t}\n`;
+    try { appendFileSync(join(dir, 'memory.md'), block, 'utf8'); } catch { /* noop */ }
+    this.appendLog({ kind: 'memory', agent: id, bytes: t.length });
+    this.commit(`hive: memory (${id})`);
+  }
   inbox(id: string): HiveMessage[] {
     return this.listMessages(join(this.agentDir(id), 'inbox'));
   }

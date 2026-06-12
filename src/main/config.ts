@@ -164,6 +164,12 @@ export interface HarnessConfig {
    *  the git hive, transcripts, or telemetry; injected only into a native worker's
    *  spawn env. A future OS-keychain backend swaps in behind the injection seam. */
   providerKeys?: Record<string, string>;
+  /** Opt-in: allow native (DeepSeek/Minimax) desks to run the `bash` tool. OFF by
+   *  default — a native desk gets filesystem/search/memory tools unconditionally,
+   *  but shell execution stays gated until the operator turns this on (the toolkit
+   *  still cwd-sandboxes + breaker-watches every bash call when enabled). Claude
+   *  desks are unaffected (their shell rides the CLI's own permission system). */
+  nativeBashEnabled?: boolean;
 
   // ─── Memory reflection (the janitor's condense half) ───────────────────────
   /** Master toggle for the in-process MemoryReflector. Default on. */

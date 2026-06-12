@@ -28,7 +28,7 @@ import { ControlRegistry } from './control';
 import { ClaudeRuntime } from './runtime/claudeRuntime';
 import { NativeRuntime } from './runtime/nativeRuntime';
 import { createNativeEventBridge, loadNativeEvents } from './runtime/nativeEventBridge';
-import { executeHiveTool } from './runtime/hiveTools';
+import { executeAgentTool, type AgentToolDeps } from './runtime/agentTools';
 import { redactConfig, injectionEnvForProvider, keyPresence, setKeyInConfig, clearKeyInConfig, type SafeConfig } from './credentials';
 import { listProviders } from '../shared/providerRegistry';
 import { deriveProviderId } from '../shared/assignment';
@@ -245,14 +245,38 @@ const nativeEventBridge = createNativeEventBridge({
     try { liveWebContents()?.send(`agent:event:${event.agentId}`, event); } catch { /* window tore down */ }
   }
 });
+// The native coding toolkit's injected deps: the hive surface (arrow-wrapped to keep
+// `this`), the cwd resolver (= the sandbox root), the memory-append committer, and the
+// bash opt-in (off by default). Built once; cwd + bash are read live per tool call.
+const agentToolDeps: AgentToolDeps = {
+  enabled: () => hive.enabled(),
+  memory: (id) => hive.memory(id),
+  send: (partial, from) => hive.send(partial, from),
+  tasks: () => hive.tasks(),
+  writeTasks: (tasks) => hive.writeTasks(tasks),
+  appendMemory: (id, text) => hive.appendMemory(id, text),
+  resolveCwd: (id) => hive.registry().agents[id]?.cwd ?? null,
+  bashEnabled: () => readConfig().nativeBashEnabled === true
+};
 // E003 — native (non-Claude) agents run in isolated utilityProcess workers,
 // fronted by the ProviderRuntime port. The drain runs in MAIN (single-committer
 // hive); a worker exit reuses the same archive path as a PTY exit (AD-004).
 const nativeRuntime = new NativeRuntime({
   drainForStop: (id) => (hive.enabled() ? hive.drainForStop(id) : { block: false }),
-  // E006 {FR-009} — a native worker requests a tool; MAIN executes it against the
-  // hive (single-committer) and replies, so a native desk is a full hive peer.
-  executeToolFor: async (id, req) => executeHiveTool(hive, id, req),
+  // A native worker requests a tool; MAIN executes it against the GOVERNED, cwd-
+  // sandboxed toolkit so a native desk is a full hive peer with parity to a Claude
+  // desk. Every call is routed through the SAME guardrails a Claude desk hits:
+  //  (1) the permission gate — operator pause / halt / gated-tool deny (parity with
+  //      Claude's PreToolUse hook, which native calls otherwise bypassed);
+  //  (2) the circuit breaker — feed the loop/cost guard (parity with PostToolUse);
+  //  (3) executeAgentTool — single-committer I/O, cwd-sandboxed, bash opt-in.
+  executeToolFor: async (id, req) => {
+    if (control.shouldHalt(id)) return { content: 'halted by operator', success: false };
+    const decision = control.toolDecision(id, req.toolName);
+    if (decision.deny) return { content: decision.reason ?? 'denied by operator', success: false };
+    breaker.recordToolUse(id, req.toolName, req.toolInput);
+    return executeAgentTool(agentToolDeps, id, req);
+  },
   onWorkerExit: (id) => { archiveAgent(id); syncKeepAwake(); },
   usageFor: (id) => usageProvider.getAgentUsage(id),
   credentialEnvFor: (providerId) => injectionEnvForProvider(readConfig(), providerId),

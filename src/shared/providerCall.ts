@@ -14,7 +14,7 @@
 import type { AgentEvent } from './agentEvent';
 
 export interface ChatMessage {
-  role: 'user' | 'assistant' | 'tool';
+  role: 'user' | 'assistant' | 'tool' | 'system';
   content: string;
   /** Present on a `tool` message — the tool call it answers. */
   toolCallId?: string;

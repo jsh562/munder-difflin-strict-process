@@ -19,7 +19,7 @@ import { runAgentLoop } from './agentLoop';
 import { makeStubProvider, stubExecuteTool } from './stubProvider';
 import { selectAdapter } from './adapters/selectAdapter';
 import { NATIVE_PROVIDER_MODEL_ENV } from './adapters/selectAdapterEnv';
-import { HIVE_TOOL_CATALOG } from '../hiveTools';
+import { AGENT_TOOL_CATALOG, NATIVE_AGENT_PREAMBLE } from '../agentToolCatalog';
 import type { ToolSpec, ToolUseRequest } from '../../../shared/providerCall';
 import type { WorkerCommand, WorkerMessage } from '../../../shared/workerProtocol';
 
@@ -79,11 +79,12 @@ if (parentPort) {
       }
     : stubExecuteTool;
 
-  // E006 {FR-009} — advertise the core hive-tool catalog to the model ON THE NATIVE
-  // PATH so it can actually USE memory/mailbox/tasks (the execution seam above is
-  // already wired). The stub fallback keeps prior behavior (no catalog), so existing
-  // stub tests are unchanged. The catalog names match `executeHiveTool` exactly.
-  const tools: ToolSpec[] | undefined = isNative ? [...HIVE_TOOL_CATALOG] : undefined;
+  // E006 {FR-009} — advertise the full coding toolkit to the model ON THE NATIVE PATH
+  // so it can actually USE filesystem/search/shell/memory + mailbox/tasks (the
+  // execution seam above is already wired; MAIN governs + sandboxes each call). The
+  // stub fallback keeps prior behavior (no catalog), so existing stub tests are
+  // unchanged. The catalog names match `executeAgentTool` exactly (conformance test).
+  const tools: ToolSpec[] | undefined = isNative ? [...AGENT_TOOL_CATALOG] : undefined;
 
   const onCommand = async (cmd: WorkerCommand): Promise<void> => {
     switch (cmd.type) {
@@ -104,6 +105,9 @@ if (parentPort) {
               providerCall,
               executeTool,
               tools,
+              // E006 — brief a native desk on the hive protocol + toolkit (the system
+              // preamble a Claude desk gets via --append-system-prompt). Stub path: none.
+              systemPrompt: isNative ? NATIVE_AGENT_PREAMBLE : undefined,
               emit: (event) => post({ type: 'event', event }),
               requestDrain,
               caps: { maxTurns: 50, maxHops: 50 }
