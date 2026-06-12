@@ -9,7 +9,7 @@ import { OFFICE_CAST, DEFAULT_CHARACTER, type OfficeCharacterName } from '@/scen
 import { type AccentColorName } from '@/design/tokens';
 import { type HarnessConfig, buildSpawnCommand } from '@/store/config';
 import { listProviders } from '@shared/providerRegistry';
-import { resolveEffectiveModel } from '@shared/assignment';
+import { deriveProviderId, resolveEffectiveModel } from '@shared/assignment';
 
 const ACCENTS: AccentColorName[] = ['coral', 'mint', 'sky', 'lemon', 'lilac', 'peach'];
 
@@ -48,6 +48,18 @@ export function AddAgentModal({ onClose, config }: AddAgentModalProps) {
   // shows its empty-state and agent creation falls back to the existing role-based
   // default (no explicit assignment recorded — DR-7/FR-012, T011).
   const hasModels = useMemo(() => listProviders().some((p) => p.models.length > 0), []);
+
+  // A native (non-Claude) desk runs on the provider worker, NOT the `claude` CLI — so
+  // the "Command" field's `claude --model …` carrier is never executed for it (main
+  // routes it via nativeRuntime.spawn). When the picked model is native we show a
+  // read-only runtime note instead of the misleading editable command. The hidden
+  // `command` carrier is still built/sent unchanged, so spawn routing is unaffected.
+  const nativeInfo = useMemo(() => {
+    const providerId = deriveProviderId(model);
+    if (!providerId || providerId === 'anthropic') return null;
+    const provider = listProviders().find((p) => p.id === providerId);
+    return { label: provider?.displayName ?? providerId };
+  }, [model]);
 
   // Picking a model rebuilds the command and marks the choice EXPLICIT; the command
   // field stays editable for power users (it's the source of truth for the actual
@@ -226,14 +238,25 @@ export function AddAgentModal({ onClose, config }: AddAgentModalProps) {
               />
             </Row>
 
-            <Row label={config.autoMode ? 'Command (auto mode on)' : 'Command'}>
-              <input
-                value={command}
-                onChange={(e) => setCommand(e.target.value)}
-                placeholder="claude"
-                style={{ ...inputStyle, fontFamily: 'var(--cth-font-mono)' }}
-              />
-            </Row>
+            {nativeInfo ? (
+              <Row label="Runtime">
+                <div style={nativeNoteStyle}>
+                  Runs on the <strong>{nativeInfo.label}</strong> worker —{' '}
+                  <span style={{ fontFamily: 'var(--cth-font-mono)' }}>{model}</span>. No{' '}
+                  <span style={{ fontFamily: 'var(--cth-font-mono)' }}>claude</span> command is executed.
+                  {' '}Set the {nativeInfo.label} API key in Settings → Provider API keys.
+                </div>
+              </Row>
+            ) : (
+              <Row label={config.autoMode ? 'Command (auto mode on)' : 'Command'}>
+                <input
+                  value={command}
+                  onChange={(e) => setCommand(e.target.value)}
+                  placeholder="claude"
+                  style={{ ...inputStyle, fontFamily: 'var(--cth-font-mono)' }}
+                />
+              </Row>
+            )}
 
             <Row label="Description">
               <input
@@ -349,6 +372,17 @@ const inputStyle: React.CSSProperties = {
   fontSize: 16,
   color: 'var(--cth-ink-900)',
   outline: 'none'
+};
+
+const nativeNoteStyle: React.CSSProperties = {
+  width: '100%',
+  padding: '6px 8px',
+  background: 'var(--cth-paper-100)',
+  boxShadow: 'inset 0 0 0 1px var(--cth-ink-700)',
+  fontFamily: 'var(--cth-font-ui)',
+  fontSize: 13,
+  lineHeight: '18px',
+  color: 'var(--cth-ink-700)'
 };
 
 function Row({ label, children }: { label: string; children: React.ReactNode }) {
