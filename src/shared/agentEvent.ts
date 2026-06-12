@@ -1,5 +1,5 @@
 /**
- * Re-export shim — the canonical AgentEvent contract moved into @munder/agent-core
+ * Re-export shim — the canonical AgentEvent contract moved into @jsh562/agent-core
  * (runtime extraction). Kept so existing `@shared/agentEvent` / `../../shared/agentEvent`
  * imports across the app + renderer keep resolving unchanged.
  */

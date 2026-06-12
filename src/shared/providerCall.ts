@@ -1,5 +1,5 @@
 /**
- * Re-export shim — the canonical ProviderCall contract moved into @munder/agent-core
+ * Re-export shim — the canonical ProviderCall contract moved into @jsh562/agent-core
  * (runtime extraction). Kept so existing `@shared/providerCall` / `../../shared/providerCall`
  * imports across the app keep resolving unchanged.
  */

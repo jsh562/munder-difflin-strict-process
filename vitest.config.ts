@@ -6,9 +6,9 @@ import { resolve } from 'node:path';
 // (Node) modules; tests mock node-pty / electron rather than launching the app.
 export default defineConfig({
   // Resolve the extracted library from source (matches the electron-vite alias) so
-  // both the app's tests and the package's own tests import `@munder/agent-core`.
+  // both the app's tests and the package's own tests import `@jsh562/agent-core`.
   resolve: {
-    alias: { '@munder/agent-core': resolve(__dirname, 'packages/agent-core/src/index.ts') }
+    alias: { '@jsh562/agent-core': resolve(__dirname, 'packages/agent-core/src/index.ts') }
   },
   test: {
     environment: 'node',

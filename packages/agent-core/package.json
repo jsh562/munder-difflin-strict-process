@@ -1,7 +1,9 @@
 {
-  "name": "@munder/agent-core",
+  "name": "@jsh562/agent-core",
   "version": "0.1.0",
-  "private": true,
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
   "description": "Provider-agnostic agent runtime (DeepSeek/Minimax) + a governed, sandboxed coding toolkit. Bring your own host.",
   "license": "MIT",
   "type": "module",

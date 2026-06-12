@@ -1,5 +1,5 @@
 /** T007 / SC-005 — the shared port + contract leak no provider-specific type. The
- *  canonical contracts now live in the extracted @munder/agent-core package (the app's
+ *  canonical contracts now live in the extracted @jsh562/agent-core package (the app's
  *  `src/shared/*` are thin re-export shims), so the guard reads them at their source. */
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';

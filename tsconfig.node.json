@@ -11,7 +11,7 @@
     "types": ["node", "electron-vite/node"],
     "baseUrl": ".",
     "paths": {
-      "@munder/agent-core": ["packages/agent-core/src/index.ts"]
+      "@jsh562/agent-core": ["packages/agent-core/src/index.ts"]
     }
   },
   "include": ["src/main/**/*", "src/preload/**/*", "src/shared/**/*", "electron.vite.config.ts"],

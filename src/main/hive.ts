@@ -27,10 +27,10 @@ import { randomBytes, createHash } from 'node:crypto';
 import type { AgentUsageSample } from './usage';
 import type { AgentEvent } from '../shared/agentEvent';
 import { COMMAND_GROUPS } from '../shared/claudeCommands';
-// The mailbox + task-ledger vocabulary is owned by @munder/agent-core (so the extracted
+// The mailbox + task-ledger vocabulary is owned by @jsh562/agent-core (so the extracted
 // coding toolkit is host-agnostic); re-exported below so existing `import { HiveMessage }
 // from '../hive'` consumers across the app are unchanged.
-import type { MessageAct, HiveMessage, HiveTask } from '@munder/agent-core';
+import type { MessageAct, HiveMessage, HiveTask } from '@jsh562/agent-core';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 

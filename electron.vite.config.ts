@@ -14,7 +14,7 @@ const PINNED_SEMCONV = 'gen_ai_latest_experimental';
 // excluded from `externalizeDepsPlugin` so rollup bundles its TS source into BOTH main
 // rollup inputs (the main process + the native `agentWorker` utilityProcess) and the
 // renderer. Mirrors the existing `@shared` renderer alias.
-const AGENT_CORE = '@munder/agent-core';
+const AGENT_CORE = '@jsh562/agent-core';
 const AGENT_CORE_SRC = resolve(__dirname, 'packages/agent-core/src/index.ts');
 
 export default defineConfig({

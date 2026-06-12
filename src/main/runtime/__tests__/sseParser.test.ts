@@ -1,7 +1,7 @@
 /** E006 T001 — shared SSE parser: multi-line data, [DONE], chunk-split, event
  *  names, tolerant non-JSON. Electron-free, stream injected (HINT-001). */
 import { describe, it, expect } from 'vitest';
-import { parseSseStream, type ByteStream, SSE_DONE } from '@munder/agent-core';
+import { parseSseStream, type ByteStream, SSE_DONE } from '@jsh562/agent-core';
 
 /** Build a ByteStream that yields the given UTF-8 chunks (split exactly as passed). */
 function streamOf(chunks: string[]): ByteStream {

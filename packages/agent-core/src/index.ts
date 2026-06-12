@@ -1,5 +1,5 @@
 /**
- * @munder/agent-core — provider-agnostic agent runtime (DeepSeek/Minimax) plus a
+ * @jsh562/agent-core — provider-agnostic agent runtime (DeepSeek/Minimax) plus a
  * governed, sandboxed coding toolkit, extracted from the Munder Difflin harness so
  * it can host native agents in any system ("bring your own host"). This barrel is
  * the package's public API; it grows as modules migrate in (see the extraction plan).
@@ -32,4 +32,4 @@ export * from './runtime/adapters/minimaxAdapter';
 export * from './runtime/adapters/selectAdapter';
 
 /** Package wiring sentinel (kept for the workspace/alias smoke test). */
-export const AGENT_CORE_PACKAGE = '@munder/agent-core' as const;
+export const AGENT_CORE_PACKAGE = '@jsh562/agent-core' as const;

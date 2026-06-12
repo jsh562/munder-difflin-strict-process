@@ -11,7 +11,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { executeAgentTool, type AgentToolDeps, type HiveMessage } from '@munder/agent-core';
+import { executeAgentTool, type AgentToolDeps, type HiveMessage } from '@jsh562/agent-core';
 import { ControlRegistry } from '../../control';
 import { CircuitBreaker } from '../../breaker';
 

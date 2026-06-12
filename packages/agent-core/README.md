@@ -1,4 +1,4 @@
-# @munder/agent-core
+# @jsh562/agent-core
 
 A **provider-agnostic agent runtime** (DeepSeek / Minimax / your own) plus a
 **governed, sandboxed coding toolkit** — extracted from the Munder Difflin harness so
@@ -42,7 +42,7 @@ breaker, then calls `executeAgentTool`).
 import {
   makeDeepseekAdapter, runAgentLoop, executeAgentTool,
   AGENT_TOOL_CATALOG, NATIVE_AGENT_PREAMBLE, type AgentToolDeps
-} from '@munder/agent-core';
+} from '@jsh562/agent-core';
 
 // 1) A provider call (or: selectAdapter(process.env, { fetch: globalThis.fetch })).
 const providerCall = makeDeepseekAdapter({

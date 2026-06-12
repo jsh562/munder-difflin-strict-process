@@ -50,7 +50,7 @@ export default tseslint.config(
     }
   },
   {
-    // Architecture boundary (extraction guard): @munder/agent-core must stay
+    // Architecture boundary (extraction guard): @jsh562/agent-core must stay
     // host-agnostic — no electron, no node-pty, and NO import back into the host app
     // (src/**). It MAY use Node builtins (it's a Node library: fs/child_process/etc.).
     // This is the static counterpart to the runtime boundary.test.ts guard; together

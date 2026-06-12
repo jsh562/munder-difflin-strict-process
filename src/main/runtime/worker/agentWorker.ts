@@ -23,7 +23,7 @@ import {
   NATIVE_PROVIDER_MODEL_ENV,
   AGENT_TOOL_CATALOG,
   NATIVE_AGENT_PREAMBLE
-} from '@munder/agent-core';
+} from '@jsh562/agent-core';
 import type { ToolSpec, ToolUseRequest } from '../../../shared/providerCall';
 import type { WorkerCommand, WorkerMessage } from '../../../shared/workerProtocol';
 

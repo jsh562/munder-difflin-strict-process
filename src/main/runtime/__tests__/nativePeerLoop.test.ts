@@ -4,8 +4,8 @@
  *  the executeTool seam — and that the seam can route to the core hive tools
  *  (executeHiveTool) exactly as the native worker wires it. Pure Node, no electron. */
 import { describe, it, expect } from 'vitest';
-import { runAgentLoop, type AgentLoopDeps, type ToolResult } from '@munder/agent-core';
-import { executeHiveTool, CORE_HIVE_TOOL_NAMES, HIVE_TOOL_CATALOG, type HiveToolDeps } from '@munder/agent-core';
+import { runAgentLoop, type AgentLoopDeps, type ToolResult } from '@jsh562/agent-core';
+import { executeHiveTool, CORE_HIVE_TOOL_NAMES, HIVE_TOOL_CATALOG, type HiveToolDeps } from '@jsh562/agent-core';
 import type { AgentEvent } from '../../../shared/agentEvent';
 import type { ProviderCall, ProviderRequest, ProviderTurn, ToolSpec, ToolUseRequest } from '../../../shared/providerCall';
 

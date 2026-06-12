@@ -28,7 +28,7 @@ import { ControlRegistry } from './control';
 import { ClaudeRuntime } from './runtime/claudeRuntime';
 import { NativeRuntime } from './runtime/nativeRuntime';
 import { createNativeEventBridge, loadNativeEvents } from './runtime/nativeEventBridge';
-import { executeAgentTool, type AgentToolDeps } from '@munder/agent-core';
+import { executeAgentTool, type AgentToolDeps } from '@jsh562/agent-core';
 import { redactConfig, injectionEnvForProvider, keyPresence, setKeyInConfig, clearKeyInConfig, type SafeConfig } from './credentials';
 import { listProviders } from '../shared/providerRegistry';
 import { deriveProviderId } from '../shared/assignment';
