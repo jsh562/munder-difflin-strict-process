@@ -39,7 +39,7 @@
  * code?, message? }` so the loop's `withReliability` (ADR-0009) classifies it; the
  * adapter does NOT retry itself.
  */
-import { AGENT_EVENT_VERSION, type AgentEvent } from '../../../../shared/agentEvent';
+import { AGENT_EVENT_VERSION, type AgentEvent } from '../../contracts/agentEvent';
 import type {
   ChatMessage,
   ProviderCall,
@@ -47,8 +47,8 @@ import type {
   ProviderTurn,
   ToolUseRequest,
   UsageDelta
-} from '../../../../shared/providerCall';
-import { lookupCapabilities, lookupModel } from '../../../../shared/providerRegistry';
+} from '../../contracts/providerCall';
+import { lookupCapabilities, lookupModel } from '../../contracts/providerRegistry';
 import { makeCapabilityGate, type CapabilityGate } from './capabilityGate';
 // Reuse the DeepSeek adapter's injected fetch contract verbatim (PriorExports) so
 // both adapters share one boundary shape — no second copy of the fetch types.

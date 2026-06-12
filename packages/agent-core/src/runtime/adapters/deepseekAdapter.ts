@@ -29,15 +29,15 @@
  * error shaped `{ status?, retryAfter?, code?, message? }` so the loop's
  * `withReliability` (ADR-0009) classifies it; the adapter does NOT retry itself.
  */
-import { AGENT_EVENT_VERSION, type AgentEvent } from '../../../../shared/agentEvent';
+import { AGENT_EVENT_VERSION, type AgentEvent } from '../../contracts/agentEvent';
 import type {
   ProviderCall,
   ProviderRequest,
   ProviderTurn,
   ToolUseRequest,
   UsageDelta
-} from '../../../../shared/providerCall';
-import { lookupCapabilities } from '../../../../shared/providerRegistry';
+} from '../../contracts/providerCall';
+import { lookupCapabilities } from '../../contracts/providerRegistry';
 import { makeCapabilityGate, type CapabilityGate } from './capabilityGate';
 import { parseSseStream, type ByteStream } from './sseParser';
 

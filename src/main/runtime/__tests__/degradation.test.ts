@@ -13,9 +13,9 @@
  *  path (deepseek, caching supported / images+MCP+web-search gated). Electron-free,
  *  `fetch` injected (HINT-001); no live network. */
 import { describe, it, expect } from 'vitest';
-import { makeDeepseekAdapter, type FetchLike, type FetchResponseLike } from '../worker/adapters/deepseekAdapter';
-import { makeMinimaxAdapter } from '../worker/adapters/minimaxAdapter';
-import type { ByteStream } from '../worker/adapters/sseParser';
+import { makeDeepseekAdapter, type FetchLike, type FetchResponseLike } from '@munder/agent-core';
+import { makeMinimaxAdapter } from '@munder/agent-core';
+import type { ByteStream } from '@munder/agent-core';
 import type { AgentEvent, NotificationEvent } from '../../../shared/agentEvent';
 import type { ProviderCall, ProviderRequest } from '../../../shared/providerCall';
 

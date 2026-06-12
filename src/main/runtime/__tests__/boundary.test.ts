@@ -1,9 +1,11 @@
-/** T007 / SC-005 — the shared port + contract leak no provider-specific type. */
+/** T007 / SC-005 — the shared port + contract leak no provider-specific type. The
+ *  canonical contracts now live in the extracted @munder/agent-core package (the app's
+ *  `src/shared/*` are thin re-export shims), so the guard reads them at their source. */
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, it, expect } from 'vitest';
 
-const SHARED = resolve(process.cwd(), 'src/shared');
+const CONTRACTS = resolve(process.cwd(), 'packages/agent-core/src/contracts');
 // Vendor names only — substring checks like "pty"/"hook" would false-positive on
 // benign identifiers (e.g. "EMPTY"_CAPABILITY contains "pty"). Provider-specific
 // IMPORTS are covered by the separate import-line check below.
@@ -11,7 +13,7 @@ const VENDOR = /(claude|deepseek|minimax|anthropic)/i;
 
 describe('shared boundary', () => {
   for (const file of ['agentEvent.ts', 'providerRuntime.ts']) {
-    const src = readFileSync(resolve(SHARED, file), 'utf8');
+    const src = readFileSync(resolve(CONTRACTS, file), 'utf8');
 
     it(`${file} imports nothing provider-specific`, () => {
       const imports = src.split('\n').filter((l) => /^\s*import\b/.test(l));

@@ -4,7 +4,7 @@
  * Electron-free so vitest exercises the loop. E006 replaces this with the real
  * DeepSeek/Minimax adapters implementing the same `ProviderCall` contract.
  */
-import type { ProviderCall, ProviderTurn } from '../../../shared/providerCall';
+import type { ProviderCall, ProviderTurn } from '../contracts/providerCall';
 
 export function makeStubProvider(): ProviderCall {
   let call = 0;

@@ -18,8 +18,8 @@
  * capabilities); a native desk's autonomy/drain, telemetry, avatars, and breaker all
  * flow through the existing AgentEvent stream regardless.
  */
-import type { ToolSpec } from '../../shared/providerCall';
-import type { HiveMessage, HiveTask } from '../hive';
+import type { ToolSpec } from '../contracts/providerCall';
+import type { HiveMessage, HiveTask } from '../coordination/types';
 
 /** The minimal hive surface the dispatcher needs (injected; the real HiveManager). */
 export interface HiveToolDeps {

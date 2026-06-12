@@ -15,11 +15,15 @@
  *    `toolResult`); MAIN executes against the hive tool handlers (single-committer
  *    preserved, FR-009). The stub's local echo is used only on the stub fallback.
  */
-import { runAgentLoop } from './agentLoop';
-import { makeStubProvider, stubExecuteTool } from './stubProvider';
-import { selectAdapter } from './adapters/selectAdapter';
-import { NATIVE_PROVIDER_MODEL_ENV } from './adapters/selectAdapterEnv';
-import { AGENT_TOOL_CATALOG, NATIVE_AGENT_PREAMBLE } from '../agentToolCatalog';
+import {
+  runAgentLoop,
+  makeStubProvider,
+  stubExecuteTool,
+  selectAdapter,
+  NATIVE_PROVIDER_MODEL_ENV,
+  AGENT_TOOL_CATALOG,
+  NATIVE_AGENT_PREAMBLE
+} from '@munder/agent-core';
 import type { ToolSpec, ToolUseRequest } from '../../../shared/providerCall';
 import type { WorkerCommand, WorkerMessage } from '../../../shared/workerProtocol';
 

@@ -12,8 +12,8 @@ import {
   contextTierThreshold,
   type FetchLike,
   type FetchResponseLike
-} from '../worker/adapters/minimaxAdapter';
-import type { ByteStream } from '../worker/adapters/sseParser';
+} from '@munder/agent-core';
+import type { ByteStream } from '@munder/agent-core';
 import type { AgentEvent } from '../../../shared/agentEvent';
 import type { ProviderRequest } from '../../../shared/providerCall';
 import { lookupModel } from '../../../shared/providerRegistry';

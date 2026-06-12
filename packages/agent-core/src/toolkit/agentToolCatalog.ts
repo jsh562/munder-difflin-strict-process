@@ -15,7 +15,7 @@
  * executor fails closed on bad input (it returns an error tool-result the loop
  * feeds back for self-correction, never a crash).
  */
-import type { ToolSpec } from '../../shared/providerCall';
+import type { ToolSpec } from '../contracts/providerCall';
 import { HIVE_TOOL_CATALOG } from './hiveTools';
 
 /** The coding tools added on top of the hive tools (filesystem/search/shell/memory). */

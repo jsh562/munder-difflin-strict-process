@@ -1,9 +1,9 @@
 /** E003 — agent-loop scaffold: ordered events, monotonic usage, autonomy
  *  continue/idle, and guaranteed termination (SC-003/004/005/007). Pure Node. */
 import { describe, it, expect } from 'vitest';
-import { runAgentLoop, type AgentLoopDeps, type ToolResult } from '../worker/agentLoop';
+import { runAgentLoop, type AgentLoopDeps, type ToolResult } from '@munder/agent-core';
 import { isMonotonicTokenUsage, type AgentEvent, type TokenUsageEvent } from '../../../shared/agentEvent';
-import { makeStubProvider, stubExecuteTool } from '../worker/stubProvider';
+import { makeStubProvider, stubExecuteTool } from '@munder/agent-core';
 import type { ProviderCall, ProviderTurn, ToolUseRequest } from '../../../shared/providerCall';
 
 function baseDeps(over: Partial<AgentLoopDeps>): AgentLoopDeps {

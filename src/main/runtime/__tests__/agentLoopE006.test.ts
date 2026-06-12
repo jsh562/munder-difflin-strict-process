@@ -2,7 +2,7 @@
  *  providerCall (adapter streaming), reliability-mapped api-error, malformed tool
  *  result path, and the per-turn wall-clock budget terminal stop. Pure Node. */
 import { describe, it, expect } from 'vitest';
-import { runAgentLoop, type AgentLoopDeps, type ToolResult } from '../worker/agentLoop';
+import { runAgentLoop, type AgentLoopDeps, type ToolResult } from '@munder/agent-core';
 import type { AgentEvent } from '../../../shared/agentEvent';
 import type { ProviderCall, ProviderTurn, ToolUseRequest } from '../../../shared/providerCall';
 

@@ -14,9 +14,9 @@
  * gate is per-runtime (one instance per desk session) so the dedupe scope is the
  * session (desk lifetime), per the spec Glossary.
  */
-import type { AgentEvent } from '../../../../shared/agentEvent';
-import { AGENT_EVENT_VERSION } from '../../../../shared/agentEvent';
-import type { CapabilityDescriptor } from '../../../../shared/providerRuntime';
+import type { AgentEvent } from '../../contracts/agentEvent';
+import { AGENT_EVENT_VERSION } from '../../contracts/agentEvent';
+import type { CapabilityDescriptor } from '../../contracts/providerRuntime';
 
 /** The four gated capabilities — one per `CapabilityDescriptor` flag. */
 export type GatedCapability = 'images' | 'mcpTools' | 'webSearch' | 'caching';

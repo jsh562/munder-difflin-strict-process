@@ -4,6 +4,7 @@
   "private": true,
   "description": "Local multi-agent harness for Claude Code: autonomous agents that message, route, and remember — coordinated by a GOD orchestrator and visualized as avatars at work.",
   "main": "out/main/index.js",
+  "workspaces": ["packages/*"],
   "author": "Chaitanya Giri",
   "homepage": "https://munderdiffl.in/",
   "repository": {
@@ -17,16 +18,18 @@
     "postinstall": "electron-rebuild -f && node tools/ensure-pty-perms.cjs",
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json",
     "typecheck:web": "tsc --noEmit -p tsconfig.web.json",
-    "typecheck": "npm run typecheck:node && npm run typecheck:web",
+    "typecheck:pkg": "tsc --noEmit -p packages/agent-core/tsconfig.json",
+    "typecheck": "npm run typecheck:node && npm run typecheck:web && npm run typecheck:pkg",
     "test": "vitest",
     "test:run": "vitest run",
-    "lint": "eslint src",
+    "lint": "eslint src packages",
     "dist": "npm run build && electron-builder",
     "dist:mac": "npm run build && electron-builder --mac",
     "dist:win": "npm run build && electron-builder --win",
     "dist:linux": "npm run build && electron-builder --linux"
   },
   "dependencies": {
+    "@munder/agent-core": "*",
     "@codemirror/lang-css": "^6.3.1",
     "@codemirror/lang-html": "^6.4.11",
     "@codemirror/lang-javascript": "^6.2.5",

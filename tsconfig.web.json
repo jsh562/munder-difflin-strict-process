@@ -18,7 +18,8 @@
     "paths": {
       "@/*": ["src/renderer/src/*"],
       "@brand/*": ["docs/*"],
-      "@shared/*": ["src/shared/*"]
+      "@shared/*": ["src/shared/*"],
+      "@munder/agent-core": ["packages/agent-core/src/index.ts"]
     }
   },
   "include": ["src/renderer/**/*", "src/preload/index.d.ts", "src/shared/**/*"],

@@ -12,7 +12,7 @@ export default tseslint.config(
     ignores: [
       'node_modules/**',
       'out/**',
-      'dist/**',
+      '**/dist/**',
       '.test-build/**',
       'docs/**',
       'landing-remotion/**',
@@ -47,6 +47,26 @@ export default tseslint.config(
     rules: {
       'react-hooks/rules-of-hooks': 'warn',
       'react-hooks/exhaustive-deps': 'warn'
+    }
+  },
+  {
+    // Architecture boundary (extraction guard): @munder/agent-core must stay
+    // host-agnostic — no electron, no node-pty, and NO import back into the host app
+    // (src/**). It MAY use Node builtins (it's a Node library: fs/child_process/etc.).
+    // This is the static counterpart to the runtime boundary.test.ts guard; together
+    // they keep the package independently publishable.
+    files: ['packages/agent-core/src/**/*.ts'],
+    rules: {
+      'no-restricted-imports': ['error', {
+        paths: [
+          { name: 'electron', message: 'agent-core must stay host-agnostic — no electron.' },
+          { name: 'node-pty', message: 'agent-core must stay host-agnostic — no node-pty.' }
+        ],
+        patterns: [
+          { group: ['electron/*'], message: 'agent-core must stay host-agnostic — no electron.' },
+          { group: ['**/src/main/**', '**/src/renderer/**', '**/src/preload/**', '**/src/shared/**'], message: 'agent-core must not import the host app (src/**) — invert the dependency via an injected seam.' }
+        ]
+      }]
     }
   }
 );

@@ -24,7 +24,7 @@
  * Electron-free + unit-testable (HINT-001): the model/env/fetch are injectable; the
  * real global `fetch` is the default. No SDK or wire type crosses this boundary.
  */
-import { lookupModelInfo } from '../../../../shared/providerRegistry';
+import { lookupModelInfo } from '../../contracts/providerRegistry';
 import {
   NATIVE_PROVIDER_API_KEY_ENV,
   NATIVE_PROVIDER_ID_ENV,
@@ -32,7 +32,7 @@ import {
 } from './selectAdapterEnv';
 import { makeDeepseekAdapter, type FetchLike } from './deepseekAdapter';
 import { makeMinimaxAdapter } from './minimaxAdapter';
-import type { ProviderCall } from '../../../../shared/providerCall';
+import type { ProviderCall } from '../../contracts/providerCall';
 
 /** The minimal env shape `selectAdapter` reads — a plain string map (injectable). */
 export type EnvLike = Record<string, string | undefined>;

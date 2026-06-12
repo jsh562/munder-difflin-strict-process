@@ -15,13 +15,13 @@ import {
   makeDeepseekAdapter,
   type FetchLike as DsFetch,
   type FetchResponseLike as DsResponse
-} from '../worker/adapters/deepseekAdapter';
+} from '@munder/agent-core';
 import {
   makeMinimaxAdapter,
   type FetchLike as MmFetch,
   type FetchResponseLike as MmResponse
-} from '../worker/adapters/minimaxAdapter';
-import type { ByteStream } from '../worker/adapters/sseParser';
+} from '@munder/agent-core';
+import type { ByteStream } from '@munder/agent-core';
 import type { AgentEvent } from '../../../shared/agentEvent';
 import type { ProviderCall, ProviderRequest, ProviderTurn } from '../../../shared/providerCall';
 

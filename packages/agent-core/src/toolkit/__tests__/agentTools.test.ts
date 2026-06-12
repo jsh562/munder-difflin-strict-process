@@ -1,27 +1,18 @@
 /**
- * Native-desk coding toolkit — executor + governance tests (pure Node, no electron).
- *
- * Covers: filesystem (read/write/edit/list) + grep + write_memory round-trips against
- * a temp cwd; the cwd SANDBOX (a `..` or absolute escape is rejected, never executed);
- * bash OPT-IN (off by default) + the destructive-command guard; the catalog↔executor
- * conformance (no drift); and the real governance wiring (the index.ts executeToolFor
- * order) driven through the ACTUAL ControlRegistry + CircuitBreaker — so an operator
- * gate/pause/halt denies and the breaker is fed exactly as a Claude desk's would be.
+ * Coding toolkit executor tests (pure Node, no host/electron). Covers filesystem
+ * (read/write/edit/list) + grep + write_memory round-trips against a temp cwd; the
+ * cwd SANDBOX (a `..` or absolute escape is rejected, never executed); bash OPT-IN
+ * (off by default) + the destructive-command guard; and the catalog↔executor
+ * conformance. The governance wiring (host gate/breaker order) is exercised by the
+ * host's own test, since it composes this executor with the host's control modules.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import {
-  executeAgentTool,
-  resolveInsideCwd,
-  dangerousCommand,
-  type AgentToolDeps
-} from '../agentTools';
+import { executeAgentTool, resolveInsideCwd, dangerousCommand, type AgentToolDeps } from '../agentTools';
 import { AGENT_TOOL_CATALOG, AGENT_TOOL_NAMES } from '../agentToolCatalog';
-import { ControlRegistry } from '../../control';
-import { CircuitBreaker } from '../../breaker';
-import type { HiveMessage } from '../../hive';
+import type { HiveMessage } from '../../coordination/types';
 
 /** A fake hive + cwd that satisfies AgentToolDeps, backed by an on-disk temp cwd. */
 function makeFixture(cwd: string, over: Partial<AgentToolDeps> = {}): {
@@ -245,61 +236,5 @@ describe('catalog ↔ executor conformance (no drift)', () => {
     for (const codingTool of ['read_file', 'write_file', 'edit_file', 'list_dir', 'grep', 'bash', 'write_memory']) {
       expect(AGENT_TOOL_NAMES).toContain(codingTool);
     }
-  });
-});
-
-describe('governance wiring — the index.ts executeToolFor order (real Control + Breaker)', () => {
-  /** Rebuild the exact governed dispatch the native runtime is wired with. */
-  function governed(control: ControlRegistry, breaker: CircuitBreaker, deps: AgentToolDeps) {
-    return async (id: string, req: { toolName: string; toolInput: unknown }) => {
-      if (control.shouldHalt(id)) return { content: 'halted by operator', success: false };
-      const decision = control.toolDecision(id, req.toolName);
-      if (decision.deny) return { content: decision.reason ?? 'denied by operator', success: false };
-      breaker.recordToolUse(id, req.toolName, req.toolInput);
-      return executeAgentTool(deps, id, req);
-    };
-  }
-
-  it('a gated tool is denied before the executor runs', async () => {
-    const control = new ControlRegistry();
-    const breaker = new CircuitBreaker(() => ({} as never));
-    let ran = false;
-    const { deps } = makeFixture(cwd, { resolveCwd: () => { ran = true; return cwd; } });
-    const run = governed(control, breaker, deps);
-
-    control.gateTool('a', 'write_file', true);
-    const denied = await run('a', { toolName: 'write_file', toolInput: { path: 'x.txt', content: 'y' } });
-    expect(denied.success).toBe(false);
-    expect(denied.content).toMatch(/gated/);
-    expect(ran).toBe(false); // executor never reached
-  });
-
-  it('a paused or halted desk is denied all tools', async () => {
-    const control = new ControlRegistry();
-    const breaker = new CircuitBreaker(() => ({} as never));
-    const { deps } = makeFixture(cwd);
-    const run = governed(control, breaker, deps);
-
-    control.pause('a', true);
-    expect((await run('a', { toolName: 'list_dir', toolInput: {} })).success).toBe(false);
-    control.resume('a');
-    control.halt('a');
-    expect((await run('a', { toolName: 'list_dir', toolInput: {} })).content).toMatch(/halted/);
-  });
-
-  it('an allowed call feeds the breaker — repeated identical calls trip it', async () => {
-    const control = new ControlRegistry();
-    const breaker = new CircuitBreaker(() => ({} as never));
-    writeFileSync(join(cwd, 'a.txt'), 'x', 'utf8');
-    const { deps } = makeFixture(cwd);
-    const run = governed(control, breaker, deps);
-
-    // 8 identical tool calls = the default repeatedToolLimit → the breaker trips.
-    for (let i = 0; i < 8; i++) {
-      const r = await run('a', { toolName: 'read_file', toolInput: { path: 'a.txt' } });
-      expect(r.success).toBe(true);
-    }
-    const decisions = breaker.tick([{ agentId: 'a', sample: null, progressing: true }], 0);
-    expect(decisions[0].state.level).not.toBe('healthy');
   });
 });

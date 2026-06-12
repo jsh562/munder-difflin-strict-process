@@ -9,7 +9,7 @@
  * The electron utilityProcess transport (agentWorker.ts) wires `emit` to the
  * parent port and `requestDrain` to an IPC round-trip; tests inject fakes.
  */
-import { AGENT_EVENT_VERSION, type AgentEvent } from '../../../shared/agentEvent';
+import { AGENT_EVENT_VERSION, type AgentEvent } from '../contracts/agentEvent';
 import type {
   ChatMessage,
   ProviderCall,
@@ -17,7 +17,7 @@ import type {
   ToolSpec,
   ToolUseRequest,
   UsageDelta
-} from '../../../shared/providerCall';
+} from '../contracts/providerCall';
 import {
   ReliabilityError,
   withReliability,
