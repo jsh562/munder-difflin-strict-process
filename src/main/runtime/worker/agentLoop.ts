@@ -144,7 +144,13 @@ export async function runAgentLoop(deps: AgentLoopDeps, initialInput: string): P
       emitUsage();
 
       if (turn.text) deps.emit({ ...env(), kind: 'text-delta', text: turn.text });
-      messages.push({ role: 'assistant', content: turn.text ?? '' });
+      messages.push({
+        role: 'assistant',
+        content: turn.text ?? '',
+        // Preserve the tool calls this turn made so the next round's history is valid
+        // (the following `tool` replies need a matching assistant tool-call to bind to).
+        ...(turn.toolUses.length > 0 ? { toolCalls: turn.toolUses } : {})
+      });
 
       if (turn.endOfTurn || turn.toolUses.length === 0) break;
 

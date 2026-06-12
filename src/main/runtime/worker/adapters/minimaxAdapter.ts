@@ -206,6 +206,22 @@ function mapMessage(m: ChatMessage): Record<string, unknown> {
       content: [{ type: 'tool_result', tool_use_id: m.toolCallId ?? '', content: m.content }]
     };
   }
+  if (m.role === 'assistant' && m.toolCalls && m.toolCalls.length > 0) {
+    // An assistant turn that called tools maps to `tool_use` content blocks; their ids
+    // match the following `tool_result.tool_use_id` — Anthropic 400s on an orphan.
+    return {
+      role: 'assistant',
+      content: [
+        ...(m.content ? [{ type: 'text', text: m.content }] : []),
+        ...m.toolCalls.map((tc) => ({
+          type: 'tool_use',
+          id: tc.toolCallId,
+          name: tc.toolName,
+          input: tc.toolInput
+        }))
+      ]
+    };
+  }
   return { role: m.role, content: m.content };
 }
 
@@ -297,12 +313,21 @@ export function makeMinimaxAdapter(deps: MinimaxAdapterDeps): ProviderCall {
 
     if (!response.ok) {
       // Surface a key-free, bounded diagnostic shaped for `classifyError` — the loop
-      // decides retry vs terminal from the status (no internal retry here).
+      // decides retry vs terminal from the status (no internal retry here). Include a
+      // bounded slice of the provider's error body (its JSON error message — never the
+      // key, which only rides the Authorization header) so the reason is visible.
       const retryAfter = response.headers.get('retry-after') ?? undefined;
-      throw new MinimaxAdapterError(`Minimax HTTP ${response.status}`, {
-        status: response.status,
-        retryAfter: retryAfter ?? undefined
-      });
+      // Scrub the key BEFORE slicing — a hostile/sloppy provider could echo it in the
+      // body, and FR-013/ADR-0007 forbid it reaching the surfaced error.
+      let detail = '';
+      try {
+        const raw = await response.text();
+        detail = (apiKey ? raw.split(apiKey).join('(redacted)') : raw).slice(0, 500);
+      } catch { /* body unavailable */ }
+      throw new MinimaxAdapterError(
+        `Minimax HTTP ${response.status}${detail ? `: ${detail}` : ''}`,
+        { status: response.status, retryAfter: retryAfter ?? undefined }
+      );
     }
     if (!response.body) {
       // OK status but no stream body — treat as a transient stream fault (retryable).

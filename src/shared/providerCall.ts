@@ -18,6 +18,10 @@ export interface ChatMessage {
   content: string;
   /** Present on a `tool` message — the tool call it answers. */
   toolCallId?: string;
+  /** Present on an `assistant` message that requested tools — preserved across rounds
+   *  so the follow-up request echoes the provider's required tool-call shape. Without
+   *  it, an OpenAI/Anthropic-compatible provider 400s on the orphaned tool reply. */
+  toolCalls?: ToolUseRequest[];
 }
 
 export interface ToolSpec {

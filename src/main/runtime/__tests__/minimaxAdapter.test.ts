@@ -103,6 +103,55 @@ const TOOL_REQ: ProviderRequest = {
   tools: [{ name: 'list_dir', description: 'list', inputSchema: { type: 'object' } }]
 };
 
+describe('multi-round tool history — assistant tool_use preserved (provider-400 fix)', () => {
+  const MULTI_ROUND_REQ: ProviderRequest = {
+    messages: [
+      { role: 'user', content: 'read the file' },
+      { role: 'assistant', content: '', toolCalls: [{ toolName: 'read_file', toolInput: { path: '/tmp/a.txt' }, toolCallId: 'tu_x' }] },
+      { role: 'tool', content: 'file contents', toolCallId: 'tu_x' }
+    ],
+    tools: [{ name: 'read_file', description: 'read', inputSchema: { type: 'object' } }]
+  };
+
+  it('serializes the assistant tool calls as Anthropic tool_use blocks whose id matches the tool_result', async () => {
+    const { call, requests } = adapterOver([
+      okResponse(streamOf([
+        sse('message_start', { message: { usage: { input_tokens: 1, output_tokens: 0 } } }),
+        sse('content_block_start', { index: 0, content_block: { type: 'text', text: '' } }),
+        sse('content_block_delta', { index: 0, delta: { type: 'text_delta', text: 'ok' } }),
+        sse('content_block_stop', { index: 0 }),
+        sse('message_delta', { delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 1 } }),
+        sse('message_stop', {})
+      ]))
+    ]);
+    await runRound(call, MULTI_ROUND_REQ);
+
+    const body = requests[0].body as { messages: Array<Record<string, unknown>> };
+    const assistant = body.messages.find((m) => m.role === 'assistant');
+    expect(assistant?.content).toEqual([
+      { type: 'tool_use', id: 'tu_x', name: 'read_file', input: { path: '/tmp/a.txt' } }
+    ]);
+    // The tool reply (a `user` message with a tool_result block) binds to the same id.
+    const toolResultMsg = body.messages.find(
+      (m) => Array.isArray(m.content) && (m.content as Array<Record<string, unknown>>).some((b) => b.type === 'tool_result')
+    );
+    const block = (toolResultMsg?.content as Array<Record<string, unknown>>).find((b) => b.type === 'tool_result');
+    expect(block?.tool_use_id).toBe('tu_x');
+  });
+
+  it('surfaces the provider error body on a non-2xx (diagnosability)', async () => {
+    const errResponse: FetchResponseLike = {
+      ok: false,
+      status: 400,
+      body: null,
+      headers: { get: () => null },
+      text: async () => '{"base_resp":{"status_msg":"invalid model id"}}'
+    };
+    const { call } = adapterOver([errResponse]);
+    await expect(runRound(call, TOOL_REQ)).rejects.toThrow(/HTTP 400.*invalid model id/);
+  });
+});
+
 describe('T016 {FR-004,FR-005} — content-block assembly, thinking vs text, tool-use stop ⇒ continue', () => {
   it('assembles a tool_use input from partial_json fragments at content_block_stop (never mid-stream)', async () => {
     // The `input` arrives as partial-JSON fragments that are only valid once joined.

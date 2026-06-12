@@ -165,6 +165,19 @@ function buildBody(req: ProviderRequest, model: string, gate: CapabilityGate): s
     if (m.role === 'tool') {
       return { role: 'tool', tool_call_id: m.toolCallId ?? '', content: m.content };
     }
+    if (m.role === 'assistant' && m.toolCalls && m.toolCalls.length > 0) {
+      // Echo the assistant's tool calls so the following `tool` reply has a matching
+      // `tool_call_id` — an OpenAI-compatible provider 400s on an orphaned tool reply.
+      return {
+        role: 'assistant',
+        content: m.content,
+        tool_calls: m.toolCalls.map((tc) => ({
+          id: tc.toolCallId,
+          type: 'function',
+          function: { name: tc.toolName, arguments: JSON.stringify(tc.toolInput) }
+        }))
+      };
+    }
     return { role: m.role, content: m.content };
   });
   const body: Record<string, unknown> = {
@@ -264,12 +277,21 @@ export function makeDeepseekAdapter(deps: DeepseekAdapterDeps): ProviderCall {
 
     if (!response.ok) {
       // Surface a key-free, bounded diagnostic shaped for `classifyError` — the loop
-      // decides retry vs terminal from the status (no internal retry here).
+      // decides retry vs terminal from the status (no internal retry here). Include a
+      // bounded slice of the provider's error body (its JSON error message — never the
+      // key, which only rides the Authorization header) so the reason is visible.
       const retryAfter = response.headers.get('retry-after') ?? undefined;
-      throw new DeepseekAdapterError(`DeepSeek HTTP ${response.status}`, {
-        status: response.status,
-        retryAfter: retryAfter ?? undefined
-      });
+      // Scrub the key BEFORE slicing — a hostile/sloppy provider could echo it in the
+      // body, and FR-013/ADR-0007 forbid it reaching the surfaced error.
+      let detail = '';
+      try {
+        const raw = await response.text();
+        detail = (apiKey ? raw.split(apiKey).join('(redacted)') : raw).slice(0, 500);
+      } catch { /* body unavailable */ }
+      throw new DeepseekAdapterError(
+        `DeepSeek HTTP ${response.status}${detail ? `: ${detail}` : ''}`,
+        { status: response.status, retryAfter: retryAfter ?? undefined }
+      );
     }
     if (!response.body) {
       // OK status but no stream body — treat as a transient stream fault (retryable).

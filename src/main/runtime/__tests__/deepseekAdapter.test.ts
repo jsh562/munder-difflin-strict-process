@@ -98,6 +98,46 @@ const TOOL_REQ: ProviderRequest = {
   tools: [{ name: 'list_dir', description: 'list', inputSchema: { type: 'object' } }]
 };
 
+describe('multi-round tool history — assistant tool_calls preserved (provider-400 fix)', () => {
+  // A second-round request: the assistant turn that called a tool, then the tool reply.
+  // Without serialized `tool_calls`, DeepSeek 400s the orphaned tool message.
+  const MULTI_ROUND_REQ: ProviderRequest = {
+    messages: [
+      { role: 'user', content: 'read the file' },
+      { role: 'assistant', content: '', toolCalls: [{ toolName: 'read_file', toolInput: { path: '/tmp/a.txt' }, toolCallId: 'call_x' }] },
+      { role: 'tool', content: 'file contents', toolCallId: 'call_x' }
+    ],
+    tools: [{ name: 'read_file', description: 'read', inputSchema: { type: 'object' } }]
+  };
+
+  it('serializes the assistant tool calls as OpenAI tool_calls whose id matches the tool reply', async () => {
+    const { call, requests } = adapterOver([
+      okResponse(streamOf([sse({ choices: [{ index: 0, delta: { content: 'ok' }, finish_reason: 'stop' }] })]))
+    ]);
+    await runRound(call, MULTI_ROUND_REQ);
+
+    const body = requests[0].body as { messages: Array<Record<string, unknown>> };
+    const assistant = body.messages.find((m) => m.role === 'assistant');
+    expect(assistant?.tool_calls).toEqual([
+      { id: 'call_x', type: 'function', function: { name: 'read_file', arguments: JSON.stringify({ path: '/tmp/a.txt' }) } }
+    ]);
+    const toolMsg = body.messages.find((m) => m.role === 'tool');
+    expect(toolMsg?.tool_call_id).toBe('call_x'); // binds to the assistant tool-call id
+  });
+
+  it('surfaces the provider error body on a non-2xx (diagnosability)', async () => {
+    const errResponse: FetchResponseLike = {
+      ok: false,
+      status: 400,
+      body: null,
+      headers: { get: () => null },
+      text: async () => '{"error":{"message":"messages: tool_call_id not found"}}'
+    };
+    const { call } = adapterOver([errResponse]);
+    await expect(runRound(call, TOOL_REQ)).rejects.toThrow(/HTTP 400.*tool_call_id not found/);
+  });
+});
+
 describe('T010 {FR-001,FR-002,FR-003} — index-keyed multi-call + multi-round assembly; reasoning→thinking', () => {
   it('assembles two concurrent tool calls keyed by index, parsing args only at completion', async () => {
     // Two tool calls interleaved across deltas, ids/names on the first delta per index,
