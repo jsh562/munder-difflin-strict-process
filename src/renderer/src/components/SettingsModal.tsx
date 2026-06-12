@@ -75,6 +75,21 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
     catch { setNotifications(!next); /* revert on failure */ }
   };
 
+  // ─── Web search (native desks, Brave Search API) ────────────────────────────
+  // `webSearchEnabled` is the operator gate (a config boolean); the API key rides the
+  // credentials store under the reserved 'web-search' id (presence-only to the
+  // renderer, redacted like any provider key). Reuses saveKey/removeKey/keyDraft.
+  const WEB_SEARCH_KEY_ID = 'web-search';
+  const [webSearchEnabled, setWebSearchEnabled] = useState<boolean>(
+    (config as HarnessConfig & { webSearchEnabled?: boolean }).webSearchEnabled === true
+  );
+  const toggleWebSearch = async () => {
+    const next = !webSearchEnabled;
+    setWebSearchEnabled(next); // optimistic
+    try { await window.cth.updateConfig({ webSearchEnabled: next }); }
+    catch { setWebSearchEnabled(!next); /* revert on failure */ }
+  };
+
   // ─── circuit-breaker config (Lane A #6 canonical fields, widened view) ───────
   // Drives Jim's real breaker: floor-wide TOKEN budget (costCapTokens) + output-
   // token velocity ceiling (circuitBreaker.tokenVelocityPerMin). The token cap
@@ -203,8 +218,9 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
     let alive = true;
     window.cth.getConfig().then((c) => {
       if (!alive) return;
-      const cc = c as BreakerCfgView & SlackConfig & { notifications?: boolean };
+      const cc = c as BreakerCfgView & SlackConfig & { notifications?: boolean; webSearchEnabled?: boolean };
       setNotifications(cc.notifications === true);
+      setWebSearchEnabled(cc.webSearchEnabled === true);
       setAgentBudget(cc.costCapTokens != null ? String(cc.costCapTokens) : '');
       setVelocityCeiling(cc.circuitBreaker?.tokenVelocityPerMin != null ? String(cc.circuitBreaker.tokenVelocityPerMin) : '');
       setSlackEnabled(cc.slackEnabled ?? false);
@@ -584,10 +600,10 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
                     hive and injected only into an agent's worker — never shown back or sent to git.
                   </span>
                 </div>
-                {Object.keys(keyPresence).length === 0 ? (
+                {Object.keys(keyPresence).filter((id) => id !== WEB_SEARCH_KEY_ID).length === 0 ? (
                   <span style={{ fontSize: 12, color: 'var(--cth-ink-500)' }}>No native providers registered.</span>
                 ) : (
-                  Object.keys(keyPresence).sort().map((providerId) => (
+                  Object.keys(keyPresence).filter((id) => id !== WEB_SEARCH_KEY_ID).sort().map((providerId) => (
                     <div key={providerId} style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}>
                       <label style={{ display: 'flex', flexDirection: 'column', gap: 4, flex: 1 }}>
                         <span style={slackLabelStyle}>
@@ -621,6 +637,65 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
                   ))
                 )}
                 {keyNote && <span style={{ fontSize: 12, color: 'var(--cth-ink-500)' }}>{keyNote}</span>}
+              </div>
+
+              <div style={{ height: 2, background: 'var(--cth-ink-300)' }} />
+
+              {/* Web search (native desks) — Brave Search API */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                    <span style={{ fontSize: 14, lineHeight: '20px', color: 'var(--cth-ink-900)' }}>
+                      Web search (native desks)
+                    </span>
+                    <span style={{ fontSize: 12, lineHeight: '16px', color: 'var(--cth-ink-500)' }}>
+                      Lets DeepSeek/Minimax desks use the <code>web_search</code> tool via the Brave
+                      Search API. Results are read into the agent&rsquo;s context (they cost tokens), so
+                      it searches narrowly. Claude desks are unaffected.
+                    </span>
+                  </div>
+                  <PixelButton
+                    variant={webSearchEnabled ? 'primary' : 'secondary'}
+                    size="sm"
+                    onClick={toggleWebSearch}
+                  >
+                    {webSearchEnabled ? 'on' : 'off'}
+                  </PixelButton>
+                </div>
+                <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}>
+                  <label style={{ display: 'flex', flexDirection: 'column', gap: 4, flex: 1 }}>
+                    <span style={slackLabelStyle}>
+                      Brave Search API key{keyPresence[WEB_SEARCH_KEY_ID] ? ' — key set' : ' — no key'}
+                    </span>
+                    <input
+                      type="password"
+                      value={keyDraft[WEB_SEARCH_KEY_ID] ?? ''}
+                      onChange={(e) => setKeyDraft((d) => ({ ...d, [WEB_SEARCH_KEY_ID]: e.target.value }))}
+                      placeholder={keyPresence[WEB_SEARCH_KEY_ID] ? '•••••• (enter to replace)' : 'Brave Search API key'}
+                      style={{ ...slackInputStyle, fontFamily: 'var(--cth-font-mono)' }}
+                    />
+                  </label>
+                  <PixelButton
+                    variant="primary"
+                    size="sm"
+                    onClick={() => saveKey(WEB_SEARCH_KEY_ID)}
+                    disabled={keyBusy === WEB_SEARCH_KEY_ID || !(keyDraft[WEB_SEARCH_KEY_ID] ?? '').trim()}
+                  >
+                    {keyBusy === WEB_SEARCH_KEY_ID ? '…' : 'save'}
+                  </PixelButton>
+                  <PixelButton
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => removeKey(WEB_SEARCH_KEY_ID)}
+                    disabled={keyBusy === WEB_SEARCH_KEY_ID || !keyPresence[WEB_SEARCH_KEY_ID]}
+                  >
+                    clear
+                  </PixelButton>
+                </div>
+                <span style={{ fontSize: 12, lineHeight: '16px', color: 'var(--cth-ink-500)' }}>
+                  Get a free key at <code>brave.com/search/api</code> (the free tier covers personal use).
+                  The key is stored locally and never shown back or sent to git.
+                </span>
               </div>
 
               <div style={{ height: 2, background: 'var(--cth-ink-300)' }} />

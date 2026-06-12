@@ -95,6 +95,9 @@ const TOOL_STATION: Record<string, { station: StationKind; carry?: ToolKind }> =
   Glob: { station: 'shelf', carry: 'Glob' },
   WebFetch: { station: 'web', carry: 'WebFetch' },
   WebSearch: { station: 'web', carry: 'WebSearch' },
+  // Native (DeepSeek/Minimax) desks call the toolkit's `web_search` — walk it to the
+  // same web portal as Claude's WebSearch.
+  web_search: { station: 'web', carry: 'WebSearch' },
   TodoWrite: { station: 'board', carry: 'TodoWrite' },
   // #5A — delegating to a sub-agent reads as "handing off at the outbox".
   Task: { station: 'mailbox', carry: 'TodoWrite' }

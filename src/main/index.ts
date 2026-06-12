@@ -29,7 +29,8 @@ import { ClaudeRuntime } from './runtime/claudeRuntime';
 import { NativeRuntime } from './runtime/nativeRuntime';
 import { createNativeEventBridge, loadNativeEvents } from './runtime/nativeEventBridge';
 import { executeAgentTool, type AgentToolDeps } from '@jsh562/agent-core';
-import { redactConfig, injectionEnvForProvider, keyPresence, setKeyInConfig, clearKeyInConfig, type SafeConfig } from './credentials';
+import { redactConfig, injectionEnvForProvider, keyPresence, setKeyInConfig, clearKeyInConfig, WEB_SEARCH_KEY_ID, type SafeConfig } from './credentials';
+import { searchWebBrave } from './webSearch';
 import { listProviders } from '../shared/providerRegistry';
 import { deriveProviderId } from '../shared/assignment';
 import type { AgentInput } from '../shared/providerRuntime';
@@ -256,7 +257,12 @@ const agentToolDeps: AgentToolDeps = {
   writeTasks: (tasks) => hive.writeTasks(tasks),
   appendMemory: (id, text) => hive.appendMemory(id, text),
   resolveCwd: (id) => hive.registry().agents[id]?.cwd ?? null,
-  bashEnabled: () => readConfig().nativeBashEnabled === true
+  bashEnabled: () => readConfig().nativeBashEnabled === true,
+  // web_search routes through the host (provider + key + formatting); config is read
+  // live per call so the operator's enable/disable + key changes take effect at once.
+  // Throws a clear note when disabled/keyless — the executor turns that into a
+  // recoverable success:false tool-result.
+  searchWeb: (query, opts) => searchWebBrave(query, opts, readConfig())
 };
 // E003 — native (non-Claude) agents run in isolated utilityProcess workers,
 // fronted by the ProviderRuntime port. The drain runs in MAIN (single-committer
@@ -981,7 +987,9 @@ ipcMain.handle('config:update', (_evt, patch: Partial<HarnessConfig>) => writeCo
 ipcMain.handle('credentials:set', (_evt, providerId: unknown, key: unknown) => {
   if (typeof providerId !== 'string' || typeof key !== 'string' || !key) return { ok: false, error: 'invalid' };
   try {
-    const known = listProviders().map((p) => p.id);
+    // The web-search API key is a reserved non-provider credential (redacted like any
+    // key); allow it alongside the registry provider ids.
+    const known = [...listProviders().map((p) => p.id), WEB_SEARCH_KEY_ID];
     writeConfig({ providerKeys: setKeyInConfig(readConfig(), providerId, key, known).providerKeys });
     return { ok: true };
   } catch (e) {
@@ -993,7 +1001,7 @@ ipcMain.handle('credentials:clear', (_evt, providerId: unknown) => {
   writeConfig({ providerKeys: clearKeyInConfig(readConfig(), providerId).providerKeys });
   return { ok: true };
 });
-ipcMain.handle('credentials:presence', () => keyPresence(readConfig(), listProviders().map((p) => p.id)));
+ipcMain.handle('credentials:presence', () => keyPresence(readConfig(), [...listProviders().map((p) => p.id), WEB_SEARCH_KEY_ID]));
 ipcMain.handle('config:ensureHome', (_evt, path: unknown) => {
   if (typeof path !== 'string' || path.length === 0) return { ok: false, error: 'invalid path' };
   return ensureHarnessHome(path);

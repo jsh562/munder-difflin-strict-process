@@ -18,6 +18,12 @@ export const NATIVE_PROVIDER_ID_ENV = 'NATIVE_PROVIDER_ID';
  *  Set by the spawn router alongside the key/id env; carries no secret. */
 export const NATIVE_PROVIDER_MODEL_ENV = 'NATIVE_PROVIDER_MODEL';
 
+/** Reserved `providerKeys` id for the web-search API key (Tavily etc.). It is NOT a
+ *  model provider — stored in `providerKeys` purely so `redactConfig` strips it like
+ *  any other key (presence-only crosses to the renderer). Read with
+ *  `getKeyFromConfig(cfg, WEB_SEARCH_KEY_ID)`. */
+export const WEB_SEARCH_KEY_ID = 'web-search';
+
 /** HarnessConfig with provider key VALUES removed — the only shape sent to the
  *  renderer (TR-008). Presence (has-key per provider) is exposed instead. */
 export type SafeConfig = Omit<HarnessConfig, 'providerKeys'> & {

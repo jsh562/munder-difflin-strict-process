@@ -114,6 +114,9 @@ export interface HarnessConfig {
   opsStandupSeeded?: boolean;
   heartbeatSeeded?: boolean;
   notifications?: boolean;
+  /** Operator gate: allow native (DeepSeek/Minimax) desks to use the web_search tool
+   *  (the Brave Search API key rides the credentials store under 'web-search'). */
+  webSearchEnabled?: boolean;
   slackEnabled?: boolean;
   slackSigningSecret?: string;
   slackBotToken?: string;

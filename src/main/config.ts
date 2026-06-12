@@ -170,6 +170,11 @@ export interface HarnessConfig {
    *  still cwd-sandboxes + breaker-watches every bash call when enabled). Claude
    *  desks are unaffected (their shell rides the CLI's own permission system). */
   nativeBashEnabled?: boolean;
+  /** Opt-in: allow native desks to use the `web_search` tool. OFF by default. The
+   *  API key lives in `providerKeys['web-search']` (redacted like any provider key);
+   *  this flag is the operator gate. When off (or no key) the tool fails closed with
+   *  a clear note. Claude desks are unaffected (they use their own web tooling). */
+  webSearchEnabled?: boolean;
 
   // ─── Memory reflection (the janitor's condense half) ───────────────────────
   /** Master toggle for the in-process MemoryReflector. Default on. */
@@ -198,6 +203,7 @@ const DEFAULTS: HarnessConfig = {
   embeddingModel: 'minilm',
   missions: [OPS_STANDUP_MISSION],
   notifications: false,
+  webSearchEnabled: false,
   slackEnabled: false,
   slackSigningSecret: undefined,
   slackBotToken: undefined,
