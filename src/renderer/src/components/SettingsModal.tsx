@@ -1,6 +1,6 @@
 import { useState, useEffect, type CSSProperties } from 'react';
 import type { HarnessConfig } from '@/store/config';
-import { PixelPanel } from './PixelPanel';
+import { ModalOverlay } from './ModalOverlay';
 import { PixelButton } from './PixelButton';
 import { Icon } from './Icon';
 import { ProviderModelPicker } from './ProviderModelPicker';
@@ -309,22 +309,42 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
   ];
 
   return (
-    <div
-      onClick={busy ? undefined : onClose}
-      style={{
-        position: 'fixed', inset: 0,
-        background: 'rgba(26, 19, 32, 0.7)',
-        display: 'flex', alignItems: 'center', justifyContent: 'center',
-        zIndex: 300
-      }}
+    <ModalOverlay
+      title={changeHome ? 'CHANGE HOME FOLDER' : confirming ? 'RESET EVERYTHING?' : 'SETTINGS'}
+      width={520}
+      zIndex={300}
+      onClose={onClose}
+      closeOnBackdrop={!busy}
+      footer={
+        changeHome ? (
+          <>
+            <PixelButton variant="secondary" size="md" onClick={() => { setChangeHome(null); setChangeErr(''); }} disabled={changeBusy}>
+              cancel
+            </PixelButton>
+            <PixelButton variant="primary" size="md" onClick={applyChangeHome} disabled={changeBusy}>
+              {changeBusy ? 'applying…' : (changeMode === 'move' ? 'move & restart' : 'switch & restart')}
+            </PixelButton>
+          </>
+        ) : !confirming ? (
+          <>
+            <PixelButton variant="secondary" size="md" onClick={onClose}>close</PixelButton>
+            <PixelButton variant="destructive" size="md" onClick={() => setConfirming(true)}>
+              reset &amp; start over
+            </PixelButton>
+          </>
+        ) : (
+          <>
+            <PixelButton variant="secondary" size="md" onClick={() => setConfirming(false)} disabled={busy}>
+              cancel
+            </PixelButton>
+            <PixelButton variant="destructive" size="md" onClick={reset} disabled={busy}>
+              {busy ? 'resetting…' : 'erase everything & restart'}
+            </PixelButton>
+          </>
+        )
+      }
     >
-      <div onClick={(e) => e.stopPropagation()} style={{ width: 520, maxWidth: '92vw' }}>
-        <PixelPanel
-          variant="dialog"
-          title={changeHome ? 'CHANGE HOME FOLDER' : confirming ? 'RESET EVERYTHING?' : 'SETTINGS'}
-          noPadding
-        >
-          {changeHome ? (
+      {changeHome ? (
             <div style={{ padding: 20, display: 'flex', flexDirection: 'column', gap: 16 }}>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                 <span style={{ fontSize: 12, color: 'var(--cth-ink-500)' }}>New home folder</span>
@@ -370,14 +390,6 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
                 <div style={{ fontSize: 13, lineHeight: '18px', color: '#6E1423' }}>{changeErr}</div>
               )}
 
-              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
-                <PixelButton variant="secondary" size="md" onClick={() => { setChangeHome(null); setChangeErr(''); }} disabled={changeBusy}>
-                  cancel
-                </PixelButton>
-                <PixelButton variant="primary" size="md" onClick={applyChangeHome} disabled={changeBusy}>
-                  {changeBusy ? 'applying…' : (changeMode === 'move' ? 'move & restart' : 'switch & restart')}
-                </PixelButton>
-              </div>
             </div>
           ) : !confirming ? (
             <div style={{ padding: 20, display: 'flex', flexDirection: 'column', gap: 16 }}>
@@ -674,12 +686,6 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
                 </p>
               </div>
 
-              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
-                <PixelButton variant="secondary" size="md" onClick={onClose}>close</PixelButton>
-                <PixelButton variant="destructive" size="md" onClick={() => setConfirming(true)}>
-                  reset &amp; start over
-                </PixelButton>
-              </div>
             </div>
           ) : (
             <div style={{ padding: 20, display: 'flex', flexDirection: 'column', gap: 16 }}>
@@ -700,18 +706,8 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
                 </div>
               </div>
 
-              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
-                <PixelButton variant="secondary" size="md" onClick={() => setConfirming(false)} disabled={busy}>
-                  cancel
-                </PixelButton>
-                <PixelButton variant="destructive" size="md" onClick={reset} disabled={busy}>
-                  {busy ? 'resetting…' : 'erase everything & restart'}
-                </PixelButton>
-              </div>
             </div>
           )}
-        </PixelPanel>
-      </div>
-    </div>
+    </ModalOverlay>
   );
 }

@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { PixelPanel } from './PixelPanel';
+import { ModalOverlay } from './ModalOverlay';
 import { PixelButton } from './PixelButton';
 import { SpritePortrait } from './SpritePortrait';
 import { Icon } from './Icon';
@@ -164,23 +164,21 @@ export function AddAgentModal({ onClose, config }: AddAgentModalProps) {
   };
 
   return (
-    <div
-      onClick={onClose}
-      style={{
-        position: 'fixed', inset: 0,
-        background: 'rgba(26, 19, 32, 0.6)',
-        display: 'flex', alignItems: 'center', justifyContent: 'center',
-        zIndex: 100
-      }}
+    <ModalOverlay
+      title="ADD AGENT"
+      width={600}
+      zIndex={100}
+      onClose={onClose}
+      footer={
+        <>
+          <PixelButton variant="ghost" size="md" onClick={onClose} disabled={busy}>cancel</PixelButton>
+          <PixelButton variant="primary" size="md" onClick={submit} disabled={busy}>
+            {busy ? 'spawning...' : 'spawn'}
+          </PixelButton>
+        </>
+      }
     >
-      <div onClick={(e) => e.stopPropagation()} style={{ width: 600, maxWidth: '92vw' }}>
-        <PixelPanel
-          variant="dialog"
-          title="ADD AGENT"
-          style={{ padding: 16 }}
-          noPadding
-        >
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 12, padding: 16 }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 12, padding: 16 }}>
             <Row label="Name">
               <input
                 value={name}
@@ -349,16 +347,8 @@ export function AddAgentModal({ onClose, config }: AddAgentModalProps) {
               </div>
             )}
 
-            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 4 }}>
-              <PixelButton variant="ghost" size="md" onClick={onClose} disabled={busy}>cancel</PixelButton>
-              <PixelButton variant="primary" size="md" onClick={submit} disabled={busy}>
-                {busy ? 'spawning...' : 'spawn'}
-              </PixelButton>
-            </div>
           </div>
-        </PixelPanel>
-      </div>
-    </div>
+    </ModalOverlay>
   );
 }
 
