@@ -6,6 +6,7 @@
  * teardown/archive on worker exit (mirrors the PTY path), and bounds floor-wide
  * concurrency.
  */
+import type { AgentEvent } from '../../shared/agentEvent';
 import type { UsageSnapshot } from '../../shared/providerRuntime';
 import { NativeAgentWorker, type NativeTelemetrySink } from './nativeAgentWorker';
 import { makeElectronWorkerTransport } from './electronWorkerTransport';
@@ -40,6 +41,15 @@ export interface NativeRuntimeDeps {
    *  branch (single-writer in main, AD-002), so a native desk reaches telemetry
    *  parity. Wired to the live `TelemetryCollector` in `index.ts`. */
   telemetry?: NativeTelemetrySink;
+  /**
+   * E008 T004/T005 {FR-016/037/043} — the native-event bridge sink. When present,
+   * EACH spawned worker's normalized `AgentEvent` stream is forwarded into the
+   * bridge (single-writer main), which append-and-commits each line to the per-agent
+   * JSONL run log BEFORE forwarding it to the renderer over `agent:event`. Absent ⇒
+   * no persist/forward (the bus still emits for other consumers; the panel bridge
+   * just isn't wired). Wired to `createNativeEventBridge(...).ingest` in `index.ts`.
+   */
+  onAgentEvent?: (event: AgentEvent) => void;
 }
 
 export class NativeRuntime {
@@ -86,10 +96,24 @@ export class NativeRuntime {
       telemetry: this.deps.telemetry
     });
     this.workers.set(agentId, worker);
+    // E008 T004 {FR-016/037/043} — forward THIS worker's normalized AgentEvent
+    // stream into the single-writer bridge (persist-then-forward to the renderer).
+    // Subscribed BEFORE start() so the very first event is captured; the bus
+    // isolates listener errors, so the bridge can never break the event stream.
+    if (this.deps.onAgentEvent) {
+      const sink = this.deps.onAgentEvent;
+      worker.subscribe((event) => sink(event));
+    }
     void worker.start();
     return { ok: true };
   }
 
+  /**
+   * The native worker fronting an agent, or undefined when none is running. The
+   * worker IS a `ProviderRuntime`, so `runtimeFor(agentId)?.send(input)` routes an
+   * operator prompt / steer / drain into the running native agent (E008 T004/T005
+   * {FR-015/021}) — the reachable send seam the `native:send` IPC drives.
+   */
   runtimeFor(agentId: string): NativeAgentWorker | undefined {
     return this.workers.get(agentId);
   }

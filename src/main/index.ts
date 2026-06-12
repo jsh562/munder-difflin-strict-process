@@ -27,10 +27,12 @@ import { TelemetryCollector } from './telemetry';
 import { ControlRegistry } from './control';
 import { ClaudeRuntime } from './runtime/claudeRuntime';
 import { NativeRuntime } from './runtime/nativeRuntime';
+import { createNativeEventBridge, loadNativeEvents } from './runtime/nativeEventBridge';
 import { executeHiveTool } from './runtime/hiveTools';
 import { redactConfig, injectionEnvForProvider, keyPresence, setKeyInConfig, clearKeyInConfig, type SafeConfig } from './credentials';
 import { listProviders } from '../shared/providerRegistry';
 import { deriveProviderId } from '../shared/assignment';
+import type { AgentInput } from '../shared/providerRuntime';
 
 const isDev = !!process.env.ELECTRON_RENDERER_URL;
 const ptyManager = new PtyManager();
@@ -229,6 +231,20 @@ function teardownPty(id: string): void {
 // A natural PTY exit must run the same teardown as an explicit kill.
 ptyManager.setExitHandler(teardownPty);
 
+// E008 {FR-016/037/043} — the native-event bridge: the SINGLE-WRITER main→renderer
+// seam for native agent activity. Each native worker's normalized AgentEvent stream
+// is fed in here (via NativeRuntime.onAgentEvent); per event it APPEND-AND-COMMITS
+// the line to the per-agent JSONL run log BEFORE forwarding it to the renderer over
+// the per-agent `agent:event:<agentId>` channel (mirrors `pty:data:<id>`). Main is
+// the sole writer of the log; the renderer subscribes via preload `onAgentEvent` and
+// backfills on reopen via `loadNativeEvents`. Secret-free (ADR-0007): only AgentEvent
+// fields are persisted/forwarded — never a key/header (credentials ride spawn env).
+const nativeEventBridge = createNativeEventBridge({
+  persist: (event) => (hive.enabled() ? hive.appendNativeEvent(event) : false),
+  forward: (event) => {
+    try { liveWebContents()?.send(`agent:event:${event.agentId}`, event); } catch { /* window tore down */ }
+  }
+});
 // E003 — native (non-Claude) agents run in isolated utilityProcess workers,
 // fronted by the ProviderRuntime port. The drain runs in MAIN (single-committer
 // hive); a worker exit reuses the same archive path as a PTY exit (AD-004).
@@ -245,6 +261,9 @@ const nativeRuntime = new NativeRuntime({
   // so a DeepSeek/Minimax desk produces the SAME AgentUsageSample + ToolSpan as a
   // Claude desk and reaches telemetry parity through the unchanged consumers.
   telemetry,
+  // E008 T004/T005 {FR-016/037/043} — forward each native worker's AgentEvent
+  // stream into the single-writer bridge (persist-then-forward over `agent:event`).
+  onAgentEvent: (event) => nativeEventBridge.ingest(event),
   maxConcurrent: 15,
   maxOldSpaceMb: 512
 });
@@ -1216,6 +1235,54 @@ ipcMain.handle('telemetry:usage', (_evt, agentId: unknown) =>
 ipcMain.handle('telemetry:spans', (_evt, agentId: unknown) =>
   typeof agentId === 'string' ? telemetry.getSpans(agentId) : []);
 ipcMain.handle('telemetry:snapshot', () => telemetry.snapshot());
+
+// ─── IPC: native run-log replay (E008 T005 {FR-016/039/042}) ──────────────────
+// Backfill the persisted native AgentEvent stream when a panel (re)opens or the app
+// restarts. A READ-ONLY pass over the append-only log (main is the sole writer):
+// the renderer folds the returned events into the SAME views it builds from the
+// live `agent:event` stream, so reopen reconstructs the run deterministically.
+// Missing/partial/corrupt/truncated each degrade to a best-effort array, never an
+// error (graceful degradation, FR-016/042).
+ipcMain.handle('agent:loadEvents', (_evt, agentId: unknown) => {
+  if (typeof agentId !== 'string' || !agentId) return [];
+  return loadNativeEvents(hive.enabled() ? hive.nativeEventsPath(agentId) : null);
+});
+
+// ─── IPC: operator input/steer to a native agent (E008 T022 {FR-015/021}) ─────
+// The renderer-reachable native send seam — the native-desk peer of `pty:write`
+// for a Claude desk. Routes an operator turn into the running native worker via
+// the ProviderRuntime port (`runtimeFor(agentId).send(AgentInput)`, AD-004).
+//
+// Prompt-vs-steer routing (FR-021): a PLAIN PROMPT is delivered as
+// `{ kind:'operator' }` (a typed turn); a STEER is delivered as `{ kind:'steer' }`
+// — mid-run guidance — AND mirrored into the ControlRegistry so a native desk's
+// control snapshot reflects the steer the same way the Claude `control:steer`
+// seam does (operator-control parity). The two kinds reach the worker through
+// distinct `AgentInput.kind`s so each is handled unambiguously.
+//
+// Fail-soft ack (FR-022): returns `{ ok:false, error }` when there is no native
+// runtime for the agent (worker missing/not started) so the renderer can surface
+// distinct not-delivered feedback rather than appearing to send silently. The
+// Claude `pty:write` path is untouched — this is an additive native branch.
+ipcMain.handle('native:send', (_evt, agentId: unknown, input: unknown): { ok: boolean; error?: string } => {
+  if (typeof agentId !== 'string' || !agentId) return { ok: false, error: 'invalid agentId' };
+  const raw = (input ?? {}) as { kind?: unknown; text?: unknown };
+  const text = typeof raw.text === 'string' ? raw.text : '';
+  if (!text.trim()) return { ok: false, error: 'empty input' };
+  // Only operator/steer reach this seam from the panel; drain is hive-internal.
+  const kind: AgentInput['kind'] = raw.kind === 'steer' ? 'steer' : 'operator';
+
+  const runtime = nativeRuntime.runtimeFor(agentId);
+  if (!runtime) return { ok: false, error: 'no native runtime for agent' };
+
+  // A steer is mirrored into the operator-control registry (parity with the
+  // Claude `control:steer` surface) and ALSO delivered to the worker as the
+  // native steer seam — native agents have no hook boundary, so the worker
+  // `send({kind:'steer'})` is where the guidance actually lands.
+  if (kind === 'steer') control.steer(agentId, text);
+  runtime.send({ kind, text });
+  return { ok: true };
+});
 
 // ─── IPC: circuit-breaker state (Lane A #6 policy → this lane's avatars/meter) ─
 // Lane A's breaker calls this with a BreakerState; we fan it out to the renderer

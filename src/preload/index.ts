@@ -1,4 +1,7 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
+import type { AgentEvent } from '../shared/agentEvent';
+
+export type { AgentEvent };
 
 export interface HiveAgentMeta {
   id: string;
@@ -490,6 +493,38 @@ const api = {
     ipcRenderer.on('telemetry:event', listener);
     return () => ipcRenderer.removeListener('telemetry:event', listener);
   },
+
+  // ─── Native agent panel rendering (E008 — the AgentEvent stream) ───────────
+  /** Subscribe to a native agent's live normalized `AgentEvent` stream, forwarded
+   *  by the single-writer main bridge over the per-agent `agent:event:<agentId>`
+   *  channel (mirrors `onPtyData`). Each event was append-and-committed to the
+   *  per-agent run log BEFORE this forward, so the renderer never sees an event that
+   *  wasn't first persisted. Returns an unsubscribe fn. */
+  onAgentEvent: (agentId: string, cb: (e: AgentEvent) => void): (() => void) => {
+    const channel = `agent:event:${agentId}`;
+    const listener = (_e: IpcRendererEvent, payload: AgentEvent) => cb(payload);
+    ipcRenderer.on(channel, listener);
+    return () => ipcRenderer.removeListener(channel, listener);
+  },
+  /** Backfill a native agent's persisted run log on panel (re)open / app restart.
+   *  Returns the ordered AgentEvent array the renderer folds into its views — the
+   *  same views the live stream builds. Missing/partial/corrupt/truncated each
+   *  degrade to a best-effort array (never throws). */
+  loadNativeEvents: (agentId: string): Promise<AgentEvent[]> =>
+    ipcRenderer.invoke('agent:loadEvents', agentId),
+  /** Submit operator input / steer to a running native agent — the native-desk
+   *  peer of `writePty` for a Claude desk (E008 T023 {FR-015/021}). Bridges the
+   *  `native:send` IPC, routing the input through the ProviderRuntime send seam
+   *  in main. `input.kind` distinguishes a plain prompt (`'operator'`) from a
+   *  steer (`'steer'`) so each lands on the correct seam. Returns a structured
+   *  ack: `{ ok:true }` on delivery, `{ ok:false, error }` when the input could
+   *  not be routed (e.g. the native worker is missing) so the panel can surface
+   *  distinct not-delivered feedback (FR-022) — never throws/blocks. */
+  nativeSend: (
+    agentId: string,
+    input: { kind: 'operator' | 'steer'; text: string }
+  ): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('native:send', agentId, input),
 
   // ─── Circuit breaker (Lane A #6 state → avatars/meter) ──────────────────────
   /** Subscribe to breaker-state changes; returns an unsubscribe fn. */

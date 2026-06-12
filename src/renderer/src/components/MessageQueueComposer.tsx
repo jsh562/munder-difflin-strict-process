@@ -1,12 +1,31 @@
-import { KeyboardEvent } from 'react';
+import { KeyboardEvent, useRef, useState } from 'react';
 import { PixelButton } from './PixelButton';
 import { Icon } from './Icon';
 import { useStore, type Agent, type QueuedMessage } from '@/store/store';
+import { deriveProviderId } from '@shared/assignment';
 
 const EMPTY_QUEUE: QueuedMessage[] = [];
 
 export interface MessageQueueComposerProps {
   agent: Agent;
+}
+
+/** E008 T024 {FR-015/021} — does this desk submit through the native send seam
+ *  (`cth.nativeSend`) rather than the Claude queue→`writePty` flush path? Gated on
+ *  the runtime KIND derived from the assigned model (Principle I), never a scattered
+ *  vendor string: a non-Anthropic provider is a native (DeepSeek/Minimax) desk. */
+function isNativeRuntimeDesk(agent: Agent): boolean {
+  const providerId = deriveProviderId(agent.model);
+  return providerId !== null && providerId !== 'anthropic';
+}
+
+/** A leading `/steer ` marks the input as a mid-run STEER (FR-021) rather than a
+ *  plain prompt, so the composer routes each through the correct `AgentInput.kind`
+ *  seam. Returns the kind + the text with the marker stripped. */
+function parseNativeInput(raw: string): { kind: 'operator' | 'steer'; text: string } {
+  const m = /^\/steer\s+([\s\S]+)$/i.exec(raw.trim());
+  if (m) return { kind: 'steer', text: m[1].trim() };
+  return { kind: 'operator', text: raw.trim() };
 }
 
 /**
@@ -35,7 +54,27 @@ export function MessageQueueComposer({ agent }: MessageQueueComposerProps) {
   // The enrich toggle governs Michael's queue (it routes through the assistant).
   const showEnrichToggle = !!agent.isGod;
 
+  // E008 T024 {FR-015/021} — a native (DeepSeek/Minimax) desk has no Claude PTY for
+  // the queue→`writePty` flush loop to dispatch into, so its composer submits
+  // straight through the `cth.nativeSend` seam. Claude desks keep the unchanged
+  // queue path below (Principle V / FR-009).
+  const isNative = isNativeRuntimeDesk(agent);
+
   const idle = agent.status === 'idle';
+
+  // E008 T024/T025 {FR-021/022} — a transient, non-blocking send-result indication
+  // for the native seam: `sent` confirms delivery (queued/sent parity with a Claude
+  // send), `failed` surfaces DISTINCT not-delivered feedback when `native:send`
+  // returned `{ok:false}` (e.g. the worker is missing). Never throws/blocks.
+  const [sendState, setSendState] = useState<{ kind: 'sent' | 'failed'; msg: string } | null>(null);
+  const sendTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const flashSend = (kind: 'sent' | 'failed', msg: string) => {
+    setSendState({ kind, msg });
+    if (sendTimer.current) clearTimeout(sendTimer.current);
+    // A delivered send clears quickly; a not-delivered notice lingers so the
+    // operator can't miss that the input never reached the agent (FR-022).
+    sendTimer.current = setTimeout(() => setSendState(null), kind === 'sent' ? 2200 : 6000);
+  };
 
   const queueIt = () => {
     if (!text.trim()) return;
@@ -43,10 +82,36 @@ export function MessageQueueComposer({ agent }: MessageQueueComposerProps) {
     setText('');
   };
 
+  // Native submit: route a steer vs a plain prompt through the correct seam
+  // (FR-021) and acknowledge delivery the same way a Claude send is (FR-021), with
+  // distinct not-delivered feedback on a failed ack (FR-022). Fail-soft: a thrown
+  // bridge error is treated as not-delivered, never surfaced as an unhandled throw.
+  const nativeSubmit = async () => {
+    const raw = text;
+    if (!raw.trim()) return;
+    const input = parseNativeInput(raw);
+    if (!input.text) return;
+    setText(''); // clear optimistically — the ack decides sent vs not-delivered
+    try {
+      const ack = await window.cth.nativeSend(agent.id, input);
+      if (ack?.ok) {
+        flashSend('sent', input.kind === 'steer' ? 'steer sent' : 'sent');
+      } else {
+        flashSend('failed', `not delivered — ${ack?.error ?? 'native agent unavailable'}`);
+        setText(raw); // restore so the operator can retry the un-sent input
+      }
+    } catch (e) {
+      flashSend('failed', `not delivered — ${e instanceof Error ? e.message : 'send failed'}`);
+      setText(raw);
+    }
+  };
+
+  const submit = isNative ? nativeSubmit : queueIt;
+
   const onKey = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      queueIt();
+      void submit();
     }
   };
 
@@ -154,7 +219,13 @@ export function MessageQueueComposer({ agent }: MessageQueueComposerProps) {
           onChange={(e) => setText(e.target.value)}
           onKeyDown={onKey}
           rows={2}
-          placeholder={idle ? `Message ${agent.name}` : `${agent.name} is busy — queue a message`}
+          placeholder={
+            isNative
+              ? `Message ${agent.name} (prefix /steer to steer)`
+              : idle
+              ? `Message ${agent.name}`
+              : `${agent.name} is busy — queue a message`
+          }
           style={{
             flex: 1,
             resize: 'none',
@@ -189,20 +260,38 @@ export function MessageQueueComposer({ agent }: MessageQueueComposerProps) {
             >
               <Icon name="sparkle" /> enrich {enrichEnabled ? 'on' : 'off'}
             </button>
-            <PixelButton variant="primary" size="md" fullWidth onClick={queueIt} disabled={!text.trim()}>
+            <PixelButton variant="primary" size="md" fullWidth onClick={() => void submit()} disabled={!text.trim()}>
               <span style={{ display: 'inline-flex', gap: 6, alignItems: 'center', justifyContent: 'center' }}>
                 send <Icon name="arrow-right" />
               </span>
             </PixelButton>
           </div>
         ) : (
-          <PixelButton variant="primary" size="md" onClick={queueIt} disabled={!text.trim()}>
+          <PixelButton variant="primary" size="md" onClick={() => void submit()} disabled={!text.trim()}>
             <span style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
               send <Icon name="arrow-right" />
             </span>
           </PixelButton>
         )}
       </div>
+
+      {/* E008 T025 {FR-022} — native send-result indication: a delivered send reads
+          like a Claude send ack (queued/sent), while a NOT-delivered send shows a
+          DISTINCT, non-blocking notice (different colour + role=alert) so the
+          operator can tell an un-routed input from a successful one. */}
+      {isNative && sendState && (
+        <span
+          role={sendState.kind === 'failed' ? 'alert' : 'status'}
+          style={{
+            fontSize: 12,
+            color: sendState.kind === 'failed' ? 'var(--cth-coral)' : 'var(--cth-ink-700)',
+            display: 'inline-flex', alignItems: 'center', gap: 5
+          }}
+        >
+          <Icon name={sendState.kind === 'failed' ? 'bell' : 'check'} />
+          {sendState.msg}
+        </span>
+      )}
     </div>
   );
 }

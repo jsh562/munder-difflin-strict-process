@@ -25,6 +25,7 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { randomBytes, createHash } from 'node:crypto';
 import type { AgentUsageSample } from './usage';
+import type { AgentEvent } from '../shared/agentEvent';
 import { COMMAND_GROUPS } from '../shared/claudeCommands';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -721,6 +722,56 @@ export class HiveManager {
       usd: sample.usd
     };
     try { appendFileSync(join(root, 'cost-ledger.jsonl'), JSON.stringify(row) + '\n', 'utf8'); } catch { /* noop */ }
+  }
+
+  // — native-events run log (E008 {FR-016/038/040}) —
+
+  /**
+   * The per-agent native AgentEvent run log at
+   * `<hiveRoot>/agents/<agentId>/native-events.jsonl`.
+   *
+   * Mirrors `cost-ledger.jsonl`: a DURABLE, APPEND-ONLY JSONL stream, ONE FILE per
+   * agent, single-writer (this main process). The file is KEYED by `agentId` (one
+   * file each) and SEGMENTED by `sessionId` — the session is not in the path, it
+   * rides each line via the AgentEvent envelope (`{v,agentId,sessionId,ts,kind}`),
+   * so a new session appends to the SAME file (FR-038). It is replayed top-to-
+   * bottom on panel reopen/restart (no rotation/pruning within scale, FR-040).
+   *
+   * Returns null when the hive is disabled (no harnessHome) — the caller treats a
+   * null path as "persistence off", exactly like the cost ledger.
+   */
+  nativeEventsPath(agentId: string): string | null {
+    const root = this.root();
+    if (!root || !agentId) return null;
+    return join(root, 'agents', agentId, 'native-events.jsonl');
+  }
+
+  /**
+   * Append ONE native `AgentEvent` line to the agent's run log (E008 {FR-016/037/
+   * 038/040/043}). Like `appendCostLedger`/`appendLog`: durable immediately
+   * (append-on-event), single-writer (main), naturally ordered by arrival/`ts`.
+   *
+   * 🔒 SECRET-FREE (ADR-0007/FR-041): the persisted line is the `AgentEvent`
+   * envelope + payload AS-IS — this method NEVER injects an API key, auth header,
+   * or any credential at any nesting depth. Credentials ride spawn `env`, never the
+   * AgentEvent bus, so nothing here can leak one (the bridge is the sole caller and
+   * forwards the same untouched event).
+   *
+   * Ensures the agent dir exists (a native worker may not have a hive-provisioned
+   * workspace yet). Best-effort — never throws into the event path. Returns whether
+   * the line was committed to disk, so the caller can order persist-before-forward.
+   */
+  appendNativeEvent(event: AgentEvent): boolean {
+    const agentId = event?.agentId;
+    const path = agentId ? this.nativeEventsPath(agentId) : null;
+    if (!path) return false;
+    try {
+      mkdirSync(join(this.root()!, 'agents', agentId), { recursive: true });
+      appendFileSync(path, JSON.stringify(event) + '\n', 'utf8');
+      return true;
+    } catch {
+      return false; // best-effort — a disk error never breaks the event stream
+    }
   }
 
   // — json + atomic io —

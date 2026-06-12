@@ -4,6 +4,9 @@ import { PixelBadge } from './PixelBadge';
 import { PixelButton } from './PixelButton';
 import { SpritePortrait } from './SpritePortrait';
 import { PtyTerminalView } from './PtyTerminalView';
+import { NativeTranscriptView } from './NativeTranscriptView';
+import { StructuredRunTab } from './StructuredRunTab';
+import { useNativeAgentEvents } from '@/hooks/useNativeAgentEvents';
 import { MessageQueueComposer } from './MessageQueueComposer';
 import { AssistantRoleNote } from './AssistantRoleNote';
 import { CommandCenterPanel } from './CommandCenterPanel';
@@ -16,9 +19,39 @@ import { AgentControlStrip } from './AgentControlStrip';
 import { Icon } from './Icon';
 import { useStore, type Agent } from '@/store/store';
 import { usePtyParser } from '@/hooks/usePtyParser';
+import { deriveProviderId } from '@shared/assignment';
 
 export interface AgentDetailPanelProps {
   agent: Agent;
+}
+
+/**
+ * E008 / T020 (FR-001/FR-023) — the panel-local render-path decision: does this desk
+ * run on a NATIVE runtime (DeepSeek/Minimax), so its terminal slot shows the
+ * synthesized `NativeTranscriptView` instead of the Claude `PtyTerminalView`?
+ *
+ * The signal is the desk's RUNTIME KIND, derived locally from its assigned model via
+ * the shared, electron-free registry — the SAME decision the main spawn router makes
+ * (`src/main/index.ts`: a desk whose derived provider is present and not Claude
+ * launches on the native worker, bypassing the Claude PTY; a Claude/`anthropic` or
+ * unresolvable/unassigned desk takes the PTY path). Mirroring that one seam keeps the
+ * renderer and main in lockstep:
+ *   - native provider (deepseek/minimax) → derived id is present and `!== 'anthropic'`
+ *     → native runtime → synthesized transcript.
+ *   - Claude desk → derives `'anthropic'` → PTY path (never misrouted).
+ *   - empty/unstarted/role-based desk (no/unresolvable model) → derives `null` → PTY
+ *     path / no-PTY empty state (never misrouted as native).
+ *
+ * This is NOT vendor-string branching leaking into a downstream consumer (Principle I):
+ * it is the panel choosing which render surface to mount for the desk's runtime kind,
+ * and the decision stays local to this component. `agent.ptyId` is NOT a reliable
+ * discriminator on its own — the renderer stamps a `ptyId` onto every spawned record
+ * (`AddAgentModal`), even though the main process never creates a real PTY for a native
+ * desk — so the runtime-kind derivation is what positively identifies "native-running".
+ */
+function isNativeRuntimeDesk(agent: Agent): boolean {
+  const providerId = deriveProviderId(agent.model);
+  return providerId !== null && providerId !== 'anthropic';
 }
 
 export function AgentDetailPanel({ agent }: AgentDetailPanelProps) {
@@ -31,6 +64,10 @@ export function AgentDetailPanel({ agent }: AgentDetailPanelProps) {
   const sidebarTab = useStore(s => s.sidebarTab);
   const setSidebarTab = useStore(s => s.setSidebarTab);
   const isReal = !!agent.ptyId;
+  // E008 / T020 — does this desk render the synthesized native transcript (vs the
+  // Claude PTY)? Derived from the runtime kind (see `isNativeRuntimeDesk`); evaluated
+  // FIRST in the terminal tab so a native desk never falls into the Claude PTY branch.
+  const isNative = isNativeRuntimeDesk(agent);
   // While this agent is shown in the fullscreen overlay, the fullscreen view
   // owns the pty (it sizes it to fill the screen). Keeping the embedded terminal
   // mounted too means two xterms fight over the pty's cols/rows — which corrupts
@@ -39,6 +76,15 @@ export function AgentDetailPanel({ agent }: AgentDetailPanelProps) {
   const isFullscreenedHere = fullscreenAgentId === agent.id;
 
   const onPtyStream = usePtyParser(agent.id);
+
+  // E008 / T030 (FR-005/FR-034) — the SINGLE native fold for this desk. The structured
+  // tab consumes THIS already-folded `{ structured, loading }` (it never re-folds), so
+  // toggling the terminal ↔ structured tab reuses the folded view-models (FR-034). For a
+  // Claude/empty desk the channel never fires, so this is an idle empty fold — the
+  // structured tab there is sourced from telemetry (`source='claude'`), not this. The
+  // hook is called unconditionally (React rules) BEFORE the early `isGod` return below;
+  // a god/command-center desk simply never reads it.
+  const nativeRun = useNativeAgentEvents(agent.id);
 
   // Michael gets the full command-center dashboard instead of the plain panel.
   if (agent.isGod) return <CommandCenterPanel agent={agent} />;
@@ -147,39 +193,92 @@ export function AgentDetailPanel({ agent }: AgentDetailPanelProps) {
 
       {/* Active tab body — fills remaining space */}
       <div style={{ flex: 1, minHeight: 0, display: 'flex' }}>
-        {sidebarTab === 'terminal' && (
-          isReal && agent.ptyId ? (
-            isFullscreenedHere ? (
-              <EmptyTab title="In fullscreen">
-                This terminal is open in fullscreen. Press Esc or exit fullscreen to bring it back here.
-              </EmptyTab>
-            ) : (
-            <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-              <div style={{ flex: 1, minHeight: 0, display: 'flex' }}>
-                <PtyTerminalView
-                  key={agent.ptyId}
-                  ptyId={agent.ptyId}
-                  onStreamData={onPtyStream}
-                  onUserPrompt={(t) => {
-                    updateAgent(agent.id, { lastPrompt: t });
-                    if (t.trim().toLowerCase() === '/clear') {
-                      updateAgent(agent.id, { contextTokens: 0, contextLimit: undefined, progress: 0 });
-                    }
-                    void window.cth.historyAdd({ agentId: agent.id, cwd: agent.cwd, text: t });
-                  }}
-                  onToggleFullscreen={() => setFullscreen(agent.id)}
-                  fullscreen={false}
-                  embedded
-                />
-              </div>
-              {agent.isAssistant ? <AssistantRoleNote /> : <MessageQueueComposer agent={agent} />}
+        {/* E008 / T030 (FR-005/FR-006/FR-034) — the terminal slot hosts BOTH the
+            default view (native transcript / Claude PTY) AND the opt-in structured tab.
+            When `structured` is selected the default view stays MOUNTED but hidden
+            (`display:none`) and the structured tab is shown on top — so toggling
+            terminal ↔ structured preserves the default view's content + scroll (FR-006:
+            no unmount = the transcript's scroll/virtualization state and the pooled
+            xterm's buffer survive the switch) and re-folds nothing (FR-034: the native
+            structured tab reuses THIS panel's single `nativeRun` fold; the Claude
+            structured tab reuses the renderer telemetry it already receives). The
+            default view is rendered EXACTLY as before — the Claude PTY path is untouched. */}
+        {(sidebarTab === 'terminal' || sidebarTab === 'structured') && (
+          <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: 'flex' }}>
+            {/* Default view (kept mounted; hidden while the structured tab is active). */}
+            <div
+              style={{
+                flex: 1,
+                minWidth: 0,
+                minHeight: 0,
+                display: sidebarTab === 'terminal' ? 'flex' : 'none'
+              }}
+            >
+              {isNative ? (
+                // E008 / T020 (FR-001/FR-014/FR-023) — native desk: the synthesized
+                // transcript replaces the PTY view in the SAME terminal-tab slot, framed
+                // by the SAME flex-column wrapper + composer the Claude branch uses, so
+                // placement/framing match (FR-023). ADDITIVE; never touches the PTY path.
+                <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+                  <div style={{ flex: 1, minHeight: 0, display: 'flex' }}>
+                    <NativeTranscriptView agentId={agent.id} embedded />
+                  </div>
+                  {agent.isAssistant ? <AssistantRoleNote /> : <MessageQueueComposer agent={agent} />}
+                </div>
+              ) : isReal && agent.ptyId ? (
+                isFullscreenedHere ? (
+                  <EmptyTab title="In fullscreen">
+                    This terminal is open in fullscreen. Press Esc or exit fullscreen to bring it back here.
+                  </EmptyTab>
+                ) : (
+                  <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+                    <div style={{ flex: 1, minHeight: 0, display: 'flex' }}>
+                      <PtyTerminalView
+                        key={agent.ptyId}
+                        ptyId={agent.ptyId}
+                        onStreamData={onPtyStream}
+                        onUserPrompt={(t) => {
+                          updateAgent(agent.id, { lastPrompt: t });
+                          if (t.trim().toLowerCase() === '/clear') {
+                            updateAgent(agent.id, { contextTokens: 0, contextLimit: undefined, progress: 0 });
+                          }
+                          void window.cth.historyAdd({ agentId: agent.id, cwd: agent.cwd, text: t });
+                        }}
+                        onToggleFullscreen={() => setFullscreen(agent.id)}
+                        fullscreen={false}
+                        embedded
+                      />
+                    </div>
+                    {agent.isAssistant ? <AssistantRoleNote /> : <MessageQueueComposer agent={agent} />}
+                  </div>
+                )
+              ) : (
+                <EmptyTab title="No PTY">
+                  This agent has no live terminal. Spawn an agent through "add agent" to use the terminal tab.
+                </EmptyTab>
+              )}
             </div>
-            )
-          ) : (
-            <EmptyTab title="No PTY">
-              This agent has no live terminal. Spawn an agent through "add agent" to use the terminal tab.
-            </EmptyTab>
-          )
+
+            {/* Opt-in structured tab (shown only when selected). For a native desk it
+                reuses THIS panel's single fold (`nativeRun`, no re-fold — FR-034); for a
+                Claude desk it is derived from the existing renderer telemetry (AD-005
+                Option B), so the Claude PTY path stays byte-for-byte unchanged (FR-009). */}
+            {sidebarTab === 'structured' && (
+              <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: 'flex' }}>
+                {isNative ? (
+                  <StructuredRunTab
+                    agentId={agent.id}
+                    source="native"
+                    structured={nativeRun.structured}
+                    loading={nativeRun.loading}
+                    embedded
+                  />
+                ) : (
+                  <StructuredRunTab agentId={agent.id} source="claude" embedded />
+                )}
+              </div>
+            )}
+          </div>
         )}
 
         {sidebarTab === 'files' && (
