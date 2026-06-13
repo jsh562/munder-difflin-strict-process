@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react';
 import { useStore, type Agent, type StationKind, type ToolKind } from '@/store/store';
 import { buildSpawnCommand, ASSISTANT_MODEL, type HarnessConfig } from '@/store/config';
 import { deriveProviderId } from '@shared/assignment';
+import { isNativeRuntimeDesk } from '@/lib/runtimeKind';
 
 const GOD_ID = 'god';
 const GOD_PTY = `pty-${GOD_ID}`;
@@ -42,6 +43,17 @@ const INITIAL_GOD_PROMPT_NATIVE = [
   '3. Record durable decisions and context with write_memory so future-you remembers.',
   'Orchestrate, do not implement: triage, dispatch, resolve conflicts, and keep everyone unblocked.'
 ].join('\n');
+
+// The wake nudge for a NATIVE (DeepSeek/Minimax) desk that has unread inbox mail.
+// Unlike the Claude nudge it doesn't reference the inbox/.done/ filesystem convention
+// — a native desk acts through the hive TOOLS, and its end-of-turn drain delivers the
+// actual message CONTENT (hive.drainForStop). This text is just the kick that starts a
+// turn on an idle worker; sending it to a busy worker is a harmless no-op (its `send`
+// drops while running and its own drain covers the mail). The native god is woken the
+// same way so it sees its team's replies and keeps orchestrating.
+const NATIVE_INBOX_WAKE =
+  'You have new hive inbox message(s) — review and act on them now. ' +
+  'Act autonomously; only message the orchestrator (god) if you genuinely need a decision.';
 
 // Scheduled auto-compact command (from the ops standup). Queued per agent and
 // delivered when idle, so it never interrupts a working agent. The focus
@@ -150,6 +162,11 @@ export function useHive(config: HarnessConfig | null): void {
   // must leave the agent alone — set while its boot sequence is typing so nothing
   // collides with /remote-control + the orientation prompt.
   const bootGraceUntil = useRef<Record<string, number>>({});
+  // Per-agent timestamp of the last time the inbox-wake (#3) respawned a DOWNED
+  // native worker because a delegated message landed in its inbox but it had no
+  // live runtime. Throttles respawns so a crash-looping worker can't be respawned
+  // on every 4s wake tick.
+  const nativeRespawnAt = useRef<Record<string, number>>({});
   // Reactive so the assistant bootstrap (effect #1b) re-runs once Michael is ready.
   const godStatus = useStore((s) => s.godStatus);
   // #5C/#7C.4 — latest circuit-breaker level per agent. When 'constrained'/
@@ -429,36 +446,91 @@ export function useHive(config: HarnessConfig | null): void {
     });
   }, []);
 
-  // 3) Wake idle agents holding unread inbox messages. The assistant is
-  //    send-only (it never receives inbox mail), so it's excluded.
+  // 3) Wake idle agents holding unread inbox messages so collaboration doesn't
+  //    stall while an agent sits at its prompt. Two runtime kinds, one dedup map:
+  //    - CLAUDE desk: nudge by typing into its PTY, gated on idle/waiting so we
+  //      never jam a busy input line.
+  //    - NATIVE desk (DeepSeek/Minimax — no PTY, INCLUDING a native god): kick its
+  //      worker via nativeSend. An idle worker turns the kick into a turn whose
+  //      end-of-turn drain delivers the message content; a BUSY worker drops the
+  //      kick (its `send` guard) and its own drain delivers the mail — so the
+  //      native path needs NO idle gate. That matters: a native desk's store
+  //      status is never updated, so it can't be trusted as an idle signal.
+  //    Without this, a native worker (or a native god) only ever drained its inbox
+  //    at the end of an active turn — an idle one never started one, so delegated
+  //    work and replies sat unread forever (god ended up doing the work himself).
+  //    The send-only assistant never receives inbox mail, so it's excluded.
   useEffect(() => {
     if (!config?.onboardingComplete) return;
+
+    // Respawn a DOWNED native worker so a message delegated to it can land. The
+    // worker exited (or was lost on a full app restart) but its store record + inbox
+    // survive; reuse the "restore team" recipe (same id/cwd/model/command) — the main
+    // spawn router sends a native model to nativeRuntime.spawn. Throttled per agent so
+    // a crash-looping worker can't respawn every tick. We deliberately DON'T set
+    // `nudged` here: once the worker is back up + idle, the next tick's nativeSend
+    // delivers the wake and its drain picks up the queued mail.
+    const RESPAWN_COOLDOWN_MS = 15000;
+    const respawnNativeWorker = (a: Agent, now: number) => {
+      if (!config) return;
+      if (now - (nativeRespawnAt.current[a.id] ?? 0) < RESPAWN_COOLDOWN_MS) return;
+      nativeRespawnAt.current[a.id] = now;
+      const command = (a.command ?? '').trim() || buildSpawnCommand(config, a.model);
+      if (!command || !a.cwd) return;
+      const [exe, ...args] = command.split(/\s+/);
+      window.cth.spawnPty({
+        id: a.ptyId ?? `pty-${a.id}`,
+        cwd: a.cwd,
+        command: exe,
+        args,
+        cols: 100,
+        rows: 30,
+        hive: { id: a.id, name: a.name, cwd: a.cwd, role: a.description }
+      }).catch(() => { /* best-effort; next tick retries after the cooldown */ });
+    };
+
     const iv = setInterval(async () => {
       const now = Date.now();
-      const agents = useStore.getState().agents.filter(
-        (a) => a.ptyId && !a.isAssistant && (a.status === 'idle' || a.status === 'waiting')
-          // Don't type into an agent still running its boot sequence — the nudge
-          // would collide with /remote-control + the orientation prompt.
-          && (bootGraceUntil.current[a.id] ?? 0) < now
-      );
+      const fleetDefault = useStore.getState().fleetDefaultModel;
+      const agents = useStore.getState().agents.filter((a) => {
+        if (a.isAssistant) return false;
+        // Don't disturb an agent still running its boot sequence (the nudge would
+        // collide with /remote-control + the orientation prompt on a Claude god).
+        if ((bootGraceUntil.current[a.id] ?? 0) >= now) return false;
+        // Native desk (no PTY): no idle gate — sending to a busy worker is a no-op.
+        if (isNativeRuntimeDesk(a, fleetDefault)) return true;
+        // Claude desk: only when idle/waiting (typing into a busy TUI jams it).
+        return !!a.ptyId && (a.status === 'idle' || a.status === 'waiting');
+      });
       for (const a of agents) {
         try {
           const inbox = await window.cth.hiveInbox(a.id);
           // Dedup by the newest message id, not the count — a count can oscillate
           // as messages drain and re-arrive, which would re-nudge for the same set.
-          const newest = inbox.length
-            ? inbox.map((m) => m.id).sort().slice(-1)[0]
-            : '';
-          if (newest && nudged.current[a.id] !== newest) {
+          const newest = inbox.length ? inbox.map((m) => m.id).sort().slice(-1)[0] : '';
+          if (!newest) { nudged.current[a.id] = ''; continue; }
+          if (nudged.current[a.id] === newest) continue;
+
+          if (a.ptyId) {
+            // CLAUDE desk — type the nudge into its terminal.
             nudged.current[a.id] = newest;
             await submitToPty(
-              a.ptyId!,
+              a.ptyId,
               'You have new hive inbox message(s) — read your inbox, act on them now, and move handled ones to inbox/.done/. Act autonomously; only message god if you genuinely need a decision.'
             );
-          } else if (!newest) {
-            nudged.current[a.id] = '';
+          } else {
+            // NATIVE desk — kick its worker; the end-of-turn drain delivers content.
+            const res = await window.cth.nativeSend(a.id, { kind: 'operator', text: NATIVE_INBOX_WAKE });
+            if (res.ok) {
+              nudged.current[a.id] = newest; // delivered — don't re-kick for this set
+            } else if (/no native runtime/i.test(res.error ?? '')) {
+              // Worker is down but the mail is in its inbox — bring it back. Leave
+              // `nudged` UNSET so the next tick (worker alive + idle) sends the wake.
+              respawnNativeWorker(a, now);
+            }
+            // Other transient errors: leave nudged unset, retry next tick.
           }
-        } catch { /* ignore */ }
+        } catch { /* ignore — try again next tick */ }
       }
     }, 4000);
     return () => clearInterval(iv);
