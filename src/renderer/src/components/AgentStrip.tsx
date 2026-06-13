@@ -81,7 +81,7 @@ export function AgentStrip({ config }: AgentStripProps) {
       minHeight: 124,
       alignItems: 'center'
     }}>
-      {agents.map(a => (
+      {[...agents.filter(a => a.isGod), ...agents.filter(a => !a.isGod)].map(a => (
         <AgentCard
           key={a.id}
           name={a.name}

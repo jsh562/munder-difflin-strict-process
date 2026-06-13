@@ -27,6 +27,8 @@ export interface CircuitBreakerConfig {
 export interface HarnessConfig {
   onboardingComplete: boolean;
   harnessHome: string | null;
+  /** Optional working directory for a native god (else `<harnessHome>/workspace`). */
+  godWorkspace?: string;
   registeredRepos: string[];
   autoMode: boolean;
   defaultCommand: string;

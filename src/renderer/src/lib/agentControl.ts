@@ -12,6 +12,11 @@ import { useStore, type Agent } from '@/store/store';
  */
 export async function stopAgent(agent: Agent, isNative: boolean): Promise<void> {
   if (agent.isGod) useStore.getState().setGodDesired('stopped');
+  // A native desk never updates its own store status, so it would stay frozen on
+  // "working" after a Stop. Clear it here so the strip card reads idle/stopped (the
+  // transcript's own "working…" indicator is cleared by the synthetic stop event in
+  // NativeRuntime.kill).
+  useStore.getState().updateAgent(agent.id, { status: 'idle', action: 'stopped', carrying: undefined });
   try {
     if (isNative) await window.cth.nativeKill(agent.id);
     else if (agent.ptyId) await window.cth.killPty(agent.ptyId);

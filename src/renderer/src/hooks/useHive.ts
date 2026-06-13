@@ -218,7 +218,9 @@ export function useHive(config: HarnessConfig | null): void {
       // writes/builds (its tools are cwd-sandboxed) can't pollute that state. It still
       // orchestrates through the hive TOOLS, which are host-mediated and cwd-independent.
       // (A Claude god keeps the harness home: its orientation reads hive-root files.)
-      const godCwd = godIsNative ? godWorkspace(config.harnessHome!) : config.harnessHome!;
+      const godCwd = godIsNative
+        ? (config.godWorkspace?.trim() || godWorkspace(config.harnessHome!))
+        : config.harnessHome!;
       const god: Agent = {
         id: GOD_ID,
         name: 'Michael',
@@ -289,7 +291,7 @@ export function useHive(config: HarnessConfig | null): void {
       }, GOD_BOOT_MS));
     }, 1200);
     return () => { cancelled = true; clearTimeout(t); timers.forEach(clearTimeout); };
-  }, [config?.onboardingComplete, config?.harnessHome, godDesired]);
+  }, [config?.onboardingComplete, config?.harnessHome, config?.godWorkspace, godDesired]);
 
   // 1b) Bootstrap Michael's prep assistant ("Dwight") — only after Michael is
   //     ready, and only once. Same live-PTY idempotency + spawn-guard as #1.

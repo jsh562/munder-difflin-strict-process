@@ -96,6 +96,10 @@ export interface HarnessConfig {
   onboardingComplete: boolean;
   /** Folder where the harness keeps its own state (agent metadata, logs). */
   harnessHome: string | null;
+  /** Optional working directory for a NATIVE god — its own scratch space, kept
+   *  separate from the hive bookkeeping so its file writes can't pollute the registry
+   *  / board / memory. Unset ⇒ auto-derived `<harnessHome>/workspace`. */
+  godWorkspace?: string;
   /** Folders the user registered during onboarding (used as quick-picks). */
   registeredRepos: string[];
   /** When true, new agents are spawned with --permission-mode bypassPermissions. */

@@ -6,7 +6,7 @@
  * teardown/archive on worker exit (mirrors the PTY path), and bounds floor-wide
  * concurrency.
  */
-import type { AgentEvent } from '../../shared/agentEvent';
+import { AGENT_EVENT_VERSION, type AgentEvent } from '../../shared/agentEvent';
 import type { UsageSnapshot } from '../../shared/providerRuntime';
 import { NativeAgentWorker, type NativeTelemetrySink } from './nativeAgentWorker';
 import { makeElectronWorkerTransport } from './electronWorkerTransport';
@@ -143,6 +143,20 @@ export class NativeRuntime {
     if (!worker) return { ok: false, error: 'no native runtime for agent' };
     worker.kill();
     this.workers.delete(agentId); // idempotent with onExit — don't wait on the exit event
+    // The worker dies mid-turn with NO final event (process.exit), so the folded
+    // transcript's open turn would stay 'pending' and blink "working…" forever. Emit a
+    // synthetic terminal `stop` through the SAME bridge sink the worker uses — the fold
+    // treats `stop` as a global terminal signal (settles open turns) and it's persisted,
+    // so the indicator clears immediately AND after a reload.
+    this.deps.onAgentEvent?.({
+      v: AGENT_EVENT_VERSION,
+      agentId,
+      sessionId: null,
+      ts: Date.now(),
+      kind: 'stop',
+      reason: 'stopped by operator',
+      stopActive: true
+    });
     return { ok: true };
   }
 

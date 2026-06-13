@@ -67,6 +67,21 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
   const [notifications, setNotifications] = useState<boolean>(
     (config as HarnessConfig & { notifications?: boolean }).notifications === true
   );
+  // Optional override for the native god's working directory; unset ⇒ auto
+  // (`<harnessHome>/workspace`). Persisted to config; takes effect on the god's
+  // next (re)spawn (useHive effect #1 re-runs on the change).
+  const [godWorkspace, setGodWorkspace] = useState<string | undefined>(config.godWorkspace);
+
+  const pickGodWorkspace = async () => {
+    const res = await window.cth.chooseFolder();
+    if (!res.ok) return; // cancelled
+    setGodWorkspace(res.path);
+    await window.cth.updateConfig({ godWorkspace: res.path });
+  };
+  const resetGodWorkspace = async () => {
+    setGodWorkspace(undefined);
+    await window.cth.updateConfig({ godWorkspace: undefined });
+  };
 
   const toggleNotifications = async () => {
     const next = !notifications;
@@ -231,10 +246,11 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
     let alive = true;
     window.cth.getConfig().then((c) => {
       if (!alive) return;
-      const cc = c as BreakerCfgView & SlackConfig & { notifications?: boolean; webSearchEnabled?: boolean; nativeBashEnabled?: boolean };
+      const cc = c as BreakerCfgView & SlackConfig & { notifications?: boolean; webSearchEnabled?: boolean; nativeBashEnabled?: boolean; godWorkspace?: string };
       setNotifications(cc.notifications === true);
       setWebSearchEnabled(cc.webSearchEnabled === true);
       setNativeBashEnabled(cc.nativeBashEnabled === true);
+      setGodWorkspace(cc.godWorkspace);
       setAgentBudget(cc.costCapTokens != null ? String(cc.costCapTokens) : '');
       setVelocityCeiling(cc.circuitBreaker?.tokenVelocityPerMin != null ? String(cc.circuitBreaker.tokenVelocityPerMin) : '');
       setSlackEnabled(cc.slackEnabled ?? false);
@@ -431,6 +447,19 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
                   fontFamily: 'var(--cth-font-mono, monospace)'
                 }}>{config.harnessHome ?? '—'}</span>
                 <PixelButton variant="secondary" size="sm" onClick={pickNewHome}>change…</PixelButton>
+              </div>
+              {/* God workspace — Michael's own scratch dir (native god), kept separate
+                  from the hive bookkeeping. Unset ⇒ auto `<harnessHome>/workspace`. */}
+              <div style={{ display: 'flex', gap: 12, fontSize: 14, lineHeight: '20px', alignItems: 'center' }}>
+                <span style={{ width: 140, flexShrink: 0, color: 'var(--cth-ink-500)' }}>God workspace</span>
+                <span style={{
+                  flex: 1, color: godWorkspace ? 'var(--cth-ink-900)' : 'var(--cth-ink-500)', wordBreak: 'break-all',
+                  fontFamily: 'var(--cth-font-mono, monospace)'
+                }}>{godWorkspace ?? `auto · ${config.harnessHome ?? '<home>'}${(config.harnessHome ?? '').includes('\\') ? '\\' : '/'}workspace`}</span>
+                <PixelButton variant="secondary" size="sm" onClick={pickGodWorkspace}>change…</PixelButton>
+                {godWorkspace && (
+                  <PixelButton variant="secondary" size="sm" onClick={resetGodWorkspace}>reset</PixelButton>
+                )}
               </div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                 {rows.map(([label, value]) => (
