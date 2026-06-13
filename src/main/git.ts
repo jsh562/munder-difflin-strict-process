@@ -142,6 +142,38 @@ export async function isRepo(cwd: string): Promise<boolean> {
   return res.ok && res.stdout.trim() === 'true';
 }
 
+export interface GitWorktree {
+  path: string;
+  branch: string | null;
+  head: string;     // short sha
+  isMain: boolean;  // the repo's primary tree — never offered for deletion
+  locked: boolean;
+}
+
+/** Enumerate a repo's worktrees (the primary tree + every `git worktree add`). Parses
+ *  `git worktree list --porcelain`. The FIRST entry is the main worktree (isMain). */
+export async function listWorktrees(cwd: string): Promise<GitWorktree[] | { error: string }> {
+  const res = await runGit(cwd, ['worktree', 'list', '--porcelain']);
+  if (!res.ok) return { error: res.error };
+  const out: GitWorktree[] = [];
+  let cur: { path?: string; branch?: string | null; head?: string; locked?: boolean } | null = null;
+  const flush = () => {
+    if (cur?.path) {
+      out.push({ path: cur.path, branch: cur.branch ?? null, head: cur.head ?? '', isMain: out.length === 0, locked: cur.locked === true });
+    }
+    cur = null;
+  };
+  for (const line of res.stdout.split('\n')) {
+    if (line.startsWith('worktree ')) { flush(); cur = { path: line.slice(9).trim() }; }
+    else if (cur && line.startsWith('HEAD ')) cur.head = line.slice(5).trim().slice(0, 7);
+    else if (cur && line.startsWith('branch ')) cur.branch = line.slice(7).trim().replace(/^refs\/heads\//, '');
+    else if (cur && line.startsWith('locked')) cur.locked = true;
+    else if (cur && line.trim() === '') flush();
+  }
+  flush();
+  return out;
+}
+
 /** Derive a safe `agent/<id>` branch name from a worktree path's basename. */
 function agentBranchFor(wtPath: string): string {
   const base = wtPath.split(/[\\/]/).filter(Boolean).pop() ?? 'agent';

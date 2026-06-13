@@ -300,6 +300,12 @@ const api = {
   chooseFolder: (): Promise<{ ok: true; path: string } | { ok: false; error: string }> =>
     ipcRenderer.invoke('dialog:chooseFolder'),
 
+  // ─── Worktrees (review + bulk cleanup of kept isolated worktrees) ──────────
+  listWorktrees: (): Promise<Array<{ repo: string; path: string; branch: string | null; head: string; isMain: boolean; locked: boolean }>> =>
+    ipcRenderer.invoke('git:listWorktrees'),
+  removeWorktree: (repo: string, path: string): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('git:removeWorktree', repo, path),
+
   // ─── Terminal.app ────────────────────────────────────────────────────────
   openTerminalAt: (cwd: string): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('terminal:openAtFolder', cwd),

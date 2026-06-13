@@ -10,7 +10,7 @@ import {
 import { listDir, readFileText, writeFileText } from './fs';
 import {
   getBranch, getStatus, getLog, getBranches, getAheadBehind, isRepo,
-  addWorktree, removeWorktree
+  addWorktree, removeWorktree, listWorktrees, type GitWorktree
 } from './git';
 import { HiveManager, type AgentMeta, type HiveMessage, type HiveTask } from './hive';
 import { HookServer } from './hooks';
@@ -218,16 +218,13 @@ function teardownPty(id: string): void {
     agentProviderIds.delete(agentId);
     archiveAgent(agentId);
   }
-  // 2) Remove the isolated worktree, if any. Non-blocking; errors are logged.
-  const wtPath = worktreePaths.get(id);
-  if (wtPath) {
-    const origCwd = worktreeOrigins.get(id) ?? wtPath;
-    worktreePaths.delete(id);
-    worktreeOrigins.delete(id);
-    void removeWorktree(origCwd, wtPath)
-      .then(r => { if (!r.ok) console.error('[worktree] removeWorktree failed:', r.error); })
-      .catch(e => console.error('[worktree] removeWorktree threw:', e));
-  }
+  // 2) An isolated agent's worktree is INTENTIONALLY KEPT on exit (it was force-removed
+  //    before, which orphaned committed work). The branch + checkout survive so the god
+  //    can integrate it and the operator can review/bulk-delete stale ones from the
+  //    Worktrees panel (Settings). Only drop the live in-memory mapping here; the panel
+  //    lists from `git worktree list`, so on-disk state is the source of truth.
+  worktreePaths.delete(id);
+  worktreeOrigins.delete(id);
   syncKeepAwake();
 }
 // A natural PTY exit must run the same teardown as an explicit kill.
@@ -843,11 +840,20 @@ ipcMain.handle('pty:spawn', async (_evt, opts: SpawnOptions & { hive?: AgentMeta
   if (!opts || typeof opts.id !== 'string' || typeof opts.cwd !== 'string' || typeof opts.command !== 'string') {
     return { ok: false, error: 'invalid SpawnOptions' };
   }
-  // Git isolation: when requested and the cwd is a real repo, give this agent
-  // its own worktree on an `agent/<id>` branch so it can't clobber other agents'
-  // (or the user's) working tree. Best-effort — a failure falls back to the
-  // shared cwd rather than blocking the spawn.
-  if (opts.isolate === true && await isRepo(opts.cwd)) {
+  // Git isolation: give the agent its own worktree on an `agent/<id>` branch so it can't
+  // clobber other agents' (or the user's) working tree. AUTO-isolate when the target repo
+  // already hosts another (non-archived) worker — the newcomer gets a worktree while the
+  // FIRST agent keeps the main tree (the integration base); the explicit "isolate"
+  // checkbox forces it regardless. Best-effort — a failure falls back to the shared cwd
+  // rather than blocking the spawn. (The god/assistant never isolate; their cwd isn't a repo.)
+  const isWorkerDesk = !!opts.hive && !opts.hive.isGod && !opts.hive.isAssistant;
+  const repoOccupied =
+    isWorkerDesk &&
+    ([...worktreeOrigins.values()].includes(opts.cwd) ||
+      Object.values(hive.registry().agents).some(
+        (a) => !a.archived && a.cwd === opts.cwd && a.id !== opts.hive!.id
+      ));
+  if ((opts.isolate === true || repoOccupied) && await isRepo(opts.cwd)) {
     try {
       const origCwd = opts.cwd;
       const wtRoot = join(readConfig().harnessHome ?? origCwd, 'worktrees');
@@ -989,6 +995,25 @@ ipcMain.handle('pty:kill', (_evt, id: string) => {
   return res;
 });
 ipcMain.handle('pty:list', () => ptyManager.list());
+
+// ─── IPC: worktrees (review + bulk cleanup) ─────────────────────────────────-
+// Isolated agents' worktrees are KEPT on exit (so committed work survives for the god
+// to integrate); this surface lets the operator review + delete stale ones. Origins are
+// the registered repos plus any live worktree origins this session; each repo's worktrees
+// are enumerated from git itself (the source of truth, survives restarts).
+ipcMain.handle('git:listWorktrees', async (): Promise<Array<GitWorktree & { repo: string }>> => {
+  const origins = new Set<string>([...(readConfig().registeredRepos ?? []), ...worktreeOrigins.values()]);
+  const out: Array<GitWorktree & { repo: string }> = [];
+  for (const repo of origins) {
+    const res = await listWorktrees(repo);
+    if (Array.isArray(res)) for (const w of res) { if (!w.isMain) out.push({ ...w, repo }); }
+  }
+  return out;
+});
+ipcMain.handle('git:removeWorktree', async (_evt, repo: unknown, wtPath: unknown) => {
+  if (typeof repo !== 'string' || typeof wtPath !== 'string') return { ok: false, error: 'invalid args' };
+  return removeWorktree(repo, wtPath);
+});
 
 // ─── IPC: clipboard ─────────────────────────────────────────────────────────
 ipcMain.handle('app:copyToClipboard', (_evt, text: unknown) => {

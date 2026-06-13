@@ -83,6 +83,29 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
     await window.cth.updateConfig({ godWorkspace: undefined });
   };
 
+  // Worktrees — isolated agents' worktrees are kept on exit; let the operator review +
+  // bulk-delete stale ones. Loaded when the modal opens.
+  type Worktree = { repo: string; path: string; branch: string | null; head: string; isMain: boolean; locked: boolean };
+  const [worktrees, setWorktrees] = useState<Worktree[]>([]);
+  const [wtSelected, setWtSelected] = useState<Set<string>>(new Set());
+  const [wtBusy, setWtBusy] = useState(false);
+  const loadWorktrees = async () => {
+    try { setWorktrees(await window.cth.listWorktrees()); } catch { setWorktrees([]); }
+  };
+  useEffect(() => { void loadWorktrees(); }, []);
+  const toggleWt = (path: string) =>
+    setWtSelected((s) => { const n = new Set(s); if (n.has(path)) n.delete(path); else n.add(path); return n; });
+  const deleteSelectedWorktrees = async () => {
+    setWtBusy(true);
+    try {
+      for (const wt of worktrees.filter((w) => wtSelected.has(w.path))) {
+        await window.cth.removeWorktree(wt.repo, wt.path).catch(() => { /* best-effort; keep going */ });
+      }
+      setWtSelected(new Set());
+      await loadWorktrees();
+    } finally { setWtBusy(false); }
+  };
+
   const toggleNotifications = async () => {
     const next = !notifications;
     setNotifications(next); // optimistic
@@ -461,6 +484,35 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
                   <PixelButton variant="secondary" size="sm" onClick={resetGodWorkspace}>reset</PixelButton>
                 )}
               </div>
+
+              {/* Worktrees — isolated agents' worktrees are kept on exit so committed work
+                  survives for integration/review; this is where you bulk-clean stale ones. */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                  <span style={{ width: 140, flexShrink: 0, color: 'var(--cth-ink-500)', fontSize: 14 }}>Worktrees</span>
+                  <span style={{ flex: 1, fontSize: 13, color: 'var(--cth-ink-500)' }}>
+                    {worktrees.length === 0 ? 'none — isolated agents create these per repo' : `${worktrees.length} isolated worktree${worktrees.length === 1 ? '' : 's'}`}
+                  </span>
+                  <PixelButton variant="secondary" size="sm" onClick={() => void loadWorktrees()} disabled={wtBusy}>refresh</PixelButton>
+                  {wtSelected.size > 0 && (
+                    <PixelButton variant="destructive" size="sm" onClick={deleteSelectedWorktrees} disabled={wtBusy}>
+                      {wtBusy ? 'deleting…' : `delete ${wtSelected.size}`}
+                    </PixelButton>
+                  )}
+                </div>
+                {worktrees.length > 0 && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 180, overflowY: 'auto', paddingLeft: 152 }}>
+                    {worktrees.map((w) => (
+                      <label key={w.path} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, cursor: 'pointer' }}>
+                        <input type="checkbox" checked={wtSelected.has(w.path)} onChange={() => toggleWt(w.path)} />
+                        <span style={{ fontFamily: 'var(--cth-font-mono, monospace)', color: 'var(--cth-ink-900)' }}>{w.branch ?? '(detached)'}</span>
+                        <span style={{ color: 'var(--cth-ink-500)', wordBreak: 'break-all' }}>{w.path}</span>
+                      </label>
+                    ))}
+                  </div>
+                )}
+              </div>
+
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                 {rows.map(([label, value]) => (
                   <div key={label} style={{ display: 'flex', gap: 12, fontSize: 14, lineHeight: '20px' }}>
