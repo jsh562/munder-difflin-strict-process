@@ -54,10 +54,13 @@ if (parentPort) {
   const isNative = adapter !== null;
   const model = (process.env[NATIVE_PROVIDER_MODEL_ENV] ?? '').trim() || null;
 
-  // Host-supplied environment briefing (the desk's actual shell + OS) appended to the
-  // preamble so it uses the right command style. Stable per machine ⇒ no cache bust.
+  // Host-supplied native system-prompt additions: the orchestrator ROLE for a god desk
+  // (so Michael runs the floor on a native provider) + the shell/OS briefing. Both are
+  // stable per machine/desk ⇒ no prompt-cache bust. Order: base toolkit preamble → god
+  // role (if any) → shell note.
+  const godPrompt = (process.env.NATIVE_AGENT_GOD_PROMPT ?? '').trim();
   const envNote = (process.env.NATIVE_AGENT_ENV_NOTE ?? '').trim();
-  const nativePreamble = envNote ? `${NATIVE_AGENT_PREAMBLE}\n${envNote}` : NATIVE_AGENT_PREAMBLE;
+  const nativePreamble = [NATIVE_AGENT_PREAMBLE, godPrompt, envNote].filter(Boolean).join('\n\n');
 
   const requestDrain = (): Promise<{ block: boolean; reason?: string }> => {
     const turnId = ++turnSeq;

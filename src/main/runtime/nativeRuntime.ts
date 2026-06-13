@@ -36,10 +36,11 @@ export interface NativeRuntimeDeps {
   /** E004 — the credential injection seam: provider id → spawn env, or null when
    *  no key is set. Wired to `injectionEnvForProvider(readConfig(), providerId)`. */
   credentialEnvFor?: (providerId: string) => Record<string, string> | null;
-  /** Extra non-secret env merged into every native worker's spawn env (e.g. the
-   *  shell/OS environment note the worker appends to the preamble). Merged over
+  /** Extra non-secret env merged into a native worker's spawn env (e.g. the shell/OS
+   *  note + the god orchestration prompt). Receives the agentId so it can vary per
+   *  desk (e.g. inject the orchestrator role only for the god). Merged over
    *  `process.env` by the transport, so it never replaces the inherited env. */
-  workerEnv?: () => Record<string, string>;
+  workerEnv?: (agentId: string) => Record<string, string>;
   /** E007 T011/T017 {FR-008/011} — the telemetry forward sink. Each spawned worker's
    *  native usage + tool spans are normalized into the loopback collector's gen_ai.*
    *  branch (single-writer in main, AD-002), so a native desk reaches telemetry
@@ -84,7 +85,7 @@ export class NativeRuntime {
     // worker's selectAdapter targets the right model + endpoint (FR-008). Plus any
     // host-supplied non-secret env (the shell/OS note). Merged over process.env by the
     // transport, so an undefined result still inherits the parent env.
-    const extraEnv = this.deps.workerEnv?.() ?? {};
+    const extraEnv = this.deps.workerEnv?.(agentId) ?? {};
     const baseEnv =
       credEnv && model
         ? { ...credEnv, [NATIVE_PROVIDER_MODEL_ENV]: model }

@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import { useStore, type Agent, type StationKind, type ToolKind } from '@/store/store';
 import { buildSpawnCommand, ASSISTANT_MODEL, type HarnessConfig } from '@/store/config';
+import { deriveProviderId } from '@shared/assignment';
 
 const GOD_ID = 'god';
 const GOD_PTY = `pty-${GOD_ID}`;
@@ -28,6 +29,18 @@ const INITIAL_GOD_PROMPT = [
   '3. Check fleet health: read fleet.json in the hive root for every agent\'s live tokens, cost, status, breaker level, and inbox backlog (`claude agents` will NOT show your hive\'s agents). Flag anyone stalled, over-budget, or breaker-armed.',
   '4. Skim COMMANDS.md (hive root) for the Claude Code commands you can use — and run `mempalace wake-up` for a memory digest if the CLI is available.',
   'Then begin orchestrating: triage requests, delegate work to the team, and keep everyone unblocked. You are fully autonomous — there is no approval queue, so handle tool-permission prompts in this session yourself (the human can approve them remotely from their phone).'
+].join('\n');
+
+// A NATIVE (DeepSeek/Minimax) god has no Claude CLI — no slash commands, COMMANDS.md,
+// `claude agents`, or fleet.json CLI monitoring. It orchestrates purely through the hive
+// TOOLS, so its orientation is written for those. (Its persistent orchestrator ROLE is
+// injected host-side into the native system prompt; this is just the kickoff.)
+const INITIAL_GOD_PROMPT_NATIVE = [
+  "You're online as Michael, the orchestrator of the hive. Get oriented, then run the floor:",
+  '1. Read your own memory (hive_read_memory) and review the shared task board (hive_list_tasks).',
+  '2. Delegate work to the team with hive_send_message (to a specific desk, or "broadcast"); track it with hive_add_task.',
+  '3. Record durable decisions and context with write_memory so future-you remembers.',
+  'Orchestrate, do not implement: triage, dispatch, resolve conflicts, and keep everyone unblocked.'
 ].join('\n');
 
 // Scheduled auto-compact command (from the ops standup). Queued per agent and
@@ -205,9 +218,19 @@ export function useHive(config: HarnessConfig | null): void {
       // strictly sequential and can't jam together; the boot-grace window keeps
       // the inbox-wake/drain loops off Michael until he's oriented. Restored
       // sessions (the live-PTY branch above) skip this.
+      // A native god (a non-anthropic fleet default) is routed to the native runtime
+      // and has NO PTY — so the Claude-only kickoff (/remote-control + writePty) can't
+      // reach it. Drive it through the native seam instead; orientation lands as the
+      // worker's first input (its orchestrator ROLE is injected host-side).
+      const godIsNative = !!config.defaultModel && deriveProviderId(config.defaultModel) !== 'anthropic';
       bootGraceUntil.current[GOD_ID] = Date.now() + BOOT_GRACE_MS;
       timers.push(setTimeout(() => {
         if (cancelled) return;
+        if (godIsNative) {
+          window.cth.nativeSend(GOD_ID, { kind: 'operator', text: INITIAL_GOD_PROMPT_NATIVE })
+            .catch(() => { /* worker may not be ready/alive — best-effort */ });
+          return;
+        }
         // settleMs pauses the chain ~1.5s after /remote-control before the
         // orientation prompt is submitted next.
         submitToPty(GOD_PTY, '/remote-control', REMOTE_CONTROL_SETTLE_MS).catch(() => { /* best-effort */ });

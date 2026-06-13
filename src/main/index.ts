@@ -268,6 +268,19 @@ const agentToolDeps: AgentToolDeps = {
   // recoverable success:false tool-result.
   searchWeb: (query, opts) => searchWebDuckDuckGo(query, opts, readConfig())
 };
+
+// The orchestrator ROLE injected into a NATIVE god's system prompt (Michael on a
+// non-Claude provider). The Claude god gets its role via `--append-system-prompt`
+// (hive.injectedPrompt); a native god has no CLI, so it orchestrates purely through the
+// hive TOOLS — this prompt is written for those (no fleet.json CLI / slash commands).
+const NATIVE_GOD_PROMPT = [
+  'You are the GOD / ORCHESTRATOR of this hive of agents (you are "Michael"). Your job is to ORCHESTRATE, not implement: keep awareness of the whole team and delegate the work.',
+  '- DELEGATE: decompose work and fan it out with hive_send_message (to a desk id, or "broadcast"); assign + track it on the shared board with hive_add_task / hive_list_tasks. Do NOT do the grunt implementation yourself.',
+  '- COORDINATE: answer agents\' questions so the team runs autonomously; read a peer\'s memory with hive_read_memory when you need context; record durable decisions with write_memory.',
+  '- OWN only the high-leverage calls: task decomposition, dispatch, sign-offs, conflict resolution, integration. Keep everyone unblocked.',
+  'The human operator is watching this transcript and can message you directly — surface anything genuinely critical to them.'
+].join('\n');
+
 // E003 — native (non-Claude) agents run in isolated utilityProcess workers,
 // fronted by the ProviderRuntime port. The drain runs in MAIN (single-committer
 // hive); a worker exit reuses the same archive path as a PTY exit (AD-004).
@@ -290,9 +303,15 @@ const nativeRuntime = new NativeRuntime({
   onWorkerExit: (id) => { archiveAgent(id); syncKeepAwake(); },
   usageFor: (id) => usageProvider.getAgentUsage(id),
   credentialEnvFor: (providerId) => injectionEnvForProvider(readConfig(), providerId),
-  // Brief the native desk on its actual shell + OS so it uses the right command style
-  // (Unix vs PowerShell vs cmd) on the first try. Appended to the preamble in the worker.
-  workerEnv: () => ({ NATIVE_AGENT_ENV_NOTE: describeBashEnv() }),
+  // Per-desk native preamble additions: the shell/OS note for every desk, plus the
+  // orchestrator ROLE for a native god (so Michael actually runs the floor on DeepSeek
+  // instead of behaving like a generic worker). The worker prepends these to its system
+  // prompt. `isGod` comes from the hive registry (set at ensureAgent).
+  workerEnv: (id) => {
+    const env: Record<string, string> = { NATIVE_AGENT_ENV_NOTE: describeBashEnv() };
+    if (hive.registry().agents[id]?.isGod) env.NATIVE_AGENT_GOD_PROMPT = NATIVE_GOD_PROMPT;
+    return env;
+  },
   // E007 T011/T017 {FR-008/011} — forward each native worker's usage + tool spans
   // into the loopback collector's gen_ai.* branch (single-writer in main, AD-002),
   // so a DeepSeek/Minimax desk produces the SAME AgentUsageSample + ToolSpan as a
