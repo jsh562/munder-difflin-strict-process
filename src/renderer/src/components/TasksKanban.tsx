@@ -16,6 +16,8 @@ export interface HiveTask {
   assignee?: string;
   status: 'todo' | 'doing' | 'blocked' | 'review' | 'done';
   dependsOn: string[];
+  /** Task id(s) this card is waiting on while `blocked` (shown as "blocked by"). */
+  blockedBy?: string[];
   priority: number;
   createdAt: string;
 }
@@ -65,6 +67,7 @@ function parseTasks(raw: unknown): HiveTask[] {
       status: (['todo', 'doing', 'blocked', 'review', 'done'] as const).includes(t.status as Status)
         ? (t.status as Status) : 'todo',
       dependsOn: Array.isArray(t.dependsOn) ? t.dependsOn.filter((d): d is string => typeof d === 'string') : [],
+      blockedBy: Array.isArray(t.blockedBy) ? t.blockedBy.filter((d): d is string => typeof d === 'string') : undefined,
       priority: typeof t.priority === 'number' ? t.priority : 3,
       createdAt: typeof t.createdAt === 'string' ? t.createdAt : new Date().toISOString()
     }));
@@ -80,6 +83,17 @@ export function TasksKanban({ onAssign }: { onAssign: (prefill: string) => void 
   const [tasks, setTasks] = useState<HiveTask[]>([]);
   const [adding, setAdding] = useState(false);
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Jump-to-blocker: a transient highlight + scroll-into-view when a "blocked by" chip is
+  // clicked. Card DOM nodes register here by task id.
+  const [flashId, setFlashId] = useState<string | null>(null);
+  const flashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cardRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  const jumpTo = useCallback((tid: string) => {
+    cardRefs.current.get(tid)?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    setFlashId(tid);
+    if (flashTimer.current) clearTimeout(flashTimer.current);
+    flashTimer.current = setTimeout(() => setFlashId(null), 1600);
+  }, []);
 
   const refresh = useCallback(async () => {
     try { setTasks(parseTasks(await window.cth.hiveTasks())); } catch { /* keep last good */ }
@@ -102,8 +116,15 @@ export function TasksKanban({ onAssign }: { onAssign: (prefill: string) => void 
   }, [tasks, persist]);
 
   const moveTask = useCallback((id: string, status: Status) => {
-    persist(tasks.map((t) => (t.id === id ? { ...t, status } : t)));
+    // Moving out of 'blocked' also clears its blockers (parity with the agent tool).
+    persist(tasks.map((t) => (t.id === id ? { ...t, status, blockedBy: status === 'blocked' ? t.blockedBy : undefined } : t)));
   }, [tasks, persist]);
+
+  const setBlockedBy = useCallback((id: string, ids: string[]) => {
+    persist(tasks.map((t) => (t.id === id ? { ...t, blockedBy: ids.length ? ids : undefined } : t)));
+  }, [tasks, persist]);
+
+  const titleFor = (tid: string): string => tasks.find((t) => t.id === tid)?.title ?? tid;
 
   const assign = useCallback((t: HiveTask) => {
     const desc = t.description?.trim() ? t.description.trim() : '(no description)';
@@ -172,8 +193,14 @@ export function TasksKanban({ onAssign }: { onAssign: (prefill: string) => void 
                     key={t.id}
                     task={t}
                     assigneeName={nameFor(t.assignee)}
+                    flashing={flashId === t.id}
+                    blockers={(t.blockedBy ?? []).map((bid) => ({ id: bid, title: titleFor(bid) }))}
+                    otherTasks={tasks.filter((x) => x.id !== t.id).map((x) => ({ id: x.id, title: x.title }))}
+                    registerRef={(el) => { if (el) cardRefs.current.set(t.id, el); else cardRefs.current.delete(t.id); }}
                     onMove={(s) => moveTask(t.id, s)}
                     onAssign={() => assign(t)}
+                    onJump={jumpTo}
+                    onSetBlockedBy={(ids) => setBlockedBy(t.id, ids)}
                   />
                 ))}
               </div>
@@ -187,17 +214,26 @@ export function TasksKanban({ onAssign }: { onAssign: (prefill: string) => void 
 
 // ─── Card ────────────────────────────────────────────────────────────────────
 
-function TaskCard({ task, assigneeName, onMove, onAssign }: {
+function TaskCard({ task, assigneeName, flashing, blockers, otherTasks, registerRef, onMove, onAssign, onJump, onSetBlockedBy }: {
   task: HiveTask;
   assigneeName?: string;
+  flashing?: boolean;
+  blockers: { id: string; title: string }[];
+  otherTasks: { id: string; title: string }[];
+  registerRef: (el: HTMLDivElement | null) => void;
   onMove: (s: Status) => void;
   onAssign: () => void;
+  onJump: (id: string) => void;
+  onSetBlockedBy: (ids: string[]) => void;
 }) {
   const pr = Math.max(1, Math.min(5, task.priority));
+  const [pickingBlocker, setPickingBlocker] = useState(false);
+  const blockedSet = new Set(task.blockedBy ?? []);
   return (
-    <div style={{
+    <div ref={registerRef} style={{
       padding: 7, background: 'var(--cth-paper-100)',
-      boxShadow: 'inset 0 0 0 1px var(--cth-ink-700)', display: 'flex', flexDirection: 'column', gap: 5
+      boxShadow: flashing ? 'inset 0 0 0 2px var(--cth-lemon), 0 0 0 2px var(--cth-lemon)' : 'inset 0 0 0 1px var(--cth-ink-700)',
+      transition: 'box-shadow 200ms', display: 'flex', flexDirection: 'column', gap: 5
     }}>
       <div style={{ display: 'flex', alignItems: 'flex-start', gap: 6 }}>
         <PriorityDots level={pr} />
@@ -206,6 +242,26 @@ function TaskCard({ task, assigneeName, onMove, onAssign }: {
           lineHeight: '16px', color: 'var(--cth-ink-900)'
         }}>{task.title}</span>
       </div>
+
+      {/* Blocked-by: a coral chip per blocker; clicking jumps to that card. */}
+      {blockers.length > 0 && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexWrap: 'wrap' }}>
+          <span style={{ fontSize: 11, color: 'var(--cth-coral)' }}>⛔ blocked by</span>
+          {blockers.map((b) => (
+            <button
+              key={b.id}
+              onClick={() => onJump(b.id)}
+              title={`Jump to "${b.title}"`}
+              style={{
+                maxWidth: 130, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                padding: '1px 6px 0', border: 'none', cursor: 'pointer',
+                background: 'var(--cth-coral-light)', boxShadow: 'inset 0 0 0 1px var(--cth-coral)',
+                fontFamily: 'var(--cth-font-ui)', fontSize: 11, color: 'var(--cth-ink-900)'
+              }}
+            >{b.title}</button>
+          ))}
+        </div>
+      )}
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 5, flexWrap: 'wrap' }}>
         {assigneeName
@@ -220,7 +276,47 @@ function TaskCard({ task, assigneeName, onMove, onAssign }: {
             <Icon name="arrow-right" /> {task.dependsOn.length}
           </span>
         )}
+        {task.status === 'blocked' && otherTasks.length > 0 && (
+          <button
+            onClick={() => setPickingBlocker((v) => !v)}
+            title="Set what this card is blocked by"
+            style={{
+              padding: '1px 6px 0', border: 'none', cursor: 'pointer',
+              background: pickingBlocker ? 'var(--cth-coral-light)' : 'var(--cth-cream-200)',
+              boxShadow: `inset 0 0 0 1px ${pickingBlocker ? 'var(--cth-coral)' : 'var(--cth-ink-300)'}`,
+              fontFamily: 'var(--cth-font-ui)', fontSize: 11, color: 'var(--cth-ink-700)'
+            }}
+          >blockers</button>
+        )}
       </div>
+
+      {pickingBlocker && (
+        <div style={{
+          display: 'flex', flexWrap: 'wrap', gap: 4, maxHeight: 84, overflowY: 'auto', padding: 4,
+          background: 'var(--cth-paper-100)', boxShadow: 'inset 0 0 0 1px var(--cth-ink-300)'
+        }}>
+          {otherTasks.map((o) => {
+            const on = blockedSet.has(o.id);
+            return (
+              <button
+                key={o.id}
+                onClick={() => {
+                  const next = on ? (task.blockedBy ?? []).filter((x) => x !== o.id) : [...(task.blockedBy ?? []), o.id];
+                  onSetBlockedBy(next);
+                }}
+                title={o.title}
+                style={{
+                  maxWidth: 150, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                  padding: '2px 7px 1px', border: 'none', cursor: 'pointer',
+                  background: on ? 'var(--cth-coral)' : 'var(--cth-cream-200)',
+                  boxShadow: `inset 0 0 0 1px ${on ? 'var(--cth-ink-900)' : 'var(--cth-ink-300)'}`,
+                  fontFamily: 'var(--cth-font-ui)', fontSize: 11, color: 'var(--cth-ink-900)'
+                }}
+              >{o.title}</button>
+            );
+          })}
+        </div>
+      )}
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
         <select

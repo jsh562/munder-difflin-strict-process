@@ -31,9 +31,10 @@ Cast: **God** (`Michael`, the orchestrator — a singleton) and **workers** (Dee
 
 Messages move work; the board records it — a living, single-source-of-truth with a role protocol:
 - Statuses: `todo | doing | blocked | review | done`.
-- **`hive_update_task`** `{ id, status?, assignee?, title?, priority?, note? }`, **role-enforced**:
+- **`hive_update_task`** `{ id, status?, assignee?, title?, priority?, note?, blockedBy? }`, **role-enforced**:
   - **Worker** — may update only a card **assigned to itself**, and only to `doing` / `blocked` / `review`. It may **not** set `done` or reassign.
   - **God** — may update **any** card to **any** status, including `done`/reopen, plus reassign and reprioritize.
+- **Blocked-by:** a `blocked` card carries **`blockedBy`** — the task id(s) it's waiting on (set when marking it blocked; auto-cleared on unblock). The board shows it as a coral **"⛔ blocked by ＜title＞"** chip that jumps to the blocker. Distinct from `dependsOn` (planning-time ordering). Non-task blocks use a free-text `note` + a message to god.
 - **Ownership lanes** (no write races — the hive is single-committer, the convention keeps lanes clean):
   - **God owns** create, assign, and **sign-off**.
   - **Workers own** progress on their own cards.
@@ -42,7 +43,7 @@ Messages move work; the board records it — a living, single-source-of-truth wi
 ```
 todo ─(god assigns)─▶ doing ─(worker)─▶ review ─(integrator verifies+merges)─▶ done
                         │                              │
-                        └─(worker: blocked)─▶ blocked  └─(integrator: reopen)─▶ doing
+                        └─(worker: blocked + blockedBy)─▶ blocked  └─(integrator: reopen)─▶ doing
 ```
 (the integrator is the god by default, or a dedicated desk holding the integrator role)
 

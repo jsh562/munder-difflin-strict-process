@@ -45,6 +45,8 @@ export interface HiveTask {
   assignee?: string;
   status: 'todo' | 'doing' | 'blocked' | 'review' | 'done';
   dependsOn: string[];
+  /** Task id(s) currently blocking this card (set when status='blocked'). */
+  blockedBy?: string[];
   priority: number;
   createdAt: string;
 }
