@@ -3,38 +3,36 @@
  *
  * The package's `executeAgentTool` is host-agnostic and never touches the network —
  * it calls the injected `searchWeb(query, opts)`. This module is that injection: it
- * owns the PROVIDER (Brave Search API), the API key, and the formatting. Keeping it
- * here (not in `@jsh562/agent-core`) preserves the package boundary.
+ * owns the PROVIDER, the request, and the formatting. Keeping it here (not in
+ * `@jsh562/agent-core`) preserves the package boundary.
  *
- * Why a search API (and a key) at all: real keyword search queries a web index —
- * the index IS the product, so it bills per query. A keyless "simple request" only
- * FETCHES a known URL, which is a different capability. Brave's free tier (~2k
- * queries/mo) covers personal use.
+ * Provider = **DuckDuckGo's HTML endpoint** — completely FREE and KEYLESS. The cost of
+ * keyless is that it's unofficial: it can rate-limit, occasionally return nothing, and
+ * could break if DuckDuckGo changes its markup. (Keyed providers like Brave/Tavily are
+ * a drop-in swap behind this same function if reliability ever matters more.)
  *
  * It returns COMPACT text — the model reads the result back into its context, so we
- * cap result count and snippet length to keep that token cost bounded (the whole
- * reason the tool description tells the model to search narrowly).
+ * cap result count and snippet length to keep that token cost bounded.
  *
- * Failure modes throw a clear, self-correcting message (disabled / no key / provider
- * error); the executor turns a throw into a `success:false` tool-result the loop can
- * recover from. No secret is ever included in the returned text or the error.
+ * Failure modes throw a clear message (disabled / network error / empty); the executor
+ * turns a throw into a `success:false` tool-result the loop can recover from.
  */
 import type { HarnessConfig } from './config';
-import { getKeyFromConfig, WEB_SEARCH_KEY_ID } from './credentials';
 
-const BRAVE_ENDPOINT = 'https://api.search.brave.com/res/v1/web/search';
+// DuckDuckGo's no-JS HTML results endpoint. Keyless. A browser-like UA avoids the
+// "please enable JS" / challenge page DDG serves to obvious bots.
+const DDG_ENDPOINT = 'https://html.duckduckgo.com/html/';
+const USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 const DEFAULT_RESULTS = 5;
-const MAX_RESULTS = 10; // Brave allows up to 20; we cap lower to bound token cost
-const SNIPPET_CHARS = 500; // per-result description cap (token-conscious)
+const MAX_RESULTS = 10;
+const SNIPPET_CHARS = 500; // per-result snippet cap (token-conscious)
 const REQUEST_TIMEOUT_MS = 15_000;
 
-interface BraveWebResult {
-  title?: string;
-  url?: string;
-  description?: string;
-}
-interface BraveResponse {
-  web?: { results?: BraveWebResult[] };
+interface SearchResult {
+  title: string;
+  url: string;
+  snippet: string;
 }
 
 /** Clamp the model-requested result count into a sane, token-bounded range. */
@@ -43,33 +41,77 @@ function clampResults(n: unknown): number {
   return Math.min(Math.max(v, 1), MAX_RESULTS);
 }
 
-/** Strip Brave's <strong> highlight markup that wraps matched terms in snippets. */
-function stripTags(s: string): string {
-  return s.replace(/<\/?[^>]+>/g, '');
+/** Decode HTML entities + strip tags from a snippet/title fragment. */
+function decodeText(s: string): string {
+  return s
+    .replace(/<\/?[^>]+>/g, '') // strip tags (DDG bolds matched terms with <b>)
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#x27;|&#39;/g, "'")
+    .replace(/&nbsp;/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
-/** Format a Brave payload into compact, numbered text the model reads back. */
-function format(data: BraveResponse): string {
-  const results = Array.isArray(data.web?.results) ? data.web!.results! : [];
-  if (results.length === 0) return '(no results)';
+/** Resolve a DDG result href to the real target URL. DDG wraps results in a redirect
+ *  (`//duckduckgo.com/l/?uddg=<encoded-real-url>&rut=...`); unwrap the `uddg` param. */
+function resolveUrl(href: string): string {
+  let h = decodeText(href);
+  if (h.startsWith('//')) h = `https:${h}`;
+  try {
+    const u = new URL(h);
+    const uddg = u.searchParams.get('uddg');
+    if (uddg) return uddg; // already decoded by URLSearchParams
+  } catch {
+    /* not a parseable URL — fall through */
+  }
+  return h;
+}
+
+/** Parse DDG's HTML results page into structured rows (regex, no DOM in Node). The
+ *  no-JS page lists each result as an `<a class="result__a" href=...>title</a>` and a
+ *  matching `<a class="result__snippet">snippet</a>`. Brittle by nature — best-effort. */
+function parse(html: string, limit: number): SearchResult[] {
+  const out: SearchResult[] = [];
+  const linkRe = /<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+  const snippetRe = /<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/g;
+  const snippets: string[] = [];
+  let sm: RegExpExecArray | null;
+  while ((sm = snippetRe.exec(html)) !== null) snippets.push(decodeText(sm[1]));
+  let lm: RegExpExecArray | null;
+  let i = 0;
+  while ((lm = linkRe.exec(html)) !== null && out.length < limit) {
+    const url = resolveUrl(lm[1]);
+    const title = decodeText(lm[2]) || '(untitled)';
+    if (!url || url.startsWith('https://duckduckgo.com/')) {
+      i++;
+      continue; // skip DDG's own ad/related links
+    }
+    out.push({ title, url, snippet: (snippets[i] ?? '').slice(0, SNIPPET_CHARS) });
+    i++;
+  }
+  return out;
+}
+
+/** Format rows into compact, numbered text the model reads back. */
+function format(rows: SearchResult[]): string {
+  if (rows.length === 0) return '(no results)';
   const lines: string[] = [];
-  results.forEach((r, i) => {
-    const title = stripTags((r.title ?? '').trim()) || '(untitled)';
-    const url = (r.url ?? '').trim();
-    const snippet = stripTags((r.description ?? '').trim()).slice(0, SNIPPET_CHARS);
-    lines.push(`${i + 1}. ${title}${url ? ` — ${url}` : ''}`);
-    if (snippet) lines.push(`   ${snippet}`);
+  rows.forEach((r, i) => {
+    lines.push(`${i + 1}. ${r.title}${r.url ? ` — ${r.url}` : ''}`);
+    if (r.snippet) lines.push(`   ${r.snippet}`);
   });
   return lines.join('\n');
 }
 
 /**
- * Run a web search via the Brave Search API and return compact text. Throws (with a
- * clear, secret-free message) when web search is disabled, no key is set, or the
- * provider errors. `cfg` is passed in so the caller reads config once per call (live
- * gate — the operator's enable/disable + key changes take effect immediately).
+ * Run a free, keyless web search via DuckDuckGo's HTML endpoint and return compact
+ * text. Throws (with a clear message) when web search is disabled or the request
+ * fails. `cfg` is passed in so the caller reads config once per call (live gate).
  */
-export async function searchWebBrave(
+export async function searchWebDuckDuckGo(
   query: string,
   opts: { maxResults?: number } | undefined,
   cfg: HarnessConfig
@@ -77,12 +119,8 @@ export async function searchWebBrave(
   if (cfg.webSearchEnabled !== true) {
     throw new Error('web search is disabled — enable it in Settings → web search');
   }
-  const key = getKeyFromConfig(cfg, WEB_SEARCH_KEY_ID);
-  if (!key) {
-    throw new Error('no web-search API key is set — add a Brave Search API key in Settings → web search');
-  }
-  const count = clampResults(opts?.maxResults);
-  const url = `${BRAVE_ENDPOINT}?q=${encodeURIComponent(query)}&count=${count}`;
+  const limit = clampResults(opts?.maxResults);
+  const url = `${DDG_ENDPOINT}?q=${encodeURIComponent(query)}`;
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
@@ -90,11 +128,7 @@ export async function searchWebBrave(
   try {
     resp = await fetch(url, {
       method: 'GET',
-      headers: {
-        Accept: 'application/json',
-        'Accept-Encoding': 'gzip',
-        'X-Subscription-Token': key
-      },
+      headers: { 'User-Agent': USER_AGENT, Accept: 'text/html' },
       signal: controller.signal
     });
   } catch (e) {
@@ -104,10 +138,9 @@ export async function searchWebBrave(
     clearTimeout(timer);
   }
   if (!resp.ok) {
-    // Don't echo the provider body (could be verbose / contain the echoed key).
-    const hint = resp.status === 401 || resp.status === 403 ? ' (check the Brave Search API key)' : '';
+    const hint = resp.status === 429 ? ' (DuckDuckGo is rate-limiting — try again shortly)' : '';
     throw new Error(`search provider returned HTTP ${resp.status}${hint}`);
   }
-  const data = (await resp.json()) as BraveResponse;
-  return format(data);
+  const html = await resp.text();
+  return format(parse(html, limit));
 }

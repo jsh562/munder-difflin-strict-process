@@ -57,11 +57,6 @@ const CAPABILITY_TAGS: ReadonlyArray<{ key: keyof CapabilityDescriptor; label: s
   { key: 'supportsCaching', label: 'caching' }
 ];
 
-/** Reserved credentials id for the web-search (Brave) key — mirrors the main-process
- *  `WEB_SEARCH_KEY_ID`. Its presence (+ the webSearchEnabled gate) decides whether the
- *  harness `web search` tool is actually live for native desks. */
-const WEB_SEARCH_KEY_ID = 'web-search';
-
 export function ProviderModelPicker({ selectedModelId, onChange, accent = 'sky' }: ProviderModelPickerProps) {
   // Read the registry once per render; it is frozen data (E002), so memoizing on
   // nothing is safe and keeps the grouped list stable across re-renders.
@@ -242,11 +237,11 @@ export function ProviderModelPicker({ selectedModelId, onChange, accent = 'sky' 
                         ([
                           {
                             label: 'web search',
-                            on: harnessCfg.webSearchEnabled === true && presence[WEB_SEARCH_KEY_ID] === true,
+                            on: harnessCfg.webSearchEnabled === true,
                             title:
-                              harnessCfg.webSearchEnabled === true && presence[WEB_SEARCH_KEY_ID] === true
-                                ? 'Harness tool (Brave Search) — available to this desk regardless of the provider'
-                                : 'Harness web-search tool — turn it on in Settings → Web search and add a Brave key'
+                              harnessCfg.webSearchEnabled === true
+                                ? 'Harness tool (DuckDuckGo, free) — available to this desk regardless of the provider'
+                                : 'Harness web-search tool — turn it on in Settings → Web search'
                           },
                           {
                             label: 'files · grep',

@@ -655,7 +655,7 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
 
               <div style={{ height: 2, background: 'var(--cth-ink-300)' }} />
 
-              {/* Web search (native desks) — Brave Search API */}
+              {/* Web search (native desks) — free, keyless via DuckDuckGo */}
               <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
@@ -663,9 +663,10 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
                       Web search (native desks)
                     </span>
                     <span style={{ fontSize: 12, lineHeight: '16px', color: 'var(--cth-ink-500)' }}>
-                      Lets DeepSeek/Minimax desks use the <code>web_search</code> tool via the Brave
-                      Search API. Results are read into the agent&rsquo;s context (they cost tokens), so
-                      it searches narrowly. Claude desks are unaffected.
+                      Lets DeepSeek/Minimax desks use the <code>web_search</code> tool. Free and
+                      keyless (via DuckDuckGo). Results are read into the agent&rsquo;s context (they
+                      cost tokens), so it searches narrowly. Best-effort — DuckDuckGo may occasionally
+                      rate-limit. Claude desks are unaffected.
                     </span>
                   </div>
                   <PixelButton
@@ -676,40 +677,6 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
                     {webSearchEnabled ? 'on' : 'off'}
                   </PixelButton>
                 </div>
-                <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}>
-                  <label style={{ display: 'flex', flexDirection: 'column', gap: 4, flex: 1 }}>
-                    <span style={slackLabelStyle}>
-                      Brave Search API key{keyPresence[WEB_SEARCH_KEY_ID] ? ' — key set' : ' — no key'}
-                    </span>
-                    <input
-                      type="password"
-                      value={keyDraft[WEB_SEARCH_KEY_ID] ?? ''}
-                      onChange={(e) => setKeyDraft((d) => ({ ...d, [WEB_SEARCH_KEY_ID]: e.target.value }))}
-                      placeholder={keyPresence[WEB_SEARCH_KEY_ID] ? '•••••• (enter to replace)' : 'Brave Search API key'}
-                      style={{ ...slackInputStyle, fontFamily: 'var(--cth-font-mono)' }}
-                    />
-                  </label>
-                  <PixelButton
-                    variant="primary"
-                    size="sm"
-                    onClick={() => saveKey(WEB_SEARCH_KEY_ID)}
-                    disabled={keyBusy === WEB_SEARCH_KEY_ID || !(keyDraft[WEB_SEARCH_KEY_ID] ?? '').trim()}
-                  >
-                    {keyBusy === WEB_SEARCH_KEY_ID ? '…' : 'save'}
-                  </PixelButton>
-                  <PixelButton
-                    variant="secondary"
-                    size="sm"
-                    onClick={() => removeKey(WEB_SEARCH_KEY_ID)}
-                    disabled={keyBusy === WEB_SEARCH_KEY_ID || !keyPresence[WEB_SEARCH_KEY_ID]}
-                  >
-                    clear
-                  </PixelButton>
-                </div>
-                <span style={{ fontSize: 12, lineHeight: '16px', color: 'var(--cth-ink-500)' }}>
-                  Get a free key at <code>brave.com/search/api</code> (the free tier covers personal use).
-                  The key is stored locally and never shown back or sent to git.
-                </span>
               </div>
 
               <div style={{ height: 2, background: 'var(--cth-ink-300)' }} />

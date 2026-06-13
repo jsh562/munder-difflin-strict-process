@@ -30,7 +30,7 @@ import { NativeRuntime } from './runtime/nativeRuntime';
 import { createNativeEventBridge, loadNativeEvents } from './runtime/nativeEventBridge';
 import { executeAgentTool, type AgentToolDeps } from '@jsh562/agent-core';
 import { redactConfig, injectionEnvForProvider, keyPresence, setKeyInConfig, clearKeyInConfig, WEB_SEARCH_KEY_ID, type SafeConfig } from './credentials';
-import { searchWebBrave } from './webSearch';
+import { searchWebDuckDuckGo } from './webSearch';
 import { listProviders } from '../shared/providerRegistry';
 import { deriveProviderId } from '../shared/assignment';
 import type { AgentInput } from '../shared/providerRuntime';
@@ -258,11 +258,11 @@ const agentToolDeps: AgentToolDeps = {
   appendMemory: (id, text) => hive.appendMemory(id, text),
   resolveCwd: (id) => hive.registry().agents[id]?.cwd ?? null,
   bashEnabled: () => readConfig().nativeBashEnabled === true,
-  // web_search routes through the host (provider + key + formatting); config is read
-  // live per call so the operator's enable/disable + key changes take effect at once.
-  // Throws a clear note when disabled/keyless — the executor turns that into a
+  // web_search routes through the host (provider + formatting). Free + keyless via
+  // DuckDuckGo; config is read live per call so the operator's enable/disable takes
+  // effect at once. Throws a clear note when disabled — the executor turns that into a
   // recoverable success:false tool-result.
-  searchWeb: (query, opts) => searchWebBrave(query, opts, readConfig())
+  searchWeb: (query, opts) => searchWebDuckDuckGo(query, opts, readConfig())
 };
 // E003 — native (non-Claude) agents run in isolated utilityProcess workers,
 // fronted by the ProviderRuntime port. The drain runs in MAIN (single-committer
