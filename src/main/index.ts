@@ -1344,6 +1344,15 @@ ipcMain.handle('native:send', (_evt, agentId: unknown, input: unknown): { ok: bo
   return { ok: true };
 });
 
+// ─── IPC: stop ONE native worker (operator kill, peer to `pty:kill`) ──────────
+// The renderer routes a stop by runtime kind: a native desk (incl. the god) → here;
+// a Claude desk → `pty:kill`. Killing fires the worker's exit teardown (archive), so a
+// stopped native worker is gone until respawned (revive-on-demand, or the god's Start).
+ipcMain.handle('native:kill', (_evt, agentId: unknown): { ok: boolean; error?: string } => {
+  if (typeof agentId !== 'string' || !agentId) return { ok: false, error: 'invalid agentId' };
+  return nativeRuntime.kill(agentId);
+});
+
 // ─── IPC: circuit-breaker state (Lane A #6 policy → this lane's avatars/meter) ─
 // Lane A's breaker calls this with a BreakerState; we fan it out to the renderer
 // on `control:breakerState`, where the avatar adapter gives it precedence over

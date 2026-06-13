@@ -132,6 +132,20 @@ export class NativeRuntime {
     return this.workers.size;
   }
 
+  /**
+   * Stop ONE native worker (the operator's per-agent kill seam, peer to `pty:kill`).
+   * `worker.kill()` fires the worker's `onExit`, which removes it from the map and runs
+   * the shared archive teardown (same path as a natural exit). Returns a structured ack
+   * so the IPC layer can report whether a live worker was actually stopped.
+   */
+  kill(agentId: string): { ok: boolean; error?: string } {
+    const worker = this.workers.get(agentId);
+    if (!worker) return { ok: false, error: 'no native runtime for agent' };
+    worker.kill();
+    this.workers.delete(agentId); // idempotent with onExit — don't wait on the exit event
+    return { ok: true };
+  }
+
   killAll(): void {
     for (const worker of this.workers.values()) worker.kill();
     this.workers.clear();

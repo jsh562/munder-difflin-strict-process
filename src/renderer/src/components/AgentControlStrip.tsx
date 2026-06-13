@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { PixelButton } from './PixelButton';
+import { pauseAgent } from '@/lib/agentControl';
 
 /** Operator control for one agent (#7C.1–7C.3) — pause (deny tools at the next
  *  boundary), graceful halt (clean stop), and mid-run steering (inject context
@@ -26,9 +27,14 @@ export function AgentControlStrip({ agentId }: { agentId: string }) {
   };
 
   const togglePause = async () => {
-    const s = snap?.paused ? await window.cth.controlResume(agentId) : await window.cth.controlPause(agentId, true);
+    const next = !snap?.paused;
+    // Route through the shared helper so it ALSO sets the renderer `paused` flag — the
+    // inbox-wake (#3) / queue-drain (#4) read that to leave a paused desk alone (a
+    // native desk's tools are denied in main, but it must also not be re-woken).
+    await pauseAgent(agentId, next);
+    const s = await window.cth.controlSnapshot(agentId);
     if (s) setSnap(s);
-    flash(snap?.paused ? 'resumed' : 'paused — tool calls will be denied');
+    flash(next ? 'paused — tool calls will be denied' : 'resumed');
   };
   const halt = async () => {
     const s = await window.cth.controlHalt(agentId);

@@ -532,6 +532,11 @@ const api = {
     input: { kind: 'operator' | 'steer'; text: string }
   ): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('native:send', agentId, input),
+  /** Stop ONE native worker (operator kill, peer to `killPty`). The renderer routes
+   *  a stop by runtime kind: native desk (incl. the god) → here; Claude desk → killPty.
+   *  A stopped native worker is archived + gone until respawned. */
+  nativeKill: (agentId: string): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('native:kill', agentId),
 
   // ─── Circuit breaker (Lane A #6 state → avatars/meter) ──────────────────────
   /** Subscribe to breaker-state changes; returns an unsubscribe fn. */

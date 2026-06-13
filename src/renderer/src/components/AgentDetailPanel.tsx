@@ -117,6 +117,14 @@ export function AgentDetailPanel({ agent }: AgentDetailPanelProps) {
   };
 
   const onKill = async () => {
+    // Native desk (no PTY): STOP = kill the worker but LEAVE the record listed — it's
+    // cold now and revives on the next message/delegation (revive-on-demand). Don't
+    // archive/remove it (that's the Claude tab-close semantics).
+    if (isNative) {
+      if (!confirm(`Stop ${agent.name}? Its worker is killed; it revives on the next message or delegation.`)) return;
+      await window.cth.nativeKill(agent.id);
+      return;
+    }
     if (!agent.ptyId) return;
     if (!confirm(`Close ${agent.name}? The PTY process will terminate and the agent is archived (kept in history, off the floor).`)) return;
     await window.cth.killPty(agent.ptyId);
@@ -176,9 +184,11 @@ export function AgentDetailPanel({ agent }: AgentDetailPanelProps) {
             {openTerminalState === 'opening' ? '...' : openTerminalState === 'ok' ? 'ok' : openTerminalState === 'error' ? 'err' : 'open'}
           </span>
         </PixelButton>
-        {isReal && (
+        {(isReal || isNative) && (
           <PixelButton variant="destructive" size="sm" onClick={onKill}>
-            <Icon name="x" />
+            <span title={isNative ? `Stop ${agent.name} (kill worker; revives on demand)` : `Close ${agent.name}`} style={{ display: 'inline-flex', alignItems: 'center' }}>
+              <Icon name="x" />
+            </span>
           </PixelButton>
         )}
       </div>
@@ -192,8 +202,10 @@ export function AgentDetailPanel({ agent }: AgentDetailPanelProps) {
         }}>{openTerminalError}</div>
       )}
 
-      {/* #7C — operator control (pause / halt / steer) for live agents */}
-      {isReal && <AgentControlStrip agentId={agent.id} />}
+      {/* #7C — operator control (pause / halt / steer). Shown for a live Claude PTY AND
+          for a native desk (its tools are denied in main + the renderer leaves it
+          alone while paused). */}
+      {(isReal || isNative) && <AgentControlStrip agentId={agent.id} />}
 
       {/* Tabs */}
       <SidebarTabs current={sidebarTab} accent={agent.accent} onChange={setSidebarTab} />

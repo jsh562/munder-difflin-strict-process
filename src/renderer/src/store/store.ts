@@ -113,7 +113,12 @@ export type SidebarTab = 'terminal' | 'structured' | 'files' | 'messages' | 'tra
  *  'booting' until his PTY is confirmed live, then 'ready' (or 'failed' if the
  *  spawn errored). The empty-floor UI shows a loader while 'booting' so users
  *  don't see the "add agent" prompt before Michael has clocked in. */
-export type GodStatus = 'booting' | 'ready' | 'failed';
+export type GodStatus = 'booting' | 'ready' | 'failed' | 'stopped';
+
+/** Operator intent for the god worker: 'running' = auto-spawn + keep alive (default);
+ *  'stopped' = killed by the operator and kept down until Start. Persisted so a Stop
+ *  survives a reload (otherwise effect #1 would respawn Michael on the next mount). */
+export type GodDesired = 'running' | 'stopped';
 
 interface State {
   agents: Agent[];
@@ -153,6 +158,15 @@ interface State {
   toolCounts: Record<string, number>;
   bumpToolCount: (id: string) => void;
   setGodStatus: (status: GodStatus) => void;
+  /** Operator intent for the god (persisted): a Stop sets 'stopped' so useHive's boot
+   *  effect leaves Michael down across reloads until Start sets 'running'. */
+  godDesired: GodDesired;
+  setGodDesired: (d: GodDesired) => void;
+  /** Per-agent operator PAUSE flag (renderer mirror of main's control.pause). When on,
+   *  the agent's tool calls are denied in main AND the renderer's inbox-wake (#3) and
+   *  queue-drain (#4) leave it alone, so a paused agent truly idles. */
+  paused: Record<string, boolean>;
+  setPaused: (id: string, on: boolean) => void;
   select: (id: string) => void;
   updateAgent: (id: string, patch: Partial<Agent>) => void;
   /** E005 {FR-003} — re-assign an existing desk to an explicit model (DR-1 state
@@ -210,6 +224,7 @@ const LS_RESTORABLE = 'cth.restorableAgents';
 const LS_SELECTED = 'cth.selectedId';
 const LS_QUEUES = 'cth.messageQueues';
 const LS_ENRICH = 'cth.enrichEnabled';
+const LS_GOD_DESIRED = 'cth.godDesired';
 
 // Fields that are large or transient — not worth persisting across reloads.
 // contextTokens/contextLimit describe a LIVE session; persisting them showed a
@@ -366,6 +381,9 @@ const initialQueues = loadPersistedQueues();
 const initialEnrichEnabled: boolean = (() => {
   try { return window.localStorage.getItem(LS_ENRICH) === '1'; } catch { return false; }
 })();
+const initialGodDesired: GodDesired = (() => {
+  try { return window.localStorage.getItem(LS_GOD_DESIRED) === 'stopped' ? 'stopped' : 'running'; } catch { return 'running'; }
+})();
 
 let queuedSeq = 0;
 /** Process-unique id for a queued message (timestamp + counter avoids collisions
@@ -398,6 +416,13 @@ export const useStore = create<State>((set) => ({
   bumpToolCount: (id) =>
     set((s) => ({ toolCounts: { ...s.toolCounts, [id]: (s.toolCounts[id] ?? 0) + 1 } })),
   setGodStatus: (status) => set({ godStatus: status }),
+  godDesired: initialGodDesired,
+  setGodDesired: (d) => {
+    try { window.localStorage.setItem(LS_GOD_DESIRED, d); } catch { /* noop */ }
+    set({ godDesired: d });
+  },
+  paused: {},
+  setPaused: (id, on) => set((s) => ({ paused: { ...s.paused, [id]: on } })),
   select: (id) => set((s) => { persistAgents(s.agents, id); return { selectedId: id }; }),
   // E005 INVARIANT (DR-4/DR-9/SC-004) — an agent's `model`/`assignmentSource` are a
   // creation-time SNAPSHOT of the fleet default (or an explicit pick), frozen onto

@@ -165,6 +165,10 @@ export function useHive(config: HarnessConfig | null): void {
   const bootGraceUntil = useRef<Record<string, number>>({});
   // Reactive so the assistant bootstrap (effect #1b) re-runs once Michael is ready.
   const godStatus = useStore((s) => s.godStatus);
+  // Operator intent for the god (persisted). When 'stopped', the boot effect leaves
+  // Michael down (and the inbox-wake won't revive him); flipping it back to 'running'
+  // (the Start button) re-runs the boot effect and respawns him.
+  const godDesired = useStore((s) => s.godDesired);
   // #5C/#7C.4 — latest circuit-breaker level per agent. When 'constrained'/
   // 'stopped' the avatar is pinned to 'looping' and hook events must NOT flip it
   // back to 'working' (the flicker the spec calls out); only a genuine Stop clears it.
@@ -173,6 +177,10 @@ export function useHive(config: HarnessConfig | null): void {
   // 1) Bootstrap the god agent (source of truth = live PTYs, to dodge restarts).
   useEffect(() => {
     if (!config?.onboardingComplete || !config.harnessHome) return;
+    // Operator stopped Michael — keep him down (don't spawn, don't show the boot
+    // loader). The Start button flips godDesired to 'running', which re-runs this
+    // effect (godDesired is a dep) and respawns him.
+    if (godDesired === 'stopped') { useStore.getState().setGodStatus('stopped'); return; }
     let cancelled = false;
     const timers: ReturnType<typeof setTimeout>[] = [];
     useStore.getState().setGodStatus('booting');
@@ -241,6 +249,9 @@ export function useHive(config: HarnessConfig | null): void {
       }
       useStore.getState().addAgent(god);
       useStore.getState().setGodStatus('ready');
+      // Allow a later deliberate re-run (the Start button after a Stop) to spawn again;
+      // within one mount the listPtys / "worker exists" checks above still dedupe.
+      godSpawning.current = false;
 
       // Fresh spawn → kick Michael off once his runtime is up. For a CLAUDE god: enable
       // remote control (best-effort) then hand him the orientation prompt over the PTY,
@@ -263,7 +274,7 @@ export function useHive(config: HarnessConfig | null): void {
       }, GOD_BOOT_MS));
     }, 1200);
     return () => { cancelled = true; clearTimeout(t); timers.forEach(clearTimeout); };
-  }, [config?.onboardingComplete, config?.harnessHome]);
+  }, [config?.onboardingComplete, config?.harnessHome, godDesired]);
 
   // 1b) Bootstrap Michael's prep assistant ("Dwight") — only after Michael is
   //     ready, and only once. Same live-PTY idempotency + spawn-guard as #1.
@@ -461,9 +472,13 @@ export function useHive(config: HarnessConfig | null): void {
 
     const iv = setInterval(async () => {
       const now = Date.now();
-      const fleetDefault = useStore.getState().fleetDefaultModel;
+      const { fleetDefaultModel: fleetDefault, paused, godDesired: desired } = useStore.getState();
       const agents = useStore.getState().agents.filter((a) => {
         if (a.isAssistant) return false;
+        // Operator paused this desk, or stopped the god — leave it alone (and never let
+        // the native respawn-on-no-runtime resurrect a deliberately stopped god).
+        if (paused[a.id]) return false;
+        if (a.id === GOD_ID && desired === 'stopped') return false;
         // Don't disturb an agent still running its boot sequence (the nudge would
         // collide with /remote-control + the orientation prompt on a Claude god).
         if ((bootGraceUntil.current[a.id] ?? 0) >= now) return false;
@@ -518,9 +533,10 @@ export function useHive(config: HarnessConfig | null): void {
     // gated on the target being idle + off cooldown. Keyed cooldown per target so
     // strict one-by-one delivery holds. Returns true if it dispatched.
     const dispatch = (srcId: string, target: Agent | undefined, wrap?: (t: string) => string): boolean => {
-      const { messageQueues, removeQueuedMessage } = useStore.getState();
+      const { messageQueues, removeQueuedMessage, paused } = useStore.getState();
       const next = messageQueues[srcId]?.[0];
       if (!next || !target?.ptyId || target.status !== 'idle') return false;
+      if (paused[target.id]) return false; // operator paused — hold the queue
       const now = Date.now();
       // Hold queued messages until the target finishes its boot sequence.
       if ((bootGraceUntil.current[target.id] ?? 0) >= now) return false;

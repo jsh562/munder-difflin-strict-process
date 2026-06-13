@@ -7,6 +7,7 @@ import { PtyTerminalView } from './PtyTerminalView';
 import { NativeTranscriptView } from './NativeTranscriptView';
 import { MessageQueueComposer } from './MessageQueueComposer';
 import { isNativeRuntimeDesk } from '@/lib/runtimeKind';
+import { stopAgent, startGod, pauseAgent } from '@/lib/agentControl';
 import { TasksKanban } from './TasksKanban';
 import { disposeTerminal } from './terminalPool';
 import { Icon } from './Icon';
@@ -103,6 +104,10 @@ export function CommandCenterPanel({ agent }: { agent: Agent }) {
   // via the fleet-default fallback (a god's record may carry no explicit model).
   const fleetDefaultModel = useStore((s) => s.fleetDefaultModel);
   const isNative = isNativeRuntimeDesk(agent, fleetDefaultModel);
+  // Operator Stop/Pause/Start for Michael (Part 2). `godDesired === 'stopped'` means a
+  // Stop is in effect (worker killed, kept down across reloads); Start brings him back.
+  const godDesired = useStore((s) => s.godDesired);
+  const paused = useStore((s) => !!s.paused[agent.id]);
 
   return (
     <PixelPanel
@@ -128,9 +133,32 @@ export function CommandCenterPanel({ agent }: { agent: Agent }) {
             fontFamily: 'var(--cth-font-display)', fontSize: 10, lineHeight: '14px', color: 'var(--cth-ink-900)'
           }}>MICHAEL · COMMAND CENTER</div>
           <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginTop: 1 }}>
-            <PixelBadge status={agent.status} />
-            <span style={{ fontSize: 12, color: 'var(--cth-ink-500)' }}>runs the floor</span>
+            <PixelBadge status={godDesired === 'stopped' ? 'idle' : agent.status} />
+            <span style={{ fontSize: 12, color: 'var(--cth-ink-500)' }}>
+              {godDesired === 'stopped' ? 'stopped' : paused ? 'paused' : 'runs the floor'}
+            </span>
           </div>
+        </div>
+        {/* Operator controls — Stop/Pause while running, Start once stopped. */}
+        <div style={{ display: 'flex', gap: 4, flexShrink: 0 }}>
+          {godDesired === 'stopped' ? (
+            <CtlButton onClick={() => startGod()} title="Start Michael (respawn his worker)" tone="go">
+              <Icon name="play" /> start
+            </CtlButton>
+          ) : (
+            <>
+              <CtlButton
+                onClick={() => void pauseAgent(agent.id, !paused)}
+                title={paused ? 'Resume Michael' : 'Pause Michael (deny tools, stop waking him)'}
+                tone={paused ? 'go' : 'idle'}
+              >
+                <Icon name={paused ? 'play' : 'pause'} /> {paused ? 'resume' : 'pause'}
+              </CtlButton>
+              <CtlButton onClick={() => void stopAgent(agent, isNative)} title="Stop Michael (kill his worker)" tone="stop">
+                <Icon name="x" /> stop
+              </CtlButton>
+            </>
+          )}
         </div>
       </div>
 
@@ -1248,6 +1276,27 @@ function Centered({ children }: { children: React.ReactNode }) {
 
 function Muted({ children }: { children: React.ReactNode }) {
   return <div style={{ fontSize: 12, color: 'var(--cth-ink-500)' }}>{children}</div>;
+}
+
+/** Compact header control button (Stop / Pause / Start). `tone` colours the chip:
+ *  stop=coral, go=mint (start/resume), idle=cream (pause). */
+function CtlButton({
+  onClick, title, tone, children
+}: { onClick: () => void; title: string; tone: 'stop' | 'go' | 'idle'; children: React.ReactNode }) {
+  const bg = tone === 'stop' ? 'var(--cth-coral-light)' : tone === 'go' ? 'var(--cth-mint-light)' : 'var(--cth-cream-200)';
+  const edge = tone === 'stop' ? 'var(--cth-coral)' : tone === 'go' ? 'var(--cth-ink-900)' : 'var(--cth-ink-700)';
+  return (
+    <button
+      onClick={onClick}
+      title={title}
+      style={{
+        display: 'inline-flex', alignItems: 'center', gap: 4,
+        padding: '3px 8px 2px', border: 'none', cursor: 'pointer',
+        background: bg, boxShadow: `inset 0 0 0 1px ${edge}`,
+        fontFamily: 'var(--cth-font-ui)', fontSize: 12, color: 'var(--cth-ink-900)'
+      }}
+    >{children}</button>
+  );
 }
 
 function Pre({ children }: { children: React.ReactNode }) {
