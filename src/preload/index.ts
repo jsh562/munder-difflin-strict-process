@@ -8,6 +8,8 @@ export interface HiveAgentMeta {
   name: string;
   role?: string;
   capabilities?: string[];
+  /** Capability roles (worker / integrator). Optional at spawn — defaulted host-side. */
+  roles?: ('worker' | 'integrator')[];
   cwd: string;
   isGod?: boolean;
   isAssistant?: boolean;
@@ -634,6 +636,10 @@ const api = {
    *  archives it automatically via pty:kill; this is the explicit primitive. */
   hiveSetArchived: (id: string, archived: boolean): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('hive:setArchived', id, archived),
+  /** Set an agent's capability roles (worker / integrator). Durable in the registry; the
+   *  integration gate applies immediately, the role's prompt on the agent's next respawn. */
+  hiveSetRoles: (id: string, roles: ('worker' | 'integrator')[]): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('hive:setRoles', id, roles),
 
   // ─── Slack integration (Slack message → Michael's queue) ─────────────────────
   /** Register a listener for inbound Slack messages; returns an unsubscribe fn.

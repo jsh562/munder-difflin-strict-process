@@ -63,7 +63,8 @@ function fakeHive(): HiveToolDeps & { sent: { to: string; from: string }[]; task
     tasks: () => ledger,
     writeTasks: (t) => { ledger = { tasks: t }; },
     roster: () => [],
-    isGod: () => false
+    isGod: () => false,
+    canIntegrate: () => false
   };
 }
 

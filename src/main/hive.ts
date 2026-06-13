@@ -30,17 +30,21 @@ import { COMMAND_GROUPS } from '../shared/claudeCommands';
 // The mailbox + task-ledger vocabulary is owned by @jsh562/agent-core (so the extracted
 // coding toolkit is host-agnostic); re-exported below so existing `import { HiveMessage }
 // from '../hive'` consumers across the app are unchanged.
-import type { MessageAct, HiveMessage, HiveTask } from '@jsh562/agent-core';
+import type { MessageAct, HiveMessage, HiveTask, AgentRole } from '@jsh562/agent-core';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
-export type { MessageAct, HiveMessage, HiveTask };
+export type { MessageAct, HiveMessage, HiveTask, AgentRole };
 
 export interface AgentMeta {
   id: string;
   name: string;
   role?: string;
   capabilities?: string[];
+  /** Capability roles (worker / integrator). Drives the integration gate + delegation.
+   *  Separate from the god/assistant identity flags. Defaulted in `ensureAgent` when
+   *  unset (god → ['integrator'], normal desk → ['worker'], assistant → []). */
+  roles?: AgentRole[];
   cwd: string;
   isGod?: boolean;
   /** Michael's prep assistant — enriches prompts and forwards them to Michael.
@@ -241,10 +245,15 @@ export class HiveManager {
 
     // upsert registry
     const reg = this.registry();
+    const prev = reg.agents[meta.id];
+    // Capability roles: an explicit spawn value wins; else PRESERVE what's in the registry
+    // (so a role the operator set survives a respawn); else default by identity.
+    const defaultRoles: AgentRole[] = meta.isGod ? ['integrator'] : meta.isAssistant ? [] : ['worker'];
     reg.agents[meta.id] = {
       ...meta,
       capabilities: meta.capabilities ?? [],
       role: meta.role ?? (meta.isGod ? 'orchestrator' : 'agent'),
+      roles: meta.roles ?? prev?.roles ?? defaultRoles,
       status: 'idle',
       // A (re)spawn always means a live terminal — clear any prior archived flag.
       archived: false,
@@ -314,6 +323,26 @@ export class HiveManager {
       this.appendLog({ kind: 'archive', agentId: id, archived });
       this.commit(`hive: ${archived ? 'archive' : 'unarchive'} ${id}`);
     } catch { /* best-effort — never crash a lifecycle handler */ }
+  }
+
+  /**
+   * Set an agent's capability roles (worker / integrator). Durable in the registry, so
+   * the integration gate (read live per tool call) takes effect immediately; the agent's
+   * role-specific PROMPT only changes on its next (re)spawn. No-op if unregistered.
+   */
+  setRoles(id: string, roles: AgentRole[]): void {
+    const root = this.root();
+    if (!root) return;
+    try {
+      const reg = this.registry();
+      const agent = reg.agents[id];
+      if (!agent) return;
+      agent.roles = roles;
+      agent.lastSeen = Date.now();
+      this.writeJson(join(root, 'registry.json'), reg);
+      this.appendLog({ kind: 'roles', agentId: id, roles });
+      this.commit(`hive: roles ${id} = [${roles.join(', ')}]`);
+    } catch { /* best-effort */ }
   }
 
   /**
@@ -442,7 +471,10 @@ export class HiveManager {
         + ` MONITOR the floor by reading ${root}/fleet.json (live per-agent tokens, cost, status, last tool, breaker level, inbox backlog) and ${root}/registry.json — note that running 'claude agents' will NOT list your hive's sibling agents. A full Claude Code command reference is at ${root}/COMMANDS.md (slash commands act ONLY on your own session; CLI commands run in your shell and can target the fleet). You periodically receive scheduler / "Heartbeat" standup requests — on each, review every agent via fleet.json, re-engage anyone stalled, over-budget, or breaker-armed, and keep board.md and tasks.json accurate. Steward the token budget.`
       : meta.isAssistant
       ? 'You are Michael\'s PREP ASSISTANT. You will be handed short, possibly vague instructions (each begins with "ENRICH TASK:"). For each one: (1) figure out which project it concerns and cd into the most relevant repo — you start in Michael\'s home directory; (2) gather concrete context READ-ONLY (exact file paths, current state, relevant code, conventions, active branch, gotchas) — NEVER modify, create, or delete files; (3) rewrite the instruction into ONE clear, self-contained prompt that Michael can execute autonomously, preserving the user\'s original intent without inventing scope. Then deliver it: write ONE message JSON into your outbox with "to":"god", "act":"request", a short subject, and the finished prompt as the body. Do NOT perform the task yourself — your only output is the improved prompt sent to Michael.'
-      : 'For anything ambiguous, cross-cutting, or needing sign-off, address a message to "god".';
+      : 'For anything ambiguous, cross-cutting, or needing sign-off, address a message to "god".'
+        + ((meta.roles ?? []).includes('integrator')
+          ? ' You also hold the INTEGRATOR role: when a teammate marks a task "review", review their agent/<id> branch and merge it into the repo base (via git in your shell), then mark the card done; route conflicts back to the author.'
+          : '');
     const guardrailsLine = 'Guardrails: a circuit breaker watches the floor — a "Circuit breaker: steer/constrain" message means you are looping or overspending, so STOP repeating, summarize what you tried, and follow it. Be token-frugal (a floor-wide or per-agent token budget can pause you). The shared plan has two parts: board.md (freeform; god is the sole scribe) and tasks.json (structured kanban — todo/doing/blocked/done).';
     return [
       `You are "${meta.name}" (${meta.id}), an autonomous agent in a collaborating hive of Claude agents.`,

@@ -13,7 +13,7 @@ import {
   addWorktree, removeWorktree, listWorktrees, type GitWorktree,
   previewMerge, mergeBranch, agentBranchFor
 } from './git';
-import { HiveManager, type AgentMeta, type HiveMessage, type HiveTask } from './hive';
+import { HiveManager, type AgentMeta, type HiveMessage, type HiveTask, type AgentRole } from './hive';
 import { HookServer } from './hooks';
 import { CircuitBreaker, type BreakerInput } from './breaker';
 import type { UsageProvider } from './usage';
@@ -275,6 +275,7 @@ const agentToolDeps: AgentToolDeps = {
         archived: a.archived === true,
         isGod: a.isGod === true,
         isAssistant: a.isAssistant === true,
+        roles: a.roles ?? [],
         running:
           nativeRuntime.runtimeFor(a.id) !== undefined ||
           [...ptyToAgent.entries()].some(([ptyId, aid]) => aid === a.id && livePtys.has(ptyId)),
@@ -287,6 +288,9 @@ const agentToolDeps: AgentToolDeps = {
     const reg = hive.registry();
     return reg.agents[id]?.isGod === true || reg.godId === id;
   },
+  // Holds the `integrator` role? Gates hive_integrate + task sign-off. Read live from the
+  // registry so toggling a role takes effect immediately (no respawn needed for the gate).
+  canIntegrate: (id) => (hive.registry().agents[id]?.roles ?? []).includes('integrator'),
   // The god's integration seam (hive_integrate): review/merge a worker's branch into its
   // repo. Scoped to REGISTERED repos (+ live worktree origins) for safety; git runs in
   // main (single-committer). apply:false previews, true merges (conflicts abort + report).
@@ -329,17 +333,33 @@ const agentToolDeps: AgentToolDeps = {
 // non-Claude provider). The Claude god gets its role via `--append-system-prompt`
 // (hive.injectedPrompt); a native god has no CLI, so it orchestrates purely through the
 // hive TOOLS — this prompt is written for those (no fleet.json CLI / slash commands).
-const NATIVE_GOD_PROMPT = [
-  'You are the GOD / ORCHESTRATOR of this hive of agents (you are "Michael"). Your job is to ORCHESTRATE, not implement: keep awareness of the whole team and delegate the work.',
-  '- KNOW THE TEAM: before delegating, call hive_list_agents to see who exists, who is running, and their roles — assign to the best AVAILABLE desk, never blind.',
-  '- DELEGATE: decompose a request into slices; for each, hive_add_task (a card assigned to a desk) and hive_send_message that desk a short 4-part brief (objective / output / tools+references / boundaries+done). Different slices can go to different desks in parallel. Do NOT do the grunt implementation yourself.',
-  '- RUN THE BOARD (it is the live source of truth): at the start of a turn reconcile it — hive_list_tasks, then hive_update_task to fix anything stale. You OWN sign-off: when a worker moves its card to "review", verify the deliverable and hive_update_task it to "done" (or reopen to "doing"). Only you set "done"/reassign/reprioritize.',
-  '- INTEGRATE finished work: each worker commits its slice on its own worktree branch (hive_list_agents shows each desk\'s repo + branch). On a card in "review", use hive_integrate (no apply) to review the commits/diff, then hive_integrate apply:true to merge it into the repo\'s base — then mark the card "done". A reported conflict means send it back to the author. You never hand-edit project files; integration is your high-leverage job.',
-  '- YOU CANNOT TOUCH PROJECT FILES: your working directory is your own scratch workspace, NOT any project repo — your tools are sandboxed to it, so you literally cannot read or edit project code. Each project lives in a worker desk\'s own repo, so ALL implementation MUST be delegated; trying to do it yourself will just fail.',
-  '- IF NO WORKER DESKS ARE ALIVE to take the work, do NOT attempt it yourself — tell the operator exactly which team/desks to spawn, then orchestrate once they are up.',
-  '- COORDINATE: answer agents\' questions so the team runs autonomously; read a peer\'s memory with hive_read_memory when you need context; record durable decisions with write_memory.',
-  '- OWN only the high-leverage calls: task decomposition, dispatch, sign-offs, conflict resolution, integration. Keep everyone unblocked.',
-  'The human operator is watching this transcript and can message you directly — surface anything genuinely critical to them.'
+// The native god's orchestrator prompt. Integration guidance is CONDITIONAL on the god
+// holding the `integrator` role (it does by default, but the operator can reassign it to a
+// dedicated integrator desk): with the role the god reviews+merges+signs-off; without it,
+// the god delegates integration to whichever desk holds the role.
+function nativeGodPrompt(godIntegrates: boolean): string {
+  return [
+    'You are the GOD / ORCHESTRATOR of this hive of agents (you are "Michael"). Your job is to ORCHESTRATE, not implement: keep awareness of the whole team and delegate the work.',
+    '- KNOW THE TEAM: before delegating, call hive_list_agents to see who exists, who is running, and each desk\'s roles — assign to the best AVAILABLE desk, never blind.',
+    '- DELEGATE: decompose a request into slices; for each, hive_add_task (a card assigned to a worker desk) and hive_send_message that desk a short 4-part brief (objective / output / tools+references / boundaries+done). Different slices can go to different desks in parallel. Do NOT do the grunt implementation yourself.',
+    godIntegrates
+      ? '- RUN THE BOARD (live source of truth): at turn start reconcile it — hive_list_tasks, fix stale cards with hive_update_task. You OWN sign-off: when a worker moves its card to "review", verify it and hive_update_task it to "done" (or reopen to "doing"). You set done/reassign/reprioritize.'
+      : '- RUN THE BOARD (live source of truth): at turn start reconcile it — hive_list_tasks, fix stale cards with hive_update_task. You assign + reprioritize; the desk holding the INTEGRATOR role verifies "review" cards and signs them off to "done" — keep it fed and unblocked.',
+    godIntegrates
+      ? '- INTEGRATE finished work: each worker commits its slice on its own worktree branch (hive_list_agents shows each desk\'s repo + branch). On a "review" card, hive_integrate (no apply) to review the commits/diff, then hive_integrate apply:true to merge into the repo\'s base — then mark the card "done". A reported conflict means send it back to the author. You never hand-edit project files; integration is your high-leverage job.'
+      : '- DELEGATE INTEGRATION: you do NOT hold the integrator role — when a card reaches "review", route it (hive_send_message) to the desk that has the integrator role (see hive_list_agents) to merge + sign off. You never merge or hand-edit yourself.',
+    '- YOU CANNOT TOUCH PROJECT FILES: your working directory is your own scratch workspace, NOT any project repo — your tools are sandboxed to it, so you literally cannot read or edit project code. Each project lives in a worker desk\'s own repo, so ALL implementation MUST be delegated; trying to do it yourself will just fail.',
+    '- IF NO WORKER DESKS ARE ALIVE to take the work, do NOT attempt it yourself — tell the operator exactly which team/desks to spawn, then orchestrate once they are up.',
+    '- COORDINATE: answer agents\' questions so the team runs autonomously; read a peer\'s memory with hive_read_memory when you need context; record durable decisions with write_memory.',
+    'The human operator is watching this transcript and can message you directly — surface anything genuinely critical to them.'
+  ].join('\n');
+}
+
+// Injected into a NON-god desk that holds the `integrator` role (a dedicated integrator).
+const NATIVE_AGENT_INTEGRATOR_PROMPT = [
+  'You also hold the INTEGRATOR role: you review + merge other desks\' finished work (you do not re-implement it).',
+  '- hive_list_agents shows each desk\'s repo + worktree branch. When a task card is in "review", use hive_integrate (no apply) to review the commits + diff, then hive_integrate apply:true to merge that branch into the repo\'s base branch, then hive_update_task it to "done".',
+  '- A reported merge conflict aborts cleanly — send the card back to its author (hive_send_message) to rebase/resolve; never force it.'
 ].join('\n');
 
 // E003 — native (non-Claude) agents run in isolated utilityProcess workers,
@@ -364,13 +384,17 @@ const nativeRuntime = new NativeRuntime({
   onWorkerExit: (id) => { archiveAgent(id); syncKeepAwake(); },
   usageFor: (id) => usageProvider.getAgentUsage(id),
   credentialEnvFor: (providerId) => injectionEnvForProvider(readConfig(), providerId),
-  // Per-desk native preamble additions: the shell/OS note for every desk, plus the
-  // orchestrator ROLE for a native god (so Michael actually runs the floor on DeepSeek
-  // instead of behaving like a generic worker). The worker prepends these to its system
-  // prompt. `isGod` comes from the hive registry (set at ensureAgent).
+  // Per-desk native preamble additions (the worker prepends these to its system prompt):
+  // the shell/OS note for every desk; the orchestrator ROLE for a native god (with its
+  // integration guidance conditional on the god holding the `integrator` role); and the
+  // INTEGRATOR preamble for a dedicated (non-god) integrator desk. Identity + roles come
+  // from the hive registry (set at ensureAgent / setRoles).
   workerEnv: (id) => {
     const env: Record<string, string> = { NATIVE_AGENT_ENV_NOTE: describeBashEnv() };
-    if (hive.registry().agents[id]?.isGod) env.NATIVE_AGENT_GOD_PROMPT = NATIVE_GOD_PROMPT;
+    const agent = hive.registry().agents[id];
+    const roles = agent?.roles ?? [];
+    if (agent?.isGod) env.NATIVE_AGENT_GOD_PROMPT = nativeGodPrompt(roles.includes('integrator'));
+    else if (roles.includes('integrator')) env.NATIVE_AGENT_INTEGRATOR_PROMPT = NATIVE_AGENT_INTEGRATOR_PROMPT;
     return env;
   },
   // E007 T011/T017 {FR-008/011} — forward each native worker's usage + tool spans
@@ -1256,6 +1280,15 @@ ipcMain.handle('hive:setArchived', (_evt, id: unknown, archived: unknown) => {
   if (typeof id !== 'string') return { ok: false, error: 'invalid id' };
   if (!hive.enabled()) return { ok: false, error: 'hive disabled (no harnessHome)' };
   hive.setArchived(id, archived === true);
+  return { ok: true };
+});
+ipcMain.handle('hive:setRoles', (_evt, id: unknown, roles: unknown) => {
+  if (typeof id !== 'string') return { ok: false, error: 'invalid id' };
+  if (!hive.enabled()) return { ok: false, error: 'hive disabled (no harnessHome)' };
+  const valid = Array.isArray(roles)
+    ? roles.filter((r): r is AgentRole => r === 'worker' || r === 'integrator')
+    : [];
+  hive.setRoles(id, valid);
   return { ok: true };
 });
 

@@ -30,6 +30,11 @@ export interface BlockReason {
   }>;
 }
 
+/** Capability roles (mirror of the agent-core `AgentRole`; declared locally so the store
+ *  doesn't reach into the package). worker = does implementation; integrator = reviews +
+ *  merges (hive_integrate) + signs tasks off. */
+export type AgentRole = 'worker' | 'integrator';
+
 export interface Agent {
   id: string;
   name: string;
@@ -71,6 +76,11 @@ export interface Agent {
   /** the last prompt the user submitted to this agent in Claude Code —
    *  shown on the floor as a card above the seated avatar */
   lastPrompt?: string;
+  /** Capability roles layered on the agent (separate from the god/assistant identity):
+   *  `worker` = eligible for delegated implementation; `integrator` = may review+merge
+   *  (hive_integrate) + sign tasks off. The god holds `integrator` by default; it's
+   *  reassignable to a dedicated desk. Persisted; the registry is the source of truth. */
+  roles?: AgentRole[];
   /** the orchestrator ("god") agent — seated in Michael's room, runs the floor */
   isGod?: boolean;
   /** Michael's prep assistant ("Dwight") — enriches prompts and forwards them to
@@ -183,6 +193,9 @@ interface State {
    *  config `defaultModel`); `undefined` clears the desk back to the role-based
    *  fallback (no `model`, no `assignmentSource`). No-op for an unknown id. */
   revertAgentToFleetDefault: (id: string, fleetDefaultModelId: string | undefined) => void;
+  /** Set an agent's capability roles (worker / integrator) and PERSIST. Pair with the
+   *  `hiveSetRoles` IPC so the registry (the gate's source of truth) matches. */
+  setAgentRoles: (id: string, roles: AgentRole[]) => void;
   pushFeed: (id: string, line: string) => void;
   addAgent: (agent: Agent) => void;
   removeAgent: (id: string) => void;
@@ -463,6 +476,13 @@ export const useStore = create<State>((set) => ({
             : { ...a, model: undefined, assignmentSource: undefined }
           : a
       );
+      persistAgents(agents, s.selectedId);
+      return { agents };
+    }),
+  setAgentRoles: (id, roles) =>
+    set((s) => {
+      if (!s.agents.some((a) => a.id === id)) return s;
+      const agents = s.agents.map((a) => (a.id === id ? { ...a, roles } : a));
       persistAgents(agents, s.selectedId);
       return { agents };
     }),

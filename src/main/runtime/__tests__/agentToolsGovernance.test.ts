@@ -27,6 +27,7 @@ function makeFixture(cwd: string, over: Partial<AgentToolDeps> = {}): { deps: Ag
     writeTasks: (t) => { ledger = { tasks: t }; },
     roster: () => [],
     isGod: () => false,
+    canIntegrate: () => false,
     appendMemory: (id, text) => mem.set(id, (mem.get(id) ?? '') + '\n' + text),
     resolveCwd: () => cwd,
     bashEnabled: () => false,

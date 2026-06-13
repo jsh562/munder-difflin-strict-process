@@ -4,7 +4,7 @@ import { PixelButton } from './PixelButton';
 import { SpritePortrait } from './SpritePortrait';
 import { Icon } from './Icon';
 import { ProviderModelPicker } from './ProviderModelPicker';
-import { useStore, type Agent } from '@/store/store';
+import { useStore, type Agent, type AgentRole } from '@/store/store';
 import { OFFICE_CAST, DEFAULT_CHARACTER, type OfficeCharacterName } from '@/scene/office/cast';
 import { type AccentColorName } from '@/design/tokens';
 import { type HarnessConfig, buildSpawnCommand } from '@/store/config';
@@ -72,6 +72,10 @@ export function AddAgentModal({ onClose, config }: AddAgentModalProps) {
   };
   const [goal, setGoal] = useState('');
   const [isolate, setIsolate] = useState(false);
+  // Capability roles. Worker (does implementation) on by default; Integrator (reviews +
+  // merges others' branches) off — tick it to make a dedicated integration desk.
+  const [roleWorker, setRoleWorker] = useState(true);
+  const [roleIntegrator, setRoleIntegrator] = useState(false);
   const [error, setError] = useState<string | undefined>();
   const [busy, setBusy] = useState(false);
 
@@ -91,6 +95,7 @@ export function AddAgentModal({ onClose, config }: AddAgentModalProps) {
     setBusy(true);
     const id = uniqueId(name);
     const ptyId = `pty-${id}`;
+    const roles: AgentRole[] = [...(roleWorker ? ['worker' as const] : []), ...(roleIntegrator ? ['integrator' as const] : [])];
     // The command field contains `claude --permission-mode bypassPermissions`
     // for auto mode. Split into argv-style for node-pty.
     const [exe, ...args] = command.trim().split(/\s+/);
@@ -103,12 +108,13 @@ export function AddAgentModal({ onClose, config }: AddAgentModalProps) {
       rows: 30,
       // When set, the main process spawns this agent in its own git worktree.
       isolate,
-      // Provision this agent in the hive (memory + mailbox + identity/protocol).
+      // Provision this agent in the hive (memory + mailbox + identity/protocol + roles).
       hive: {
         id,
         name: name.trim(),
         cwd,
-        role: description.trim() || undefined
+        role: description.trim() || undefined,
+        roles
       }
     });
     if (!spawnRes.ok) {
@@ -161,6 +167,7 @@ export function AddAgentModal({ onClose, config }: AddAgentModalProps) {
       currentStation: 'desk',
       ptyId: isNative ? undefined : ptyId,
       command: command.trim(),
+      roles,
       // The snapshotted effective model (explicit pick → fleet default), or the
       // operator's raw `model` when nothing resolved (empty registry → still feeds
       // the command they may have hand-edited).
@@ -296,6 +303,19 @@ export function AddAgentModal({ onClose, config }: AddAgentModalProps) {
                 Git isolation (own worktree)
               </span>
             </label>
+
+            <Row label="Roles">
+              <div style={{ display: 'flex', gap: 16, alignItems: 'center', flexWrap: 'wrap' }}>
+                <label style={{ display: 'flex', gap: 6, alignItems: 'center', cursor: 'pointer' }}>
+                  <input type="checkbox" checked={roleWorker} onChange={(e) => setRoleWorker(e.target.checked)} style={{ width: 16, height: 16, cursor: 'pointer' }} />
+                  <span style={{ fontFamily: 'var(--cth-font-ui)', fontSize: 14, color: 'var(--cth-ink-900)' }}>Worker</span>
+                </label>
+                <label style={{ display: 'flex', gap: 6, alignItems: 'center', cursor: 'pointer' }} title="Reviews + merges other desks' branches (hive_integrate) and signs tasks off. Tick + untick Worker for a dedicated integration desk.">
+                  <input type="checkbox" checked={roleIntegrator} onChange={(e) => setRoleIntegrator(e.target.checked)} style={{ width: 16, height: 16, cursor: 'pointer' }} />
+                  <span style={{ fontFamily: 'var(--cth-font-ui)', fontSize: 14, color: 'var(--cth-ink-900)' }}>Integrator</span>
+                </label>
+              </div>
+            </Row>
 
             <Row label="Character">
               <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
