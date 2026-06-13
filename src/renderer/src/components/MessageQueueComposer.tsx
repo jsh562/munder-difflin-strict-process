@@ -14,8 +14,12 @@ export interface MessageQueueComposerProps {
  *  (`cth.nativeSend`) rather than the Claude queue→`writePty` flush path? Gated on
  *  the runtime KIND derived from the assigned model (Principle I), never a scattered
  *  vendor string: a non-Anthropic provider is a native (DeepSeek/Minimax) desk. */
-function isNativeRuntimeDesk(agent: Agent): boolean {
-  const providerId = deriveProviderId(agent.model);
+function isNativeRuntimeDesk(agent: Agent, fleetDefaultModel?: string | null): boolean {
+  // Mirror the main spawn router's model resolution (agent.model ?? fleet default) so a
+  // model-less desk like the god submits through the native send seam, not the Claude
+  // queue→writePty path (which a native god has no PTY for).
+  const model = (agent.model ?? '').trim() || (fleetDefaultModel ?? undefined);
+  const providerId = deriveProviderId(model);
   return providerId !== null && providerId !== 'anthropic';
 }
 
@@ -58,7 +62,8 @@ export function MessageQueueComposer({ agent }: MessageQueueComposerProps) {
   // the queue→`writePty` flush loop to dispatch into, so its composer submits
   // straight through the `cth.nativeSend` seam. Claude desks keep the unchanged
   // queue path below (Principle V / FR-009).
-  const isNative = isNativeRuntimeDesk(agent);
+  const fleetDefaultModel = useStore((s) => s.fleetDefaultModel);
+  const isNative = isNativeRuntimeDesk(agent, fleetDefaultModel);
 
   const idle = agent.status === 'idle';
 

@@ -134,6 +134,10 @@ interface State {
   sidebarWidth: number;
   sidebarTab: SidebarTab;
   godStatus: GodStatus;
+  /** The house fleet-default model id (config.defaultModel), mirrored here so the
+   *  runtime-kind check (native vs Claude) can apply the SAME fallback the main spawn
+   *  router does (agent.model ?? fleet default) for model-less desks like the god. */
+  fleetDefaultModel: string | null;
   /** Per-agent outgoing message queue (agent id → messages awaiting delivery).
    *  Lets the user keep "talking" to a busy agent: messages park here and are
    *  drained to the terminal one-by-one once the agent is free. */
@@ -190,6 +194,7 @@ interface State {
   setFullscreenFile: (path: string | null) => void;
   setSidebarWidth: (px: number) => void;
   setSidebarTab: (tab: SidebarTab) => void;
+  setFleetDefaultModel: (m: string | null) => void;
   /** Drop persisted agents whose PTY is no longer alive in the main process.
    *  Called once at startup so a renderer reload (e.g. after the laptop sleeps)
    *  restores still-running agents and only removes truly-dead ones. */
@@ -381,6 +386,7 @@ export const useStore = create<State>((set) => ({
   sidebarWidth: initialSidebarWidth,
   sidebarTab: initialSidebarTab,
   godStatus: 'booting',
+  fleetDefaultModel: null,
   messageQueues: initialQueues,
   enrichEnabled: initialEnrichEnabled,
   setEnrichEnabled: (on) => {
@@ -566,7 +572,8 @@ export const useStore = create<State>((set) => ({
   setSidebarTab: (tab) => {
     try { window.localStorage.setItem(LS_SIDEBAR_TAB, tab); } catch { /* noop */ }
     set({ sidebarTab: tab });
-  }
+  },
+  setFleetDefaultModel: (m) => set({ fleetDefaultModel: (m ?? '').trim() || null })
 }));
 
 export function selectedAgent(s: State): Agent | undefined {

@@ -41,7 +41,13 @@ export function App() {
   // Initial config load
   useEffect(() => {
     let cancelled = false;
-    window.cth.getConfig().then(c => { if (!cancelled) setConfig(c); });
+    window.cth.getConfig().then(c => {
+      if (cancelled) return;
+      setConfig(c);
+      // Mirror the fleet-default model into the store so the runtime-kind check can
+      // apply the same fallback the main spawn router uses for model-less desks (god).
+      useStore.getState().setFleetDefaultModel((c as { defaultModel?: string }).defaultModel ?? null);
+    });
     return () => { cancelled = true; };
   }, []);
 

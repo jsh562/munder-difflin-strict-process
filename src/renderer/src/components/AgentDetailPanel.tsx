@@ -49,8 +49,14 @@ export interface AgentDetailPanelProps {
  * (`AddAgentModal`), even though the main process never creates a real PTY for a native
  * desk — so the runtime-kind derivation is what positively identifies "native-running".
  */
-function isNativeRuntimeDesk(agent: Agent): boolean {
-  const providerId = deriveProviderId(agent.model);
+function isNativeRuntimeDesk(agent: Agent, fleetDefaultModel?: string | null): boolean {
+  // Resolve the EFFECTIVE model the same way the main spawn router does: an explicit
+  // per-agent model wins, else the house fleet default. So a model-less desk (e.g. the
+  // god — its registry entry carries no model) is classified by the fleet default it
+  // actually launched on, keeping the display in sync with the real runtime (otherwise
+  // a native god falls through to the blank Claude-PTY view).
+  const model = (agent.model ?? '').trim() || (fleetDefaultModel ?? undefined);
+  const providerId = deriveProviderId(model);
   return providerId !== null && providerId !== 'anthropic';
 }
 
@@ -63,11 +69,12 @@ export function AgentDetailPanel({ agent }: AgentDetailPanelProps) {
   const fullscreenAgentId = useStore(s => s.fullscreenAgentId);
   const sidebarTab = useStore(s => s.sidebarTab);
   const setSidebarTab = useStore(s => s.setSidebarTab);
+  const fleetDefaultModel = useStore(s => s.fleetDefaultModel);
   const isReal = !!agent.ptyId;
   // E008 / T020 — does this desk render the synthesized native transcript (vs the
   // Claude PTY)? Derived from the runtime kind (see `isNativeRuntimeDesk`); evaluated
   // FIRST in the terminal tab so a native desk never falls into the Claude PTY branch.
-  const isNative = isNativeRuntimeDesk(agent);
+  const isNative = isNativeRuntimeDesk(agent, fleetDefaultModel);
   // While this agent is shown in the fullscreen overlay, the fullscreen view
   // owns the pty (it sizes it to fill the screen). Keeping the embedded terminal
   // mounted too means two xterms fight over the pty's cols/rows — which corrupts
