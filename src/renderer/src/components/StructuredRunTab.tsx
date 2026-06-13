@@ -11,6 +11,7 @@ import {
   DEFAULT_TRUNCATE_BYTES,
   TRUNCATION_INDICATOR
 } from './foldEvents';
+import { toolSummaryLine } from './toolSummary';
 import { useAgentSpans, useFleetTelemetry, type ToolSpan, type AgentUsageSample } from '@/hooks/useTelemetry';
 
 /**
@@ -572,6 +573,17 @@ function ToolCallRow({ call }: { call: StructuredToolCall }) {
             <span style={{ color: 'var(--cth-ink-300)', fontSize: 12 }}>· {fmtDur(call.durationMs)}</span>
           )}
         </div>
+        {(() => {
+          // Human-readable summary line (same vocabulary as the transcript), shown only
+          // when it adds something beyond the raw tool name already rendered above.
+          const line = toolSummaryLine(call.name, call.input.full);
+          if (!line || line === call.name) return null;
+          return (
+            <div style={{ color: 'var(--cth-ink-500)', fontSize: 13, marginTop: 1 }}>
+              {line.length > 100 ? `${line.slice(0, 100)}…` : line}
+            </div>
+          );
+        })()}
         <PayloadLine label="in" payload={call.input} />
         {call.output && <PayloadLine label="out" payload={call.output} error={failed} />}
       </div>

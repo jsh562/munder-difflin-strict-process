@@ -46,9 +46,11 @@ import type { AgentEvent, TokenUsageEvent } from '../../../shared/agentEvent';
  *  `interrupted` — stream ended/aborted with the entry still open (FR-011/C6). */
 export type EntryStatus = 'pending' | 'resolved' | 'interrupted';
 
-/** The four transcript entry categories. Each is visually distinct (FR-003/FR-017);
- *  thinking is DISTINCT from assistant text and never merged into it. */
-export type TranscriptEntryType = 'assistant-text' | 'tool-call' | 'thinking' | 'notice';
+/** The transcript entry categories. Each is visually distinct (FR-003/FR-017);
+ *  thinking is DISTINCT from assistant text and never merged into it. `turn-divider`
+ *  is a lightweight separator emitted at each turn boundary after the first, so the
+ *  flat transcript reads as grouped turns (the structured view already groups). */
+export type TranscriptEntryType = 'assistant-text' | 'tool-call' | 'thinking' | 'notice' | 'turn-divider';
 
 /** Inline-notice category (FR-007/FR-008). `degradation` ← `notification`,
  *  `api-error` ← `api-error` (retryable flag carried), `needs-input` ← `needs-input`. */
@@ -107,6 +109,10 @@ export interface TranscriptEntry {
   durationMs?: number;
   /** tool-call: optional error string from a failed `tool-end`. */
   error?: string;
+
+  // ── turn-divider ──
+  /** turn-divider only: the 1-based turn number this separator introduces. */
+  turnIndex?: number;
 
   // ── notice ──
   /** notice only: which category of notice this is. */
@@ -461,8 +467,22 @@ export function foldEvents(events: AgentEvent[], options: FoldOptions = {}): Fol
         closeOpenText();
         closeOpenThinking();
         if (openTurn && !openTurnIsReal) openTurn.status = 'resolved';
+        const turnIdx = turns.length;
+        // Emit a transcript separator for every turn AFTER the first, so the flat
+        // transcript reads as grouped turns. Display-only; the structured view is
+        // unaffected (it groups by the StructuredTurn list, not these entries).
+        if (turnIdx > 0) {
+          entries.push({
+            id: entryId('turn', i, ev.ts),
+            type: 'turn-divider',
+            ts: ev.ts,
+            seq: i,
+            turnIndex: turnIdx + 1, // 1-based, matches the structured view's "turn N"
+            status: 'resolved'
+          });
+        }
         openTurn = {
-          index: turns.length,
+          index: turnIdx,
           toolCalls: [],
           tokenUsage: null,
           status: 'pending'

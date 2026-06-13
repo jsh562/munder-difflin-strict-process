@@ -10,6 +10,7 @@ import type { CSSProperties } from 'react';
 import { useNativeAgentEvents } from '@/hooks/useNativeAgentEvents';
 import type { TranscriptEntry, TruncatedPayload } from './foldEvents';
 import { STICK_THRESHOLD, buildOffsets, visibleRange } from './transcriptWindow';
+import { summarizeTool } from './toolSummary';
 
 /**
  * E008 / T016–T018 — the synthesized terminal transcript for a NATIVE agent desk
@@ -379,9 +380,32 @@ function TranscriptRow({ entry }: { entry: TranscriptEntry }) {
       return <ToolCallRow entry={entry} />;
     case 'notice':
       return <NoticeRow entry={entry} />;
+    case 'turn-divider':
+      return <TurnDividerRow entry={entry} />;
     default:
       return null;
   }
+}
+
+/** A subtle "turn N" separator so the flat transcript reads as grouped turns. */
+function TurnDividerRow({ entry }: { entry: TranscriptEntry }) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 0 2px' }}>
+      <span
+        style={{
+          fontFamily: 'var(--cth-font-ui)',
+          fontSize: 11,
+          color: 'var(--cth-ink-300)',
+          textTransform: 'uppercase',
+          letterSpacing: '0.08em',
+          userSelect: 'none'
+        }}
+      >
+        turn {entry.turnIndex}
+      </span>
+      <span style={{ flex: 1, height: 1, background: 'var(--cth-ink-300)' }} aria-hidden />
+    </div>
+  );
 }
 
 /** Assistant answer text — the default, unadorned terminal output. Glyph `›`. */
@@ -453,54 +477,86 @@ function ThinkingRow({ entry }: { entry: TranscriptEntry }) {
   );
 }
 
-/** A tool call — pending → resolved IN PLACE (FR-004). Glyph + status badge + (on
- *  resolve) success/failure + duration. Same entry id stays mounted across the
- *  pending→resolved transition, so it never re-mounts/relocates. */
+/** A tool call rendered as a collapsible CARD (FR-004) — a human-readable header
+ *  ("Ran `find …` ✓ 68ms") that is always visible, over a collapsible body holding the
+ *  raw tool name + in/out payloads. Default-collapsed for ok calls (so the narrative
+ *  reads cleanly); a FAILURE auto-expands so the error is visible without a click. The
+ *  same entry id stays mounted across pending→resolved, so it never re-mounts/relocates;
+ *  the header swaps its status glyph/label in place. */
 function ToolCallRow({ entry }: { entry: TranscriptEntry }) {
   const status = entry.status;
   const failed = status === 'resolved' && entry.success === false;
-  const badge =
+  const { verb, detail } = summarizeTool(entry.toolName ?? '', entry.toolInput?.full);
+  const detailLine = detail.replace(/\s+/g, ' ').trim();
+  const detailShort = detailLine.length > 90 ? `${detailLine.slice(0, 90)}…` : detailLine;
+
+  const icon = status === 'pending' ? '⟳' : status === 'interrupted' ? '⊘' : failed ? '✗' : '✓';
+  const accent =
     status === 'pending'
-      ? { text: 'running…', color: 'var(--cth-status-working)' }
+      ? 'var(--cth-status-working)'
       : status === 'interrupted'
-      ? { text: 'interrupted', color: 'var(--cth-status-blocked)' }
+      ? 'var(--cth-status-blocked)'
       : failed
-      ? { text: 'failed', color: 'var(--cth-coral)' }
-      : { text: 'ok', color: 'var(--cth-mint)' };
+      ? 'var(--cth-coral)'
+      : 'var(--cth-mint)';
+  const statusText = status === 'pending' ? 'running…' : status === 'interrupted' ? 'interrupted' : failed ? 'failed' : 'ok';
+
+  // Collapsed by default; a failure auto-expands. Because the entry stays mounted across
+  // pending→resolved, a live transition INTO failed must flip the toggle too (useState's
+  // initial value alone wouldn't), so an effect opens it on the failing edge.
+  const [expanded, setExpanded] = useState(failed);
+  const wasFailed = useRef(failed);
+  useEffect(() => {
+    if (failed && !wasFailed.current) setExpanded(true);
+    wasFailed.current = failed;
+  }, [failed]);
 
   return (
     <div style={rowBase}>
-      <span style={{ ...gutter, color: 'var(--cth-sky)' }} aria-hidden>
-        ⚙
+      <span style={{ ...gutter, color: accent }} aria-hidden>
+        {icon}
       </span>
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
-          <span style={{ fontFamily: 'var(--cth-font-ui)', fontSize: 12, color: 'var(--cth-ink-500)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
-            tool
-          </span>
-          <span style={{ color: 'var(--cth-ink-900)', fontWeight: 600 }}>{entry.toolName}</span>
-          <span style={{ fontFamily: 'var(--cth-font-ui)', fontSize: 12, color: badge.color }}>
-            {status === 'pending' && (
-              <span
-                aria-hidden
-                style={{
-                  display: 'inline-block',
-                  width: 6,
-                  height: 6,
-                  marginRight: 4,
-                  background: badge.color,
-                  animation: 'cth-blink 800ms steps(2, end) infinite'
-                }}
-              />
-            )}
-            {badge.text}
+      <div style={{ flex: 1, minWidth: 0, borderLeft: `2px solid ${accent}`, paddingLeft: 8 }}>
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          aria-expanded={expanded}
+          style={{
+            display: 'flex',
+            alignItems: 'baseline',
+            gap: 6,
+            flexWrap: 'wrap',
+            width: '100%',
+            background: 'transparent',
+            border: 'none',
+            padding: 0,
+            cursor: 'pointer',
+            textAlign: 'left',
+            font: 'inherit',
+            color: 'var(--cth-ink-900)'
+          }}
+        >
+          <span style={{ fontWeight: 600 }}>{verb}</span>
+          {detailShort && <span style={{ color: 'var(--cth-ink-700)' }}>{detailShort}</span>}
+          <span style={{ fontFamily: 'var(--cth-font-ui)', fontSize: 12, color: accent }}>
+            {statusText}
             {status === 'resolved' && entry.durationMs !== undefined && (
               <span style={{ color: 'var(--cth-ink-300)' }}> · {fmtDur(entry.durationMs)}</span>
             )}
           </span>
-        </div>
-        <PayloadLine label="in" payload={entry.toolInput} />
-        {entry.result && <PayloadLine label="out" payload={entry.result} error={failed} />}
+          <span aria-hidden style={{ color: 'var(--cth-ink-300)', fontSize: 12 }}>
+            {expanded ? '▾' : '▸'}
+          </span>
+        </button>
+        {expanded && (
+          <div style={{ marginTop: 2 }}>
+            <div style={{ fontFamily: 'var(--cth-font-ui)', fontSize: 11, color: 'var(--cth-ink-300)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+              {entry.toolName}
+            </div>
+            <PayloadLine label="in" payload={entry.toolInput} />
+            {entry.result && <PayloadLine label="out" payload={entry.result} error={failed} />}
+          </div>
+        )}
       </div>
     </div>
   );
