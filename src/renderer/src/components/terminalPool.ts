@@ -15,7 +15,6 @@
  */
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
-import { WebglAddon } from '@xterm/addon-webgl';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
 import '@xterm/xterm/css/xterm.css';
 
@@ -50,7 +49,7 @@ export function acquireTerminal(ptyId: string, theme?: ThemeMap, fontSize = 14):
 
   const term = new Terminal({
     theme,
-    fontFamily: 'VT323, monospace',
+    fontFamily: '"Departure Mono", "Cascadia Mono", Consolas, monospace',
     fontSize,
     lineHeight: 1.0,
     cursorBlink: true,
@@ -162,25 +161,12 @@ export function attachTerminal(entry: TerminalEntry, container: HTMLElement): vo
   if (!entry.opened) {
     entry.term.open(entry.host);
     entry.opened = true;
-    // Switch from the DOM renderer to WebGL (must load after open()). The DOM
-    // renderer assumes a perfectly monospace font, but VT323 is missing glyphs
-    // (↔, arrows, some box-drawing) and has no real bold — the browser
-    // substitutes fallback glyphs with different advance widths, so box-drawing
-    // tables shear apart and the cursor drifts. WebGL draws every glyph into its
-    // own fixed cell, keeping the grid aligned. NOT the deprecated canvas addon
-    // (its dirty-region tracking garbles scrollback). Best-effort: on init
-    // failure or GPU context loss, dispose → fall back to the DOM renderer
-    // rather than leave a black terminal.
-    try {
-      const webgl = new WebglAddon();
-      webgl.onContextLoss(() => {
-        console.warn('[terminal] webgl context lost — falling back to DOM renderer');
-        try { webgl.dispose(); } catch { /* noop */ }
-      });
-      entry.term.loadAddon(webgl);
-    } catch (e) {
-      console.warn('[terminal] webgl renderer unavailable, using DOM renderer:', e);
-    }
+    // Use xterm's default DOM renderer (no WebGL addon). WebGL was only needed because
+    // VT323 was missing glyphs + had no real bold, so the DOM renderer's fallback
+    // substitution sheared the grid. We now ship "Departure Mono" — a COMPLETE pixel
+    // monospace (box-drawing 128/128, block elements 32/32) with bold mapped to the
+    // regular face — so the DOM renderer keeps the grid aligned AND gives reliable text
+    // selection / drag-through-scroll / copy (the WebGL renderer's weak spot).
   }
 }
 

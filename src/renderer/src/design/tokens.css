@@ -48,7 +48,7 @@
   /* Type */
   --cth-font-display: "Press Start 2P", monospace;
   --cth-font-ui:      "Pixelify Sans", system-ui, sans-serif;
-  --cth-font-mono:    "VT323", "JetBrains Mono", monospace;
+  --cth-font-mono:    "Departure Mono", "Cascadia Mono", Consolas, monospace;
 
   /* Type scale */
   --cth-text-display-lg: 16px;
