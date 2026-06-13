@@ -177,17 +177,12 @@ export function useHive(config: HarnessConfig | null): void {
 
       const command = buildSpawnCommand(config, config.defaultModel);
       const [exe, ...args] = command.trim().split(/\s+/);
-      const res = await window.cth.spawnPty({
-        id: GOD_PTY,
-        cwd: config.harnessHome!,
-        command: exe,
-        args,
-        cols: 100,
-        rows: 30,
-        hive: { id: GOD_ID, name: 'Michael', cwd: config.harnessHome!, isGod: true, role: 'orchestrator (god)' }
-      });
-      if (cancelled) { godSpawning.current = false; return; }
-      if (!res.ok) { godSpawning.current = false; useStore.getState().setGodStatus('failed'); return; }
+      // A native god (a non-anthropic fleet default) is routed to the native runtime and
+      // has NO real PTY. Its record therefore carries NO ptyId — otherwise the live-PTY
+      // reconcile (which drops agents whose ptyId isn't an alive PTY) would delete it on
+      // every renderer reload. The runtime kind (native trace vs Claude PTY) is derived
+      // from the model, not the ptyId.
+      const godIsNative = !!config.defaultModel && deriveProviderId(config.defaultModel) !== 'anthropic';
       const god: Agent = {
         id: GOD_ID,
         name: 'Michael',
@@ -201,28 +196,45 @@ export function useHive(config: HarnessConfig | null): void {
         action: 'running the floor',
         progress: 0,
         currentStation: 'desk',
-        ptyId: GOD_PTY,
+        ptyId: godIsNative ? undefined : GOD_PTY,
         command: command.trim(),
         model: config.defaultModel,
         isGod: true,
         recentTextTs: Date.now()
       };
+      const res = await window.cth.spawnPty({
+        id: GOD_PTY,
+        cwd: config.harnessHome!,
+        command: exe,
+        args,
+        cols: 100,
+        rows: 30,
+        hive: { id: GOD_ID, name: 'Michael', cwd: config.harnessHome!, isGod: true, role: 'orchestrator (god)' }
+      });
+      if (cancelled) { godSpawning.current = false; return; }
+      if (!res.ok) {
+        godSpawning.current = false;
+        // On a renderer reload the native god worker survives in MAIN, so the respawn
+        // reports "native worker exists" — it's already running + oriented, so RESTORE
+        // the record (refreshing model/ptyId) instead of failing, and skip the kickoff.
+        // A real failure (e.g. needs-credentials) still surfaces as 'failed'.
+        if (godIsNative && /worker exists/i.test(res.error ?? '')) {
+          useStore.getState().addAgent(god);
+          useStore.getState().setGodStatus('ready');
+        } else {
+          useStore.getState().setGodStatus('failed');
+        }
+        return;
+      }
       useStore.getState().addAgent(god);
       useStore.getState().setGodStatus('ready');
 
-      // Fresh spawn → kick Michael off once his TUI is up. First enable remote
-      // control so the human can approve permission prompts from their phone
-      // (best-effort — a failed/unknown slash command just prints to his terminal
-      // and is harmless), PAUSE so it lands on its own line, then hand him the
-      // orientation prompt. Both go through the per-pty submit chain, so they're
-      // strictly sequential and can't jam together; the boot-grace window keeps
-      // the inbox-wake/drain loops off Michael until he's oriented. Restored
-      // sessions (the live-PTY branch above) skip this.
-      // A native god (a non-anthropic fleet default) is routed to the native runtime
-      // and has NO PTY — so the Claude-only kickoff (/remote-control + writePty) can't
-      // reach it. Drive it through the native seam instead; orientation lands as the
+      // Fresh spawn → kick Michael off once his runtime is up. For a CLAUDE god: enable
+      // remote control (best-effort) then hand him the orientation prompt over the PTY,
+      // strictly sequenced; the boot-grace window keeps the inbox-wake/drain loops off
+      // him until oriented. For a NATIVE god (no PTY): the Claude-only kickoff can't
+      // reach it, so drive it through the native send seam — orientation lands as the
       // worker's first input (its orchestrator ROLE is injected host-side).
-      const godIsNative = !!config.defaultModel && deriveProviderId(config.defaultModel) !== 'anthropic';
       bootGraceUntil.current[GOD_ID] = Date.now() + BOOT_GRACE_MS;
       timers.push(setTimeout(() => {
         if (cancelled) return;
