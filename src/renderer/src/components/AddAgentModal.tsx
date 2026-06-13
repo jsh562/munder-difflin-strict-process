@@ -10,6 +10,7 @@ import { type AccentColorName } from '@/design/tokens';
 import { type HarnessConfig, buildSpawnCommand } from '@/store/config';
 import { listProviders } from '@shared/providerRegistry';
 import { deriveProviderId, resolveEffectiveModel } from '@shared/assignment';
+import { isNativeRuntimeDesk } from '@/lib/runtimeKind';
 
 const ACCENTS: AccentColorName[] = ['coral', 'mint', 'sky', 'lemon', 'lilac', 'peach'];
 
@@ -135,6 +136,15 @@ export function AddAgentModal({ onClose, config }: AddAgentModalProps) {
         ? resolved.source
         : undefined;
 
+    // A NATIVE desk (DeepSeek/Minimax) is routed to the native runtime and has NO
+    // real PTY, so its record must carry NO ptyId — otherwise the live-PTY reconcile
+    // (which drops agents whose ptyId isn't an alive PTY) would move it to "restorable"
+    // on every reload, requiring a manual restore AND hiding it from the inbox-wake
+    // loop (which only iterates live `agents`). Mirrors the god's handling so a native
+    // worker instead stays listed and revives on demand when delegated to / messaged.
+    const effectiveModel = resolved.modelId ?? model;
+    const isNative = isNativeRuntimeDesk({ model: effectiveModel } as Agent, config.defaultModel);
+
     const agent: Agent = {
       id,
       name: name.trim(),
@@ -149,7 +159,7 @@ export function AddAgentModal({ onClose, config }: AddAgentModalProps) {
       action: 'starting up',
       progress: 0,
       currentStation: 'desk',
-      ptyId,
+      ptyId: isNative ? undefined : ptyId,
       command: command.trim(),
       // The snapshotted effective model (explicit pick → fleet default), or the
       // operator's raw `model` when nothing resolved (empty registry → still feeds

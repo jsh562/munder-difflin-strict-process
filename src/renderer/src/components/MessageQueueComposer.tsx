@@ -3,6 +3,7 @@ import { PixelButton } from './PixelButton';
 import { Icon } from './Icon';
 import { useStore, type Agent, type QueuedMessage } from '@/store/store';
 import { deriveProviderId } from '@shared/assignment';
+import { respawnNativeWorker } from '@/lib/nativeRespawn';
 
 const EMPTY_QUEUE: QueuedMessage[] = [];
 
@@ -97,17 +98,27 @@ export function MessageQueueComposer({ agent }: MessageQueueComposerProps) {
     const input = parseNativeInput(raw);
     if (!input.text) return;
     setText(''); // clear optimistically — the ack decides sent vs not-delivered
-    try {
-      const ack = await window.cth.nativeSend(agent.id, input);
-      if (ack?.ok) {
-        flashSend('sent', input.kind === 'steer' ? 'steer sent' : 'sent');
-      } else {
-        flashSend('failed', `not delivered — ${ack?.error ?? 'native agent unavailable'}`);
-        setText(raw); // restore so the operator can retry the un-sent input
+    const trySend = async (): Promise<{ ok: boolean; error?: string }> => {
+      try { return await window.cth.nativeSend(agent.id, input); }
+      catch (e) { return { ok: false, error: e instanceof Error ? e.message : 'send failed' }; }
+    };
+    let ack = await trySend();
+    // Revive-on-demand: a saved native worker stays listed but COLD after a restart.
+    // If its worker is down, respawn it from its own recipe and poll briefly until it
+    // accepts the message — so messaging a cold desk just works, no "restore team".
+    if (!ack.ok && /no native runtime/i.test(ack.error ?? '')) {
+      respawnNativeWorker(agent, null); // idempotent + throttled
+      flashSend('sent', 'reviving worker…');
+      for (let i = 0; i < 6 && !ack.ok; i++) {
+        await new Promise((r) => setTimeout(r, 1000));
+        ack = await trySend();
       }
-    } catch (e) {
-      flashSend('failed', `not delivered — ${e instanceof Error ? e.message : 'send failed'}`);
-      setText(raw);
+    }
+    if (ack.ok) {
+      flashSend('sent', input.kind === 'steer' ? 'steer sent' : 'sent');
+    } else {
+      flashSend('failed', `not delivered — ${ack.error ?? 'native agent unavailable'}`);
+      setText(raw); // restore so the operator can retry the un-sent input
     }
   };
 

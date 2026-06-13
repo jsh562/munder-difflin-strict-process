@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import type { AccentColorName } from '@/design/tokens';
 import type { OfficeCharacterName } from '@/scene/office/cast';
 import type { StatusKind } from '@/components/PixelBadge';
+import { isNativeRuntimeDesk } from '@/lib/runtimeKind';
 
 export type ToolKind =
   | 'Read' | 'Edit' | 'Write' | 'Bash' | 'WebFetch' | 'WebSearch'
@@ -539,14 +540,21 @@ export const useStore = create<State>((set) => ({
   reconcileWithLivePtys: (livePtyIds) =>
     set((s) => {
       const live = new Set(livePtyIds);
-      // Keep agents with no PTY (synthetic) or whose PTY is still alive.
-      const agents = s.agents.filter((a) => !a.ptyId || live.has(a.ptyId));
+      // A NATIVE desk (DeepSeek/Minimax) is routed to the native runtime and never
+      // owns a real PTY, so it must NOT be reconciled against the live-PTY list — it
+      // stays listed (alive or cold) and revives on demand when delegated to / messaged
+      // (the inbox-wake loop + composer respawn it). This also rescues records still
+      // persisted with a STALE fake ptyId from before the AddAgentModal fix.
+      const isNative = (a: Agent) => isNativeRuntimeDesk(a, s.fleetDefaultModel);
+      // Keep agents with no PTY (synthetic), a still-alive PTY, or any native desk.
+      const agents = s.agents.filter((a) => !a.ptyId || live.has(a.ptyId) || isNative(a));
       if (agents.length === s.agents.length) return s;
-      // Workers whose terminal died with the previous session become restorable
-      // (full spawn recipe retained) instead of silently vanishing. God and the
-      // assistant are excluded — they auto-respawn at boot.
+      // Claude workers whose terminal died with the previous session become restorable
+      // (full spawn recipe retained) instead of silently vanishing. God, the assistant,
+      // and native desks are excluded — god/assistant auto-respawn at boot, native desks
+      // are kept above and revive on demand.
       const dead = s.agents.filter(
-        (a) => a.ptyId && !live.has(a.ptyId) && !a.isGod && !a.isAssistant
+        (a) => a.ptyId && !live.has(a.ptyId) && !a.isGod && !a.isAssistant && !isNative(a)
       );
       const restorableAgents = [
         ...s.restorableAgents.filter((r) => !dead.some((d) => d.id === r.id)),

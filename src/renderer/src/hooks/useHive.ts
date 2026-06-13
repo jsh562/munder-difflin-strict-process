@@ -3,6 +3,7 @@ import { useStore, type Agent, type StationKind, type ToolKind } from '@/store/s
 import { buildSpawnCommand, ASSISTANT_MODEL, type HarnessConfig } from '@/store/config';
 import { deriveProviderId } from '@shared/assignment';
 import { isNativeRuntimeDesk } from '@/lib/runtimeKind';
+import { respawnNativeWorker } from '@/lib/nativeRespawn';
 
 const GOD_ID = 'god';
 const GOD_PTY = `pty-${GOD_ID}`;
@@ -162,11 +163,6 @@ export function useHive(config: HarnessConfig | null): void {
   // must leave the agent alone — set while its boot sequence is typing so nothing
   // collides with /remote-control + the orientation prompt.
   const bootGraceUntil = useRef<Record<string, number>>({});
-  // Per-agent timestamp of the last time the inbox-wake (#3) respawned a DOWNED
-  // native worker because a delegated message landed in its inbox but it had no
-  // live runtime. Throttles respawns so a crash-looping worker can't be respawned
-  // on every 4s wake tick.
-  const nativeRespawnAt = useRef<Record<string, number>>({});
   // Reactive so the assistant bootstrap (effect #1b) re-runs once Michael is ready.
   const godStatus = useStore((s) => s.godStatus);
   // #5C/#7C.4 — latest circuit-breaker level per agent. When 'constrained'/
@@ -463,32 +459,6 @@ export function useHive(config: HarnessConfig | null): void {
   useEffect(() => {
     if (!config?.onboardingComplete) return;
 
-    // Respawn a DOWNED native worker so a message delegated to it can land. The
-    // worker exited (or was lost on a full app restart) but its store record + inbox
-    // survive; reuse the "restore team" recipe (same id/cwd/model/command) — the main
-    // spawn router sends a native model to nativeRuntime.spawn. Throttled per agent so
-    // a crash-looping worker can't respawn every tick. We deliberately DON'T set
-    // `nudged` here: once the worker is back up + idle, the next tick's nativeSend
-    // delivers the wake and its drain picks up the queued mail.
-    const RESPAWN_COOLDOWN_MS = 15000;
-    const respawnNativeWorker = (a: Agent, now: number) => {
-      if (!config) return;
-      if (now - (nativeRespawnAt.current[a.id] ?? 0) < RESPAWN_COOLDOWN_MS) return;
-      nativeRespawnAt.current[a.id] = now;
-      const command = (a.command ?? '').trim() || buildSpawnCommand(config, a.model);
-      if (!command || !a.cwd) return;
-      const [exe, ...args] = command.split(/\s+/);
-      window.cth.spawnPty({
-        id: a.ptyId ?? `pty-${a.id}`,
-        cwd: a.cwd,
-        command: exe,
-        args,
-        cols: 100,
-        rows: 30,
-        hive: { id: a.id, name: a.name, cwd: a.cwd, role: a.description }
-      }).catch(() => { /* best-effort; next tick retries after the cooldown */ });
-    };
-
     const iv = setInterval(async () => {
       const now = Date.now();
       const fleetDefault = useStore.getState().fleetDefaultModel;
@@ -526,7 +496,7 @@ export function useHive(config: HarnessConfig | null): void {
             } else if (/no native runtime/i.test(res.error ?? '')) {
               // Worker is down but the mail is in its inbox — bring it back. Leave
               // `nudged` UNSET so the next tick (worker alive + idle) sends the wake.
-              respawnNativeWorker(a, now);
+              respawnNativeWorker(a, config);
             }
             // Other transient errors: leave nudged unset, retry next tick.
           }
