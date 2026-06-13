@@ -7,6 +7,7 @@ import { PtyTerminalView } from './PtyTerminalView';
 import { NativeTranscriptView } from './NativeTranscriptView';
 import { MessageQueueComposer } from './MessageQueueComposer';
 import { isNativeRuntimeDesk } from '@/lib/runtimeKind';
+import { displayStatus } from '@/lib/agentStatus';
 import { stopAgent, startGod, pauseAgent } from '@/lib/agentControl';
 import { TasksKanban } from './TasksKanban';
 import { disposeTerminal } from './terminalPool';
@@ -133,7 +134,7 @@ export function CommandCenterPanel({ agent }: { agent: Agent }) {
             fontFamily: 'var(--cth-font-display)', fontSize: 10, lineHeight: '14px', color: 'var(--cth-ink-900)'
           }}>MICHAEL · COMMAND CENTER</div>
           <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginTop: 1 }}>
-            <PixelBadge status={godDesired === 'stopped' ? 'idle' : agent.status} />
+            <PixelBadge status={displayStatus(agent, paused, godDesired)} />
             <span style={{ fontSize: 12, color: 'var(--cth-ink-500)' }}>
               {godDesired === 'stopped' ? 'stopped' : paused ? 'paused' : 'runs the floor'}
             </span>

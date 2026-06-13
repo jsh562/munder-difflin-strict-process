@@ -428,6 +428,34 @@ export function useHive(config: HarnessConfig | null): void {
     });
   }, []);
 
+  // 2e) Drive NATIVE desk status from the live AgentEvent stream. Claude desks get
+  //     status from hook events (#2); a native desk's store status was otherwise FROZEN
+  //     (so the god read "idle" while working). turn-start → 'working'; turn-end/stop →
+  //     'idle'. Left untouched while the desk is paused, a stopped god, or breaker-armed
+  //     so those operator/guard states stick (displayStatus layers pause/stop on top).
+  //     Keyed on the native id set so it re-subscribes when desks come/go.
+  const nativeIds = useStore((s) =>
+    s.agents.filter((a) => isNativeRuntimeDesk(a, s.fleetDefaultModel)).map((a) => a.id).sort().join(',')
+  );
+  useEffect(() => {
+    if (!config?.onboardingComplete || !nativeIds) return;
+    const offs = nativeIds.split(',').map((id) =>
+      window.cth.onAgentEvent?.(id, (e) => {
+        if (e.kind !== 'turn-start' && e.kind !== 'turn-end' && e.kind !== 'stop') return;
+        const { updateAgent, agents, paused, godDesired: desired } = useStore.getState();
+        if (!agents.some((a) => a.id === id)) return;
+        if (paused[id]) return;                              // operator paused — keep it
+        if (id === GOD_ID && desired === 'stopped') return;  // stopped god stays down
+        const lvl = breakerLevel.current[id];
+        if (lvl === 'constrained' || lvl === 'stopped') return; // breaker pins 'looping'
+        updateAgent(id, e.kind === 'turn-start'
+          ? { status: 'working', action: 'working' }
+          : { status: 'idle', action: 'idle' });
+      })
+    );
+    return () => offs.forEach((off) => off?.());
+  }, [config?.onboardingComplete, nativeIds]);
+
   // 2c) Context gauge backfill: poll each live agent's current context size
   //     (tokens) from its session transcript — only until the status line
   //     (effect 2d) has delivered exact numbers for that agent.

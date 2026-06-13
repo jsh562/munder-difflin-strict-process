@@ -8,6 +8,7 @@ import {
 } from 'react';
 import type { CSSProperties } from 'react';
 import { useNativeAgentEvents } from '@/hooks/useNativeAgentEvents';
+import { useStore } from '@/store/store';
 import type { TranscriptEntry, TruncatedPayload } from './foldEvents';
 import { STICK_THRESHOLD, buildOffsets, visibleRange } from './transcriptWindow';
 import { summarizeTool, summarizeResult } from './toolSummary';
@@ -72,10 +73,16 @@ export function NativeTranscriptView({ agentId, embedded }: NativeTranscriptView
   // A turn is "in progress" while its fold status is still `pending` (turn-start seen,
   // no turn-end/stop yet). The fold opens a pending turn at `turn-start` — BEFORE any
   // text delta — and resolves it at `turn-end`/`stop`, so this flag rises before the
-  // first visible token and clears the moment the turn settles (FR-018).
+  // first visible token and clears the moment the turn settles (FR-018). But the
+  // operator's Pause (worker mid-turn with tools denied) / Stop (god killed) won't
+  // produce a fold-settling event for that turn, so SUPPRESS the "working…" spinner in
+  // those states — the surrounding chrome (badge/card) shows the real paused/stopped.
+  const suppressed = useStore(
+    (s) => !!s.paused[agentId] || (agentId === 'god' && s.godDesired === 'stopped')
+  );
   const streaming = useMemo(
-    () => structured.turns.some((t) => t.status === 'pending'),
-    [structured.turns]
+    () => !suppressed && structured.turns.some((t) => t.status === 'pending'),
+    [structured.turns, suppressed]
   );
 
   return (

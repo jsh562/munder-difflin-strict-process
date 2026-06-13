@@ -4,6 +4,7 @@ import { PixelButton } from './PixelButton';
 import { Icon } from './Icon';
 import { useStore, type Agent } from '@/store/store';
 import { buildSpawnCommand, type HarnessConfig } from '@/store/config';
+import { displayStatus } from '@/lib/agentStatus';
 
 export interface AgentStripProps {
   /** Needed to rebuild a spawn command when a restorable agent predates the
@@ -17,6 +18,8 @@ export function AgentStrip({ config }: AgentStripProps) {
   const selectedId = useStore(s => s.selectedId);
   const select = useStore(s => s.select);
   const setAddAgentOpen = useStore(s => s.setAddAgentOpen);
+  const paused = useStore(s => s.paused);
+  const godDesired = useStore(s => s.godDesired);
   const [restoring, setRestoring] = useState(false);
 
   /** Respawn every worker from the previous session with its ORIGINAL agent id,
@@ -87,7 +90,7 @@ export function AgentStrip({ config }: AgentStripProps) {
           name={a.name}
           character={a.character}
           accent={a.accent}
-          status={a.status}
+          status={displayStatus(a, !!paused[a.id], godDesired)}
           project={a.project}
           action={a.action}
           progress={a.progress}
