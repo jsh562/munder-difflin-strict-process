@@ -54,6 +54,11 @@ if (parentPort) {
   const isNative = adapter !== null;
   const model = (process.env[NATIVE_PROVIDER_MODEL_ENV] ?? '').trim() || null;
 
+  // Host-supplied environment briefing (the desk's actual shell + OS) appended to the
+  // preamble so it uses the right command style. Stable per machine ⇒ no cache bust.
+  const envNote = (process.env.NATIVE_AGENT_ENV_NOTE ?? '').trim();
+  const nativePreamble = envNote ? `${NATIVE_AGENT_PREAMBLE}\n${envNote}` : NATIVE_AGENT_PREAMBLE;
+
   const requestDrain = (): Promise<{ block: boolean; reason?: string }> => {
     const turnId = ++turnSeq;
     return new Promise((resolve) => {
@@ -110,8 +115,9 @@ if (parentPort) {
               executeTool,
               tools,
               // E006 — brief a native desk on the hive protocol + toolkit (the system
-              // preamble a Claude desk gets via --append-system-prompt). Stub path: none.
-              systemPrompt: isNative ? NATIVE_AGENT_PREAMBLE : undefined,
+              // preamble a Claude desk gets via --append-system-prompt), plus the
+              // host's shell/OS environment note. Stub path: none.
+              systemPrompt: isNative ? nativePreamble : undefined,
               emit: (event) => post({ type: 'event', event }),
               requestDrain,
               caps: { maxTurns: 50, maxHops: 50 }

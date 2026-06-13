@@ -31,6 +31,7 @@ import { createNativeEventBridge, loadNativeEvents } from './runtime/nativeEvent
 import { executeAgentTool, type AgentToolDeps } from '@jsh562/agent-core';
 import { redactConfig, injectionEnvForProvider, keyPresence, setKeyInConfig, clearKeyInConfig, WEB_SEARCH_KEY_ID, type SafeConfig } from './credentials';
 import { searchWebDuckDuckGo } from './webSearch';
+import { resolveBashEnv, describeBashEnv } from './bashShell';
 import { listProviders } from '../shared/providerRegistry';
 import { deriveProviderId } from '../shared/assignment';
 import type { AgentInput } from '../shared/providerRuntime';
@@ -258,6 +259,9 @@ const agentToolDeps: AgentToolDeps = {
   appendMemory: (id, text) => hive.appendMemory(id, text),
   resolveCwd: (id) => hive.registry().agents[id]?.cwd ?? null,
   bashEnabled: () => readConfig().nativeBashEnabled === true,
+  // Run the bash tool through a real shell (Git Bash on Windows) so ls/grep/find/pipes
+  // work — instead of Node's cmd.exe default. Detected once at startup.
+  bashShell: () => resolveBashEnv().shell,
   // web_search routes through the host (provider + formatting). Free + keyless via
   // DuckDuckGo; config is read live per call so the operator's enable/disable takes
   // effect at once. Throws a clear note when disabled — the executor turns that into a
@@ -286,6 +290,9 @@ const nativeRuntime = new NativeRuntime({
   onWorkerExit: (id) => { archiveAgent(id); syncKeepAwake(); },
   usageFor: (id) => usageProvider.getAgentUsage(id),
   credentialEnvFor: (providerId) => injectionEnvForProvider(readConfig(), providerId),
+  // Brief the native desk on its actual shell + OS so it uses the right command style
+  // (Unix vs PowerShell vs cmd) on the first try. Appended to the preamble in the worker.
+  workerEnv: () => ({ NATIVE_AGENT_ENV_NOTE: describeBashEnv() }),
   // E007 T011/T017 {FR-008/011} — forward each native worker's usage + tool spans
   // into the loopback collector's gen_ai.* branch (single-writer in main, AD-002),
   // so a DeepSeek/Minimax desk produces the SAME AgentUsageSample + ToolSpan as a
