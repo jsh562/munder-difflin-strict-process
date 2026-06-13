@@ -1,6 +1,6 @@
 import { app, BrowserWindow, clipboard, dialog, ipcMain, powerSaveBlocker, screen, shell, Notification } from 'electron';
 import { spawn } from 'node:child_process';
-import { rmSync, existsSync, readFileSync, readdirSync, statSync, cpSync } from 'node:fs';
+import { rmSync, existsSync, readFileSync, readdirSync, statSync, cpSync, mkdirSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
 import { PtyManager, type SpawnOptions } from './pty';
 import {
@@ -276,7 +276,7 @@ const agentToolDeps: AgentToolDeps = {
 const NATIVE_GOD_PROMPT = [
   'You are the GOD / ORCHESTRATOR of this hive of agents (you are "Michael"). Your job is to ORCHESTRATE, not implement: keep awareness of the whole team and delegate the work.',
   '- DELEGATE: decompose work and fan it out with hive_send_message (to a desk id, or "broadcast"); assign + track it on the shared board with hive_add_task / hive_list_tasks. Do NOT do the grunt implementation yourself.',
-  '- YOU CANNOT TOUCH PROJECT FILES: your working directory is the hive harness home, NOT any project repo — your tools are sandboxed to it, so you literally cannot read or edit project code. Each project lives in a worker desk\'s own repo, so ALL implementation MUST be delegated; trying to do it yourself will just fail.',
+  '- YOU CANNOT TOUCH PROJECT FILES: your working directory is your own scratch workspace, NOT any project repo — your tools are sandboxed to it, so you literally cannot read or edit project code. Each project lives in a worker desk\'s own repo, so ALL implementation MUST be delegated; trying to do it yourself will just fail.',
   '- IF NO WORKER DESKS ARE ALIVE to take the work, do NOT attempt it yourself — tell the operator exactly which team/desks to spawn, then orchestrate once they are up.',
   '- COORDINATE: answer agents\' questions so the team runs autonomously; read a peer\'s memory with hive_read_memory when you need context; record durable decisions with write_memory.',
   '- OWN only the high-leverage calls: task decomposition, dispatch, sign-offs, conflict resolution, integration. Keep everyone unblocked.',
@@ -854,6 +854,10 @@ ipcMain.handle('pty:spawn', async (_evt, opts: SpawnOptions & { hive?: AgentMeta
   // If the agent carries hive metadata, provision its workspace and inject the
   // identity + protocol (extra --append-system-prompt args + AGENT_* env).
   if (opts.hive && hive.enabled()) {
+    // Ensure the agent's working dir exists before it spawns there — chiefly the god's
+    // dedicated workspace (a sibling of the hive bookkeeping), which won't exist on the
+    // first run. A no-op for an existing project cwd / the harness home.
+    try { mkdirSync(opts.cwd, { recursive: true }); } catch { /* best-effort */ }
     try {
       const inj = hive.ensureAgent(
         { ...opts.hive, cwd: opts.cwd },

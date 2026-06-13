@@ -10,6 +10,15 @@ const GOD_PTY = `pty-${GOD_ID}`;
 const ASSISTANT_ID = 'assistant';
 const ASSISTANT_PTY = `pty-${ASSISTANT_ID}`;
 
+/** The native god's dedicated working directory: a `workspace` sibling of the hive
+ *  bookkeeping under the harness home, so its file writes never mix with the registry,
+ *  board, or per-agent memory. Main `mkdir`s it at spawn. Built with the harness home's
+ *  own path separator so the displayed/sandboxed path stays consistent on Windows. */
+function godWorkspace(harnessHome: string): string {
+  const sep = harnessHome.includes('\\') ? '\\' : '/';
+  return `${harnessHome.replace(/[\\/]+$/, '')}${sep}workspace`;
+}
+
 // How long to let Claude Code's TUI finish booting before we type the first
 // thing into Michael's terminal, and how long to PAUSE after the /remote-control
 // command so the slash command lands + executes on its own line before the
@@ -204,6 +213,12 @@ export function useHive(config: HarnessConfig | null): void {
       // every renderer reload. The runtime kind (native trace vs Claude PTY) is derived
       // from the model, not the ptyId.
       const godIsNative = !!config.defaultModel && deriveProviderId(config.defaultModel) !== 'anthropic';
+      // A NATIVE god gets its OWN working directory — a sibling of the hive bookkeeping
+      // (registry.json, board.md, agents/<id>/memory.md, inboxes) — so anything it
+      // writes/builds (its tools are cwd-sandboxed) can't pollute that state. It still
+      // orchestrates through the hive TOOLS, which are host-mediated and cwd-independent.
+      // (A Claude god keeps the harness home: its orientation reads hive-root files.)
+      const godCwd = godIsNative ? godWorkspace(config.harnessHome!) : config.harnessHome!;
       const god: Agent = {
         id: GOD_ID,
         name: 'Michael',
@@ -212,7 +227,7 @@ export function useHive(config: HarnessConfig | null): void {
         description: 'god — runs the floor, triages requests, escalates only critical calls to you',
         project: 'hive',
         tmuxTarget: '',
-        cwd: config.harnessHome!,
+        cwd: godCwd,
         status: 'idle',
         action: 'running the floor',
         progress: 0,
@@ -225,12 +240,12 @@ export function useHive(config: HarnessConfig | null): void {
       };
       const res = await window.cth.spawnPty({
         id: GOD_PTY,
-        cwd: config.harnessHome!,
+        cwd: godCwd,
         command: exe,
         args,
         cols: 100,
         rows: 30,
-        hive: { id: GOD_ID, name: 'Michael', cwd: config.harnessHome!, isGod: true, role: 'orchestrator (god)' }
+        hive: { id: GOD_ID, name: 'Michael', cwd: godCwd, isGod: true, role: 'orchestrator (god)' }
       });
       if (cancelled) { godSpawning.current = false; return; }
       if (!res.ok) {
