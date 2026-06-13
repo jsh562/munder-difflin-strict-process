@@ -4,7 +4,9 @@ import { PixelBadge } from './PixelBadge';
 import { PixelButton } from './PixelButton';
 import { SpritePortrait } from './SpritePortrait';
 import { PtyTerminalView } from './PtyTerminalView';
+import { NativeTranscriptView } from './NativeTranscriptView';
 import { MessageQueueComposer } from './MessageQueueComposer';
+import { isNativeRuntimeDesk } from '@/lib/runtimeKind';
 import { TasksKanban } from './TasksKanban';
 import { disposeTerminal } from './terminalPool';
 import { Icon } from './Icon';
@@ -96,6 +98,11 @@ export function CommandCenterPanel({ agent }: { agent: Agent }) {
   const fullscreenAgentId = useStore((s) => s.fullscreenAgentId);
   const onPtyStream = usePtyParser(agent.id);
   const isFullscreenedHere = fullscreenAgentId === agent.id;
+  // A native god (DeepSeek/Minimax) has no Claude PTY — show its synthesized transcript
+  // (not the PTY view / "no live terminal"). Mirrors the main router's model resolution
+  // via the fleet-default fallback (a god's record may carry no explicit model).
+  const fleetDefaultModel = useStore((s) => s.fleetDefaultModel);
+  const isNative = isNativeRuntimeDesk(agent, fleetDefaultModel);
 
   return (
     <PixelPanel
@@ -160,6 +167,13 @@ export function CommandCenterPanel({ agent }: { agent: Agent }) {
         {tab === 'terminal' && (
           isFullscreenedHere ? (
             <Centered>Terminal is open in fullscreen. Press Esc to bring it back.</Centered>
+          ) : isNative ? (
+            <>
+              <div style={{ flex: 1, minHeight: 0, display: 'flex' }}>
+                <NativeTranscriptView agentId={agent.id} embedded />
+              </div>
+              <MessageQueueComposer agent={agent} />
+            </>
           ) : agent.ptyId ? (
             <>
               <div style={{ flex: 1, minHeight: 0, display: 'flex' }}>
