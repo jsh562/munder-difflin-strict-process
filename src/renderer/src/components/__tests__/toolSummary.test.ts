@@ -1,7 +1,7 @@
 /** toolSummary — every native toolkit tool maps to a human-readable verb/detail;
  *  unknown tools fall back to the raw name; MCP tools get a server/tool label. */
 import { describe, it, expect } from 'vitest';
-import { summarizeTool, toolSummaryLine } from '../toolSummary';
+import { summarizeTool, toolSummaryLine, summarizeResult } from '../toolSummary';
 
 describe('summarizeTool — readable labels for the native toolkit', () => {
   it('maps each coding/hive tool to a friendly verb + detail', () => {
@@ -37,5 +37,33 @@ describe('summarizeTool — readable labels for the native toolkit', () => {
   it('toolSummaryLine joins verb + detail, omitting an empty detail', () => {
     expect(toolSummaryLine('bash', { command: 'npm test' })).toBe('Ran npm test');
     expect(toolSummaryLine('hive_list_tasks', {})).toBe('Listed tasks');
+  });
+});
+
+describe('summarizeResult — scannable result previews for the card header', () => {
+  it('counts lines per tool with correct pluralization', () => {
+    expect(summarizeResult('read_file', 'a\nb\nc', true)).toBe('3 lines');
+    expect(summarizeResult('read_file', 'only one', true)).toBe('1 line');
+    expect(summarizeResult('grep', 'f.ts:1: x\nf.ts:2: y', true)).toBe('2 matches');
+    expect(summarizeResult('list_dir', 'a\nb', true)).toBe('2 entries');
+    expect(summarizeResult('hive_list_tasks', 't1', true)).toBe('1 task');
+  });
+
+  it('bash shows the first non-empty output line (clamped)', () => {
+    expect(summarizeResult('bash', '\n  41 passed  \nmore', true)).toBe('41 passed');
+    expect(summarizeResult('bash', '   \n  ', true)).toBe('no output');
+    expect(summarizeResult('bash', 'x'.repeat(80), true)).toBe(`${'x'.repeat(60)}…`);
+  });
+
+  it('returns nothing for actions, failures, or empty non-bash results', () => {
+    expect(summarizeResult('edit_file', 'ok', true)).toBe('');
+    expect(summarizeResult('write_memory', 'noted', true)).toBe('');
+    expect(summarizeResult('read_file', 'a\nb', false)).toBe(''); // failure → header shows "failed"
+    expect(summarizeResult('read_file', '   ', true)).toBe('');
+  });
+
+  it('coerces non-string results without crashing', () => {
+    expect(summarizeResult('read_file', { a: 1 }, true)).toBe('1 line');
+    expect(summarizeResult('read_file', null, true)).toBe('');
   });
 });

@@ -76,3 +76,42 @@ export function toolSummaryLine(toolName: string, toolInput: unknown): string {
   const { verb, detail } = summarizeTool(toolName, toolInput);
   return detail ? `${verb} ${detail}` : verb;
 }
+
+function resultString(result: unknown): string {
+  if (typeof result === 'string') return result;
+  if (result === undefined || result === null) return '';
+  try { return JSON.stringify(result); } catch { return String(result); }
+}
+
+/** Non-empty line count of a result body (trailing blank lines ignored). */
+function countLines(s: string): number {
+  const t = s.replace(/\s+$/, '');
+  return t === '' ? 0 : t.split('\n').length;
+}
+
+/**
+ * A short, scannable preview of a tool's RESULT for the collapsed card header — so the
+ * operator can read "Read CLAUDE.md · 320 lines" or "Ran npm test · 41 passed" without
+ * expanding. Returns '' when there's nothing worth previewing (the header already shows
+ * ok/failed) or on failure (the error itself is auto-expanded). Format-agnostic + safe:
+ * it counts lines / shows the first output line rather than parsing tool-specific shapes.
+ */
+export function summarizeResult(toolName: string, result: unknown, success: boolean): string {
+  if (!success) return '';
+  const s = resultString(result);
+  if (s.trim() === '') return toolName === 'bash' ? 'no output' : '';
+  const n = countLines(s);
+  const plur = (one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+  switch (toolName) {
+    case 'read_file': return plur('line', 'lines');
+    case 'list_dir': return plur('entry', 'entries');
+    case 'grep': return plur('match', 'matches');
+    case 'hive_list_tasks': return plur('task', 'tasks');
+    case 'web_search': return plur('line', 'lines');
+    case 'bash': {
+      const line = s.split('\n').map((l) => l.trim()).find((l) => l.length > 0) ?? '';
+      return line.length > 60 ? `${line.slice(0, 60)}…` : line;
+    }
+    default: return ''; // actions (write/edit/memory/message) — status 'ok' is enough
+  }
+}

@@ -10,7 +10,8 @@ import type { CSSProperties } from 'react';
 import { useNativeAgentEvents } from '@/hooks/useNativeAgentEvents';
 import type { TranscriptEntry, TruncatedPayload } from './foldEvents';
 import { STICK_THRESHOLD, buildOffsets, visibleRange } from './transcriptWindow';
-import { summarizeTool } from './toolSummary';
+import { summarizeTool, summarizeResult } from './toolSummary';
+import { Markdown } from './Markdown';
 
 /**
  * E008 / T016–T018 — the synthesized terminal transcript for a NATIVE agent desk
@@ -408,14 +409,18 @@ function TurnDividerRow({ entry }: { entry: TranscriptEntry }) {
   );
 }
 
-/** Assistant answer text — the default, unadorned terminal output. Glyph `›`. */
+/** Assistant answer text — rendered as lightweight Markdown (headings, lists, code
+ *  blocks, inline code, bold/italic) so prose reads like Claude Code / Cursor instead
+ *  of one run-on line. Glyph `›`. */
 function AssistantTextRow({ entry }: { entry: TranscriptEntry }) {
   return (
     <div style={rowBase}>
       <span style={{ ...gutter, color: 'var(--cth-ink-300)' }} aria-hidden>
         ›
       </span>
-      <span style={{ flex: 1, color: 'var(--cth-ink-900)' }}>{entry.text}</span>
+      <div style={{ flex: 1, minWidth: 0, color: 'var(--cth-ink-900)' }}>
+        <Markdown text={entry.text ?? ''} />
+      </div>
     </div>
   );
 }
@@ -489,6 +494,10 @@ function ToolCallRow({ entry }: { entry: TranscriptEntry }) {
   const { verb, detail } = summarizeTool(entry.toolName ?? '', entry.toolInput?.full);
   const detailLine = detail.replace(/\s+/g, ' ').trim();
   const detailShort = detailLine.length > 90 ? `${detailLine.slice(0, 90)}…` : detailLine;
+  // A scannable preview of the result in the collapsed header (e.g. "· 320 lines").
+  const resultPreview = status === 'resolved' && !failed && entry.result
+    ? summarizeResult(entry.toolName ?? '', entry.result.full, true)
+    : '';
 
   const icon = status === 'pending' ? '⟳' : status === 'interrupted' ? '⊘' : failed ? '✗' : '✓';
   const accent =
@@ -544,6 +553,11 @@ function ToolCallRow({ entry }: { entry: TranscriptEntry }) {
               <span style={{ color: 'var(--cth-ink-300)' }}> · {fmtDur(entry.durationMs)}</span>
             )}
           </span>
+          {resultPreview && (
+            <span style={{ fontFamily: 'var(--cth-font-ui)', fontSize: 12, color: 'var(--cth-ink-500)' }}>
+              · {resultPreview}
+            </span>
+          )}
           <span aria-hidden style={{ color: 'var(--cth-ink-300)', fontSize: 12 }}>
             {expanded ? '▾' : '▸'}
           </span>
@@ -553,7 +567,9 @@ function ToolCallRow({ entry }: { entry: TranscriptEntry }) {
             <div style={{ fontFamily: 'var(--cth-font-ui)', fontSize: 11, color: 'var(--cth-ink-300)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
               {entry.toolName}
             </div>
-            <PayloadLine label="in" payload={entry.toolInput} />
+            {/* A file edit/write shows a compact diff instead of a raw JSON input blob. */}
+            <ToolEditDiff toolName={entry.toolName} input={entry.toolInput?.full} />
+            {!isFileMutation(entry.toolName) && <PayloadLine label="in" payload={entry.toolInput} />}
             {entry.result && <PayloadLine label="out" payload={entry.result} error={failed} />}
           </div>
         )}
@@ -701,6 +717,63 @@ function PayloadLine({
     </div>
   );
 }
+
+/** Does this tool write a file (so its card shows a diff instead of a raw input blob)? */
+function isFileMutation(toolName?: string): boolean {
+  return toolName === 'edit_file' || toolName === 'write_file';
+}
+
+/** Compact, dependency-free view of a file change: `edit_file` shows old (−) → new (+);
+ *  `write_file` shows the written content (+). Line-clamped for scanning; renders
+ *  nothing when the expected fields are absent (the caller then shows the raw input). */
+function ToolEditDiff({ toolName, input }: { toolName?: string; input: unknown }) {
+  if (!isFileMutation(toolName)) return null;
+  const o = input && typeof input === 'object' ? (input as Record<string, unknown>) : {};
+  if (toolName === 'edit_file') {
+    const oldS = typeof o.old_string === 'string' ? o.old_string : '';
+    const newS = typeof o.new_string === 'string' ? o.new_string : '';
+    if (!oldS && !newS) return null;
+    return (
+      <div style={diffWrap}>
+        <DiffBlock sign="−" text={oldS} bg="var(--cth-coral-light)" fg="var(--cth-coral)" />
+        <DiffBlock sign="+" text={newS} bg="var(--cth-mint-light)" fg="var(--cth-mint)" />
+      </div>
+    );
+  }
+  const content = typeof o.content === 'string' ? o.content : '';
+  if (!content) return null;
+  return (
+    <div style={diffWrap}>
+      <DiffBlock sign="+" text={content} bg="var(--cth-mint-light)" fg="var(--cth-mint)" />
+    </div>
+  );
+}
+
+const MAX_DIFF_LINES = 20;
+function DiffBlock({ sign, text, bg, fg }: { sign: string; text: string; bg: string; fg: string }) {
+  const lines = text.split('\n');
+  const shown = lines.slice(0, MAX_DIFF_LINES);
+  const extra = lines.length - shown.length;
+  return (
+    <pre style={{ ...diffBlock, background: bg }}>
+      {shown.map((l, i) => (
+        <div key={i}><span style={{ color: fg, userSelect: 'none' }}>{sign} </span>{l}</div>
+      ))}
+      {extra > 0 && <div style={{ color: 'var(--cth-ink-500)' }}>  … {extra} more line{extra === 1 ? '' : 's'}</div>}
+    </pre>
+  );
+}
+
+const diffWrap: CSSProperties = { marginTop: 2, display: 'flex', flexDirection: 'column', gap: 3 };
+const diffBlock: CSSProperties = {
+  margin: 0,
+  padding: '4px 6px',
+  fontFamily: 'var(--cth-font-mono, monospace)',
+  fontSize: '0.9em',
+  whiteSpace: 'pre-wrap',
+  wordBreak: 'break-word',
+  boxShadow: 'inset 0 0 0 1px var(--cth-ink-300)'
+};
 
 /** The trailing in-progress indicator (FR-018). A blinking caret-style mark + label,
  *  rendered AFTER the last entry while a turn is still open. Not a virtualized entry,
