@@ -174,8 +174,38 @@ export async function listWorktrees(cwd: string): Promise<GitWorktree[] | { erro
   return out;
 }
 
-/** Derive a safe `agent/<id>` branch name from a worktree path's basename. */
-function agentBranchFor(wtPath: string): string {
+/** Preview what merging `branch` into the repo's current branch would bring: the commits
+ *  not yet in base + a diffstat. Read-only — for the god's review before integrating. */
+export async function previewMerge(
+  repo: string, branch: string
+): Promise<{ ok: true; base: string; commits: string; diffstat: string } | { ok: false; error: string }> {
+  const br = await getBranch(repo);
+  const base = 'current' in br && br.current ? br.current : 'HEAD';
+  const log = await runGit(repo, ['log', '--oneline', `${base}..${branch}`]);
+  if (!log.ok) return { ok: false, error: log.error };
+  const stat = await runGit(repo, ['diff', '--stat', `${base}...${branch}`]);
+  if (!stat.ok) return { ok: false, error: stat.error };
+  return { ok: true, base, commits: log.stdout.trim(), diffstat: stat.stdout.trim() };
+}
+
+/** Merge `branch` into the repo's CURRENT branch (the main tree's base). On conflict (or
+ *  any failure) the merge is ABORTED so the tree is left clean, and `conflict` is set so
+ *  the caller can route the work back to the author instead of leaving a half-merge. */
+export async function mergeBranch(
+  repo: string, branch: string
+): Promise<{ ok: true; base: string } | { ok: false; error: string; conflict?: boolean }> {
+  const br = await getBranch(repo);
+  const base = 'current' in br && br.current ? br.current : null;
+  if (!base) return { ok: false, error: 'repo is in detached HEAD — cannot merge' };
+  const res = await runGit(repo, ['merge', '--no-ff', '--no-edit', branch]);
+  if (res.ok) return { ok: true, base };
+  await runGit(repo, ['merge', '--abort']); // leave the tree clean on failure
+  return { ok: false, error: res.error, conflict: /conflict/i.test(res.error) };
+}
+
+/** Derive a safe `agent/<id>` branch name from a worktree path's basename. Exported so
+ *  the roster can report each isolated desk's branch for the god to integrate. */
+export function agentBranchFor(wtPath: string): string {
   const base = wtPath.split(/[\\/]/).filter(Boolean).pop() ?? 'agent';
   const slug = base.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'agent';
   return `agent/${slug}`;

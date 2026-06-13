@@ -10,7 +10,8 @@ import {
 import { listDir, readFileText, writeFileText } from './fs';
 import {
   getBranch, getStatus, getLog, getBranches, getAheadBehind, isRepo,
-  addWorktree, removeWorktree, listWorktrees, type GitWorktree
+  addWorktree, removeWorktree, listWorktrees, type GitWorktree,
+  previewMerge, mergeBranch, agentBranchFor
 } from './git';
 import { HiveManager, type AgentMeta, type HiveMessage, type HiveTask } from './hive';
 import { HookServer } from './hooks';
@@ -259,21 +260,57 @@ const agentToolDeps: AgentToolDeps = {
   roster: () => {
     const reg = hive.registry();
     const livePtys = new Set(ptyManager.list().map((p) => p.id));
-    return Object.values(reg.agents).map((a) => ({
-      id: a.id,
-      name: a.name,
-      role: a.role,
-      archived: a.archived === true,
-      isGod: a.isGod === true,
-      isAssistant: a.isAssistant === true,
-      running:
-        nativeRuntime.runtimeFor(a.id) !== undefined ||
-        [...ptyToAgent.entries()].some(([ptyId, aid]) => aid === a.id && livePtys.has(ptyId))
-    }));
+    return Object.values(reg.agents).map((a) => {
+      // Worktree maps are keyed by the spawn id (`pty-<id>` for both Claude PTYs and
+      // native desks). An isolated desk reports its origin repo + agent/<id> branch so
+      // the god can review + integrate it; a non-isolated worker reports its cwd as repo.
+      const wtKey = `pty-${a.id}`;
+      const origin = worktreeOrigins.get(wtKey);
+      const wtPath = worktreePaths.get(wtKey);
+      const isWorker = a.isGod !== true && a.isAssistant !== true;
+      return {
+        id: a.id,
+        name: a.name,
+        role: a.role,
+        archived: a.archived === true,
+        isGod: a.isGod === true,
+        isAssistant: a.isAssistant === true,
+        running:
+          nativeRuntime.runtimeFor(a.id) !== undefined ||
+          [...ptyToAgent.entries()].some(([ptyId, aid]) => aid === a.id && livePtys.has(ptyId)),
+        repo: origin ?? (isWorker ? a.cwd : undefined),
+        branch: wtPath ? agentBranchFor(wtPath) : undefined
+      };
+    });
   },
   isGod: (id) => {
     const reg = hive.registry();
     return reg.agents[id]?.isGod === true || reg.godId === id;
+  },
+  // The god's integration seam (hive_integrate): review/merge a worker's branch into its
+  // repo. Scoped to REGISTERED repos (+ live worktree origins) for safety; git runs in
+  // main (single-committer). apply:false previews, true merges (conflicts abort + report).
+  integrate: async (repo, branch, apply) => {
+    const allowed = new Set<string>([...(readConfig().registeredRepos ?? []), ...worktreeOrigins.values()]);
+    if (!allowed.has(repo)) return { content: `repo is not registered (cannot integrate): ${repo}`, success: false };
+    if (!apply) {
+      const p = await previewMerge(repo, branch);
+      if (!p.ok) return { content: `preview failed: ${p.error}`, success: false };
+      return {
+        content: `Preview — merge ${branch} into ${p.base}:\n\nCommits:\n${p.commits || '(none)'}\n\nFiles:\n${p.diffstat || '(none)'}`,
+        success: true
+      };
+    }
+    const m = await mergeBranch(repo, branch);
+    if (!m.ok) {
+      return {
+        content: m.conflict
+          ? `merge CONFLICT — aborted, repo left clean. Send ${branch} back to its author to rebase/resolve.\n${m.error}`
+          : `merge failed: ${m.error}`,
+        success: false
+      };
+    }
+    return { content: `merged ${branch} into ${m.base}`, success: true };
   },
   appendMemory: (id, text) => hive.appendMemory(id, text),
   resolveCwd: (id) => hive.registry().agents[id]?.cwd ?? null,
@@ -297,6 +334,7 @@ const NATIVE_GOD_PROMPT = [
   '- KNOW THE TEAM: before delegating, call hive_list_agents to see who exists, who is running, and their roles — assign to the best AVAILABLE desk, never blind.',
   '- DELEGATE: decompose a request into slices; for each, hive_add_task (a card assigned to a desk) and hive_send_message that desk a short 4-part brief (objective / output / tools+references / boundaries+done). Different slices can go to different desks in parallel. Do NOT do the grunt implementation yourself.',
   '- RUN THE BOARD (it is the live source of truth): at the start of a turn reconcile it — hive_list_tasks, then hive_update_task to fix anything stale. You OWN sign-off: when a worker moves its card to "review", verify the deliverable and hive_update_task it to "done" (or reopen to "doing"). Only you set "done"/reassign/reprioritize.',
+  '- INTEGRATE finished work: each worker commits its slice on its own worktree branch (hive_list_agents shows each desk\'s repo + branch). On a card in "review", use hive_integrate (no apply) to review the commits/diff, then hive_integrate apply:true to merge it into the repo\'s base — then mark the card "done". A reported conflict means send it back to the author. You never hand-edit project files; integration is your high-leverage job.',
   '- YOU CANNOT TOUCH PROJECT FILES: your working directory is your own scratch workspace, NOT any project repo — your tools are sandboxed to it, so you literally cannot read or edit project code. Each project lives in a worker desk\'s own repo, so ALL implementation MUST be delegated; trying to do it yourself will just fail.',
   '- IF NO WORKER DESKS ARE ALIVE to take the work, do NOT attempt it yourself — tell the operator exactly which team/desks to spawn, then orchestrate once they are up.',
   '- COORDINATE: answer agents\' questions so the team runs autonomously; read a peer\'s memory with hive_read_memory when you need context; record durable decisions with write_memory.',
