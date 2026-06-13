@@ -61,7 +61,9 @@ function fakeHive(): HiveToolDeps & { sent: { to: string; from: string }[]; task
       } as ReturnType<HiveToolDeps['send']>;
     },
     tasks: () => ledger,
-    writeTasks: (t) => { ledger = { tasks: t }; }
+    writeTasks: (t) => { ledger = { tasks: t }; },
+    roster: () => [],
+    isGod: () => false
   };
 }
 

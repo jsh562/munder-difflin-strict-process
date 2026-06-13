@@ -256,6 +256,28 @@ const agentToolDeps: AgentToolDeps = {
   send: (partial, from) => hive.send(partial, from),
   tasks: () => hive.tasks(),
   writeTasks: (tasks) => hive.writeTasks(tasks),
+  // Roster for hive_list_agents — registry meta enriched with live presence (a native
+  // worker in the runtime, or a live PTY mapped to the desk) so the god delegates with
+  // sight. `isGod` gates the privileged task-board updates (done/reassign/reprioritize).
+  roster: () => {
+    const reg = hive.registry();
+    const livePtys = new Set(ptyManager.list().map((p) => p.id));
+    return Object.values(reg.agents).map((a) => ({
+      id: a.id,
+      name: a.name,
+      role: a.role,
+      archived: a.archived === true,
+      isGod: a.isGod === true,
+      isAssistant: a.isAssistant === true,
+      running:
+        nativeRuntime.runtimeFor(a.id) !== undefined ||
+        [...ptyToAgent.entries()].some(([ptyId, aid]) => aid === a.id && livePtys.has(ptyId))
+    }));
+  },
+  isGod: (id) => {
+    const reg = hive.registry();
+    return reg.agents[id]?.isGod === true || reg.godId === id;
+  },
   appendMemory: (id, text) => hive.appendMemory(id, text),
   resolveCwd: (id) => hive.registry().agents[id]?.cwd ?? null,
   bashEnabled: () => readConfig().nativeBashEnabled === true,
@@ -275,7 +297,9 @@ const agentToolDeps: AgentToolDeps = {
 // hive TOOLS — this prompt is written for those (no fleet.json CLI / slash commands).
 const NATIVE_GOD_PROMPT = [
   'You are the GOD / ORCHESTRATOR of this hive of agents (you are "Michael"). Your job is to ORCHESTRATE, not implement: keep awareness of the whole team and delegate the work.',
-  '- DELEGATE: decompose work and fan it out with hive_send_message (to a desk id, or "broadcast"); assign + track it on the shared board with hive_add_task / hive_list_tasks. Do NOT do the grunt implementation yourself.',
+  '- KNOW THE TEAM: before delegating, call hive_list_agents to see who exists, who is running, and their roles — assign to the best AVAILABLE desk, never blind.',
+  '- DELEGATE: decompose a request into slices; for each, hive_add_task (a card assigned to a desk) and hive_send_message that desk a short 4-part brief (objective / output / tools+references / boundaries+done). Different slices can go to different desks in parallel. Do NOT do the grunt implementation yourself.',
+  '- RUN THE BOARD (it is the live source of truth): at the start of a turn reconcile it — hive_list_tasks, then hive_update_task to fix anything stale. You OWN sign-off: when a worker moves its card to "review", verify the deliverable and hive_update_task it to "done" (or reopen to "doing"). Only you set "done"/reassign/reprioritize.',
   '- YOU CANNOT TOUCH PROJECT FILES: your working directory is your own scratch workspace, NOT any project repo — your tools are sandboxed to it, so you literally cannot read or edit project code. Each project lives in a worker desk\'s own repo, so ALL implementation MUST be delegated; trying to do it yourself will just fail.',
   '- IF NO WORKER DESKS ARE ALIVE to take the work, do NOT attempt it yourself — tell the operator exactly which team/desks to spawn, then orchestrate once they are up.',
   '- COORDINATE: answer agents\' questions so the team runs autonomously; read a peer\'s memory with hive_read_memory when you need context; record durable decisions with write_memory.',

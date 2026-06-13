@@ -41,7 +41,7 @@ export interface HiveTask {
   title: string;
   description?: string;
   assignee?: string;
-  status: 'todo' | 'doing' | 'blocked' | 'done';
+  status: 'todo' | 'doing' | 'blocked' | 'review' | 'done';
   dependsOn: string[];
   priority: number;
   createdAt: string;

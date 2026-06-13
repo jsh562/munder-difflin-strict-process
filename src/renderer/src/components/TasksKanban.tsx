@@ -14,7 +14,7 @@ export interface HiveTask {
   title: string;
   description?: string;
   assignee?: string;
-  status: 'todo' | 'doing' | 'blocked' | 'done';
+  status: 'todo' | 'doing' | 'blocked' | 'review' | 'done';
   dependsOn: string[];
   priority: number;
   createdAt: string;
@@ -26,6 +26,9 @@ const COLUMNS: { key: Status; label: string; accent: string }[] = [
   { key: 'todo',    label: 'TODO',    accent: 'var(--cth-sky)' },
   { key: 'doing',   label: 'DOING',   accent: 'var(--cth-lemon)' },
   { key: 'blocked', label: 'BLOCKED', accent: 'var(--cth-coral)' },
+  // The worker→god hand-off lane: a worker moves a finished card here; the god verifies
+  // and advances it to DONE (or reopens it).
+  { key: 'review',  label: 'REVIEW',  accent: 'var(--cth-lilac)' },
   { key: 'done',    label: 'DONE',    accent: 'var(--cth-mint)' }
 ];
 
@@ -59,7 +62,7 @@ function parseTasks(raw: unknown): HiveTask[] {
       title: typeof t.title === 'string' ? t.title : '(untitled)',
       description: typeof t.description === 'string' ? t.description : undefined,
       assignee: typeof t.assignee === 'string' ? t.assignee : undefined,
-      status: (['todo', 'doing', 'blocked', 'done'] as const).includes(t.status as Status)
+      status: (['todo', 'doing', 'blocked', 'review', 'done'] as const).includes(t.status as Status)
         ? (t.status as Status) : 'todo',
       dependsOn: Array.isArray(t.dependsOn) ? t.dependsOn.filter((d): d is string => typeof d === 'string') : [],
       priority: typeof t.priority === 'number' ? t.priority : 3,

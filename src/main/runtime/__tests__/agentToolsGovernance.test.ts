@@ -25,6 +25,8 @@ function makeFixture(cwd: string, over: Partial<AgentToolDeps> = {}): { deps: Ag
     send: (partial, from = 'system') => ({ id: 'm1', from, to: String(partial.to), act: 'inform' } as unknown as HiveMessage),
     tasks: () => ledger,
     writeTasks: (t) => { ledger = { tasks: t }; },
+    roster: () => [],
+    isGod: () => false,
     appendMemory: (id, text) => mem.set(id, (mem.get(id) ?? '') + '\n' + text),
     resolveCwd: () => cwd,
     bashEnabled: () => false,
