@@ -90,6 +90,19 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
     catch { setWebSearchEnabled(!next); /* revert on failure */ }
   };
 
+  // ─── Native bash (native desks' shell tool) ─────────────────────────────────
+  // Opt-in gate for the `bash` tool on DeepSeek/Minimax desks. OFF by default; even
+  // when on, every call stays cwd-sandboxed + breaker-watched + destructive-guarded.
+  const [nativeBashEnabled, setNativeBashEnabled] = useState<boolean>(
+    (config as HarnessConfig & { nativeBashEnabled?: boolean }).nativeBashEnabled === true
+  );
+  const toggleNativeBash = async () => {
+    const next = !nativeBashEnabled;
+    setNativeBashEnabled(next); // optimistic
+    try { await window.cth.updateConfig({ nativeBashEnabled: next }); }
+    catch { setNativeBashEnabled(!next); /* revert on failure */ }
+  };
+
   // ─── circuit-breaker config (Lane A #6 canonical fields, widened view) ───────
   // Drives Jim's real breaker: floor-wide TOKEN budget (costCapTokens) + output-
   // token velocity ceiling (circuitBreaker.tokenVelocityPerMin). The token cap
@@ -218,9 +231,10 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
     let alive = true;
     window.cth.getConfig().then((c) => {
       if (!alive) return;
-      const cc = c as BreakerCfgView & SlackConfig & { notifications?: boolean; webSearchEnabled?: boolean };
+      const cc = c as BreakerCfgView & SlackConfig & { notifications?: boolean; webSearchEnabled?: boolean; nativeBashEnabled?: boolean };
       setNotifications(cc.notifications === true);
       setWebSearchEnabled(cc.webSearchEnabled === true);
+      setNativeBashEnabled(cc.nativeBashEnabled === true);
       setAgentBudget(cc.costCapTokens != null ? String(cc.costCapTokens) : '');
       setVelocityCeiling(cc.circuitBreaker?.tokenVelocityPerMin != null ? String(cc.circuitBreaker.tokenVelocityPerMin) : '');
       setSlackEnabled(cc.slackEnabled ?? false);
@@ -696,6 +710,30 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
                   Get a free key at <code>brave.com/search/api</code> (the free tier covers personal use).
                   The key is stored locally and never shown back or sent to git.
                 </span>
+              </div>
+
+              <div style={{ height: 2, background: 'var(--cth-ink-300)' }} />
+
+              {/* Native shell (bash) — opt-in tool for native desks */}
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                  <span style={{ fontSize: 14, lineHeight: '20px', color: 'var(--cth-ink-900)' }}>
+                    Native shell (bash)
+                  </span>
+                  <span style={{ fontSize: 12, lineHeight: '16px', color: 'var(--cth-ink-500)' }}>
+                    Lets DeepSeek/Minimax desks run the <code>bash</code> tool (builds, tests, git).
+                    Off by default; even when on, every command stays scoped to the desk&rsquo;s working
+                    directory, is watched by the circuit breaker, and screened by a destructive-command
+                    guard. Claude desks are unaffected.
+                  </span>
+                </div>
+                <PixelButton
+                  variant={nativeBashEnabled ? 'primary' : 'secondary'}
+                  size="sm"
+                  onClick={toggleNativeBash}
+                >
+                  {nativeBashEnabled ? 'on' : 'off'}
+                </PixelButton>
               </div>
 
               <div style={{ height: 2, background: 'var(--cth-ink-300)' }} />

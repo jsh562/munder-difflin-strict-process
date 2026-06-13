@@ -57,6 +57,11 @@ const CAPABILITY_TAGS: ReadonlyArray<{ key: keyof CapabilityDescriptor; label: s
   { key: 'supportsCaching', label: 'caching' }
 ];
 
+/** Reserved credentials id for the web-search (Brave) key — mirrors the main-process
+ *  `WEB_SEARCH_KEY_ID`. Its presence (+ the webSearchEnabled gate) decides whether the
+ *  harness `web search` tool is actually live for native desks. */
+const WEB_SEARCH_KEY_ID = 'web-search';
+
 export function ProviderModelPicker({ selectedModelId, onChange, accent = 'sky' }: ProviderModelPickerProps) {
   // Read the registry once per render; it is frozen data (E002), so memoizing on
   // nothing is safe and keeps the grouped list stable across re-renders.
@@ -84,6 +89,19 @@ export function ProviderModelPicker({ selectedModelId, onChange, accent = 'sky' 
     return () => {
       alive = false;
     };
+  }, []);
+
+  // Harness-provided capabilities are gated by operator config, read once on mount
+  // (same best-effort pattern as presence). These are NOT provider-native — they are
+  // tools the harness adds to native (non-Claude) desks regardless of the provider, so
+  // their on/off state comes from config, not the registry.
+  const [harnessCfg, setHarnessCfg] = useState<{ webSearchEnabled?: boolean; nativeBashEnabled?: boolean }>({});
+  useEffect(() => {
+    let alive = true;
+    window.cth?.getConfig?.()
+      .then((c) => { if (alive) setHarnessCfg(c ?? {}); })
+      .catch(() => { /* defaults: everything off */ });
+    return () => { alive = false; };
   }, []);
 
   /** A model needs credentials when its DERIVED provider (DR-1) has no stored key.
@@ -184,11 +202,19 @@ export function ProviderModelPicker({ selectedModelId, onChange, accent = 'sky' 
                       </span>
                     </span>
                     <span style={{ display: 'flex', gap: 4, flexWrap: 'wrap', alignItems: 'center' }}>
+                      {/* Provider-native capabilities — hosted by the provider's API
+                          (the registry flags). A tooltip names the source so these are
+                          not confused with the harness chips below. */}
                       {CAPABILITY_TAGS.map(({ key, label }) => {
                         const supported = model.capabilities[key];
                         return (
                           <span
                             key={key}
+                            title={
+                              supported
+                                ? `Provider-native — hosted by ${provider.displayName}'s API`
+                                : `Not hosted by ${provider.displayName}'s API`
+                            }
                             style={{
                               padding: '1px 6px 0',
                               fontFamily: 'var(--cth-font-ui)',
@@ -206,6 +232,54 @@ export function ProviderModelPicker({ selectedModelId, onChange, accent = 'sky' 
                           </span>
                         );
                       })}
+                      {/* Harness-provided capabilities — tools the harness adds to native
+                          (non-Claude) desks, INDEPENDENT of the provider. Distinct mint
+                          chips with a `+` so they read as a different source; dimmed (not
+                          struck) when available-but-off. Resolves the "web search struck
+                          through but I enabled it" confusion: the provider flag is false,
+                          yet the harness tool is live. */}
+                      {provider.id !== 'anthropic' &&
+                        ([
+                          {
+                            label: 'web search',
+                            on: harnessCfg.webSearchEnabled === true && presence[WEB_SEARCH_KEY_ID] === true,
+                            title:
+                              harnessCfg.webSearchEnabled === true && presence[WEB_SEARCH_KEY_ID] === true
+                                ? 'Harness tool (Brave Search) — available to this desk regardless of the provider'
+                                : 'Harness web-search tool — turn it on in Settings → Web search and add a Brave key'
+                          },
+                          {
+                            label: 'files · grep',
+                            on: true,
+                            title: 'Harness coding tools (read/write/edit/list/grep) — always on for native desks'
+                          },
+                          {
+                            label: 'shell',
+                            on: harnessCfg.nativeBashEnabled === true,
+                            title:
+                              harnessCfg.nativeBashEnabled === true
+                                ? 'Harness bash tool — on (cwd-sandboxed + circuit-breaker watched)'
+                                : 'Harness bash tool — enable in Settings → Native shell'
+                          }
+                        ] as { label: string; on: boolean; title: string }[]).map((chip) => (
+                          <span
+                            key={`harness-${chip.label}`}
+                            title={chip.title}
+                            style={{
+                              padding: '1px 6px 0',
+                              fontFamily: 'var(--cth-font-ui)',
+                              fontSize: 11,
+                              lineHeight: '16px',
+                              color: chip.on ? 'var(--cth-ink-900)' : 'var(--cth-ink-300)',
+                              background: 'var(--cth-mint-light)',
+                              boxShadow: chip.on
+                                ? 'inset 0 0 0 1px var(--cth-mint)'
+                                : 'inset 0 0 0 1px var(--cth-ink-300)'
+                            }}
+                          >
+                            +{chip.label}
+                          </span>
+                        ))}
                       {/* T025 {FR-010} — "needs credentials" affordance per uncredentialed
                           provider; the model stays selectable (NOT blocked — DR-6). */}
                       {uncredentialed && (

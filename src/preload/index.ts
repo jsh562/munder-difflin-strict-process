@@ -117,6 +117,10 @@ export interface HarnessConfig {
   /** Operator gate: allow native (DeepSeek/Minimax) desks to use the web_search tool
    *  (the Brave Search API key rides the credentials store under 'web-search'). */
   webSearchEnabled?: boolean;
+  /** Operator gate: allow native (DeepSeek/Minimax) desks to use the `bash` tool
+   *  (still cwd-sandboxed + breaker-watched + destructive-command guarded). OFF by
+   *  default. Claude desks are unaffected (their shell rides the CLI's own gate). */
+  nativeBashEnabled?: boolean;
   slackEnabled?: boolean;
   slackSigningSecret?: string;
   slackBotToken?: string;
