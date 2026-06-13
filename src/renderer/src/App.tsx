@@ -5,6 +5,7 @@ import type { HarnessConfig } from '@/store/config';
 import { OfficeFloor } from '@/scene/office/OfficeFloor';
 import { useHive } from '@/hooks/useHive';
 import { MemoryPanel } from '@/components/MemoryPanel';
+import { TaskBoardOverlay } from '@/components/TaskBoardOverlay';
 import { AgentDetailPanel } from '@/components/AgentDetailPanel';
 import { AgentStrip } from '@/components/AgentStrip';
 import { AddAgentModal } from '@/components/AddAgentModal';
@@ -30,6 +31,7 @@ export function App() {
   const godStatus = useStore(s => s.godStatus);
   const fullscreenAgentId = useStore(s => s.fullscreenAgentId);
   const fullscreenFilePath = useStore(s => s.fullscreenFilePath);
+  const tasksBoardOpen = useStore(s => s.tasksBoardOpen);
   const sidebarWidth = useStore(s => s.sidebarWidth);
   const setSidebarWidth = useStore(s => s.setSidebarWidth);
 
@@ -171,6 +173,7 @@ export function App() {
         <div style={{ flex: 1, minHeight: 0, minWidth: 0, position: 'relative' }}>
           <OfficeFloor />
           <MemoryPanel />
+          {tasksBoardOpen && <TaskBoardOverlay />}
           {agentCount === 0 && godStatus === 'booting' && <MichaelBooting />}
           {agentCount === 0 && godStatus !== 'booting' && (
             <div style={{

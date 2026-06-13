@@ -313,6 +313,12 @@ const api = {
   // ─── Terminal.app ────────────────────────────────────────────────────────
   openTerminalAt: (cwd: string): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('terminal:openAtFolder', cwd),
+  /** Reveal a folder in the OS file manager (Explorer/Finder). */
+  revealFolder: (cwd: string): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('folder:reveal', cwd),
+  /** Open a folder in the user's editor (VS Code `code` if on PATH, else reveal it). */
+  openInEditor: (cwd: string): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('folder:openInEditor', cwd),
 
   // ─── Clipboard ─────────────────────────────────────────────────────────────
   copyToClipboard: (text: string): Promise<{ ok: boolean; error?: string }> =>

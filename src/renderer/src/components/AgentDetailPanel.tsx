@@ -9,6 +9,8 @@ import { StructuredRunTab } from './StructuredRunTab';
 import { useNativeAgentEvents } from '@/hooks/useNativeAgentEvents';
 import { MessageQueueComposer } from './MessageQueueComposer';
 import { AssistantRoleNote } from './AssistantRoleNote';
+import { AgentRoleControl } from './AgentRoleControl';
+import { AgentWorkspaceControl } from './AgentWorkspaceControl';
 import { CommandCenterPanel } from './CommandCenterPanel';
 import { disposeTerminal } from './terminalPool';
 import { SidebarTabs } from './SidebarTabs';
@@ -96,11 +98,13 @@ export function AgentDetailPanel({ agent }: AgentDetailPanelProps) {
   // Michael gets the full command-center dashboard instead of the plain panel.
   if (agent.isGod) return <CommandCenterPanel agent={agent} />;
 
-  const openTerminal = async () => {
+  // Open the desk's working directory: reveal in the file manager, open in the editor, or
+  // open a terminal — all cross-platform (the macOS-only `open` is gone). Shared status.
+  const runFolderAction = async (run: () => Promise<{ ok: boolean; error?: string }>) => {
     setOpenTerminalState('opening');
     setOpenTerminalError(undefined);
     try {
-      const result = await window.cth.openTerminalAt(agent.cwd);
+      const result = await run();
       if (result.ok) {
         setOpenTerminalState('ok');
         setTimeout(() => setOpenTerminalState('idle'), 1500);
@@ -178,10 +182,17 @@ export function AgentDetailPanel({ agent }: AgentDetailPanelProps) {
             }}>{agent.project}</span>
           </div>
         </div>
-        <PixelButton variant="secondary" size="sm" onClick={openTerminal} disabled={openTerminalState === 'opening'}>
-          <span title={`open Terminal.app at ${agent.cwd}`} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+        {/* Open the desk's working directory: reveal folder · open in editor · open terminal */}
+        <PixelButton variant="secondary" size="sm" onClick={() => void runFolderAction(() => window.cth.revealFolder(agent.cwd))} disabled={openTerminalState === 'opening'}>
+          <span title={`reveal folder: ${agent.cwd}`} style={{ display: 'inline-flex', alignItems: 'center' }}><Icon name="folder" /></span>
+        </PixelButton>
+        <PixelButton variant="secondary" size="sm" onClick={() => void runFolderAction(() => window.cth.openInEditor(agent.cwd))} disabled={openTerminalState === 'opening'}>
+          <span title={`open in editor: ${agent.cwd}`} style={{ display: 'inline-flex', alignItems: 'center' }}><Icon name="code" /></span>
+        </PixelButton>
+        <PixelButton variant="secondary" size="sm" onClick={() => void runFolderAction(() => window.cth.openTerminalAt(agent.cwd))} disabled={openTerminalState === 'opening'}>
+          <span title={`open terminal at: ${agent.cwd}`} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
             <Icon name="terminal" />
-            {openTerminalState === 'opening' ? '...' : openTerminalState === 'ok' ? 'ok' : openTerminalState === 'error' ? 'err' : 'open'}
+            {openTerminalState === 'opening' ? '…' : openTerminalState === 'ok' ? 'ok' : openTerminalState === 'error' ? 'err' : ''}
           </span>
         </PixelButton>
         {(isReal || isNative) && (
@@ -206,6 +217,19 @@ export function AgentDetailPanel({ agent }: AgentDetailPanelProps) {
           for a native desk (its tools are denied in main + the renderer leaves it
           alone while paused). */}
       {(isReal || isNative) && <AgentControlStrip agentId={agent.id} />}
+
+      {/* Roles + workspace — edit this desk's capability roles and change its working
+          directory (a cwd change restarts it in the new folder). Workers only. */}
+      {!agent.isAssistant && (
+        <div style={{
+          display: 'flex', flexDirection: 'column', gap: 6,
+          padding: '6px 8px', background: 'var(--cth-paper-100)',
+          borderBottom: '1px solid var(--cth-ink-300)', flexShrink: 0
+        }}>
+          <AgentRoleControl agent={agent} />
+          <AgentWorkspaceControl agent={agent} />
+        </div>
+      )}
 
       {/* Tabs */}
       <SidebarTabs current={sidebarTab} accent={agent.accent} onChange={setSidebarTab} />

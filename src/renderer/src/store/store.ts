@@ -147,6 +147,8 @@ interface State {
   addAgentOpen: boolean;
   fullscreenAgentId: string | null;
   fullscreenFilePath: string | null;
+  /** When true, the big task board is open over the office (center area). */
+  tasksBoardOpen: boolean;
   sidebarWidth: number;
   sidebarTab: SidebarTab;
   godStatus: GodStatus;
@@ -196,6 +198,9 @@ interface State {
   /** Set an agent's capability roles (worker / integrator) and PERSIST. Pair with the
    *  `hiveSetRoles` IPC so the registry (the gate's source of truth) matches. */
   setAgentRoles: (id: string, roles: AgentRole[]) => void;
+  /** Set an agent's working directory and PERSIST (mirrors the registry cwd a respawn
+   *  rewrites). Used by the "change workspace" control. */
+  setAgentCwd: (id: string, cwd: string) => void;
   pushFeed: (id: string, line: string) => void;
   addAgent: (agent: Agent) => void;
   removeAgent: (id: string) => void;
@@ -220,6 +225,7 @@ interface State {
   setAddAgentOpen: (open: boolean) => void;
   setFullscreen: (id: string | null) => void;
   setFullscreenFile: (path: string | null) => void;
+  setTasksBoardOpen: (on: boolean) => void;
   setSidebarWidth: (px: number) => void;
   setSidebarTab: (tab: SidebarTab) => void;
   setFleetDefaultModel: (m: string | null) => void;
@@ -415,6 +421,7 @@ export const useStore = create<State>((set) => ({
   addAgentOpen: false,
   fullscreenAgentId: null,
   fullscreenFilePath: null,
+  tasksBoardOpen: false,
   sidebarWidth: initialSidebarWidth,
   sidebarTab: initialSidebarTab,
   godStatus: 'booting',
@@ -483,6 +490,13 @@ export const useStore = create<State>((set) => ({
     set((s) => {
       if (!s.agents.some((a) => a.id === id)) return s;
       const agents = s.agents.map((a) => (a.id === id ? { ...a, roles } : a));
+      persistAgents(agents, s.selectedId);
+      return { agents };
+    }),
+  setAgentCwd: (id, cwd) =>
+    set((s) => {
+      if (!s.agents.some((a) => a.id === id)) return s;
+      const agents = s.agents.map((a) => (a.id === id ? { ...a, cwd, project: cwd.split(/[\\/]/).filter(Boolean).pop() ?? a.project } : a));
       persistAgents(agents, s.selectedId);
       return { agents };
     }),
@@ -617,6 +631,7 @@ export const useStore = create<State>((set) => ({
   setAddAgentOpen: (open) => set({ addAgentOpen: open }),
   setFullscreen: (id) => set({ fullscreenAgentId: id }),
   setFullscreenFile: (path) => set({ fullscreenFilePath: path }),
+  setTasksBoardOpen: (on) => set({ tasksBoardOpen: on }),
   setSidebarWidth: (px) => {
     const clamped = Math.min(1200, Math.max(320, Math.round(px)));
     try { window.localStorage.setItem(LS_SIDEBAR_WIDTH, String(clamped)); } catch { /* noop */ }

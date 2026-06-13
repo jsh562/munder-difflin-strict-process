@@ -347,7 +347,7 @@ function nativeGodPrompt(godIntegrates: boolean): string {
       : '- RUN THE BOARD (live source of truth): at turn start reconcile it — hive_list_tasks, fix stale cards with hive_update_task. You assign + reprioritize; the desk holding the INTEGRATOR role verifies "review" cards and signs them off to "done" — keep it fed and unblocked.',
     godIntegrates
       ? '- INTEGRATE finished work: each worker commits its slice on its own worktree branch (hive_list_agents shows each desk\'s repo + branch). On a "review" card, hive_integrate (no apply) to review the commits/diff, then hive_integrate apply:true to merge into the repo\'s base — then mark the card "done". A reported conflict means send it back to the author. You never hand-edit project files; integration is your high-leverage job.'
-      : '- DELEGATE INTEGRATION: you do NOT hold the integrator role — when a card reaches "review", route it (hive_send_message) to the desk that has the integrator role (see hive_list_agents) to merge + sign off. You never merge or hand-edit yourself.',
+      : '- DELEGATE INTEGRATION: you do NOT hold the integrator role. When a card reaches "review", find the desk whose roles include "integrator" via hive_list_agents and hive_send_message it the task id + its repo + branch to merge + sign off (the system also auto-pings that desk on "review", so this is a backstop). You never merge or hand-edit yourself.',
     '- YOU CANNOT TOUCH PROJECT FILES: your working directory is your own scratch workspace, NOT any project repo — your tools are sandboxed to it, so you literally cannot read or edit project code. Each project lives in a worker desk\'s own repo, so ALL implementation MUST be delegated; trying to do it yourself will just fail.',
     '- IF NO WORKER DESKS ARE ALIVE to take the work, do NOT attempt it yourself — tell the operator exactly which team/desks to spawn, then orchestrate once they are up.',
     '- COORDINATE: answer agents\' questions so the team runs autonomously; read a peer\'s memory with hive_read_memory when you need context; record durable decisions with write_memory.',
@@ -358,7 +358,8 @@ function nativeGodPrompt(godIntegrates: boolean): string {
 // Injected into a NON-god desk that holds the `integrator` role (a dedicated integrator).
 const NATIVE_AGENT_INTEGRATOR_PROMPT = [
   'You also hold the INTEGRATOR role: you review + merge other desks\' finished work (you do not re-implement it).',
-  '- hive_list_agents shows each desk\'s repo + worktree branch. When a task card is in "review", use hive_integrate (no apply) to review the commits + diff, then hive_integrate apply:true to merge that branch into the repo\'s base branch, then hive_update_task it to "done".',
+  '- You are PINGED automatically when a card enters "review"; you should ALSO, on each wake, scan hive_list_tasks for any cards in "review" and integrate them — don\'t wait to be asked.',
+  '- hive_list_agents shows each desk\'s repo + worktree branch. For a "review" card, use hive_integrate (no apply) to review the commits + diff, then hive_integrate apply:true to merge that branch into the repo\'s base branch, then hive_update_task it to "done".',
   '- A reported merge conflict aborts cleanly — send the card back to its author (hive_send_message) to rebase/resolve; never force it.'
 ].join('\n');
 
@@ -1103,19 +1104,51 @@ ipcMain.handle('dialog:chooseFolder', async (evt) => {
   return { ok: true as const, path: res.filePaths[0] };
 });
 
-// ─── IPC: Terminal.app at a folder ──────────────────────────────────────────
-ipcMain.handle('terminal:openAtFolder', async (_evt, cwd: unknown) => {
-  if (typeof cwd !== 'string' || cwd.length === 0) return { ok: false, error: 'invalid cwd' };
-  return new Promise<{ ok: boolean; error?: string }>((resolve) => {
-    const p = spawn('open', ['-a', 'Terminal', cwd]);
-    let err = '';
-    p.stderr.on('data', (d) => { err += d.toString(); });
-    p.on('error', (e) => resolve({ ok: false, error: e.message }));
-    p.on('close', (code) => {
-      if (code === 0) resolve({ ok: true });
-      else resolve({ ok: false, error: err.trim() || `open exited ${code}` });
-    });
+// ─── IPC: open a desk's working directory (folder / editor / terminal) ───────
+// Cross-platform actions on an agent's cwd. `folder:reveal` + `folder:openInEditor` use a
+// detached child + resolve immediately (the launcher exits even though the app stays open).
+
+/** Launch a detached process; resolve ok unless the spawn itself errors (ENOENT). */
+function launch(cmd: string, args: string[], opts: { cwd?: string; shell?: boolean } = {}): Promise<{ ok: boolean; error?: string }> {
+  return new Promise((resolve) => {
+    try {
+      const p = spawn(cmd, args, { detached: true, stdio: 'ignore', windowsHide: false, ...opts });
+      p.on('error', (e) => resolve({ ok: false, error: e.message }));
+      p.unref();
+      // No 'close' wait — a launcher (open/explorer/wt) exits fast; treat a clean spawn as ok.
+      setTimeout(() => resolve({ ok: true }), 150);
+    } catch (e) {
+      resolve({ ok: false, error: e instanceof Error ? e.message : String(e) });
+    }
   });
+}
+
+ipcMain.handle('folder:reveal', async (_evt, cwd: unknown) => {
+  if (typeof cwd !== 'string' || !cwd) return { ok: false, error: 'invalid cwd' };
+  const err = await shell.openPath(cwd); // '' on success
+  return err ? { ok: false, error: err } : { ok: true };
+});
+
+ipcMain.handle('folder:openInEditor', async (_evt, cwd: unknown) => {
+  if (typeof cwd !== 'string' || !cwd) return { ok: false, error: 'invalid cwd' };
+  // VS Code's `code` launcher (a .cmd shim on Windows → needs shell:true). Fall back to
+  // revealing the folder if `code` isn't on PATH.
+  const res = await launch('code', [cwd], { shell: process.platform === 'win32' });
+  if (res.ok) return res;
+  const err = await shell.openPath(cwd);
+  return err ? { ok: false, error: `no 'code' on PATH; ${err}` } : { ok: true };
+});
+
+ipcMain.handle('terminal:openAtFolder', async (_evt, cwd: unknown) => {
+  if (typeof cwd !== 'string' || !cwd) return { ok: false, error: 'invalid cwd' };
+  if (process.platform === 'darwin') return launch('open', ['-a', 'Terminal', cwd]);
+  if (process.platform === 'win32') {
+    // Prefer Windows Terminal (`wt -d <cwd>`); fall back to a cmd window at the folder.
+    const wt = await launch('wt', ['-d', cwd], { shell: true });
+    return wt.ok ? wt : launch('cmd', ['/c', 'start', 'cmd', '/k', `cd /d "${cwd}"`], { shell: true });
+  }
+  const xterm = await launch('x-terminal-emulator', ['--working-directory', cwd]);
+  return xterm.ok ? xterm : launch('xdg-open', [cwd]);
 });
 
 // ─── IPC: config ────────────────────────────────────────────────────────────

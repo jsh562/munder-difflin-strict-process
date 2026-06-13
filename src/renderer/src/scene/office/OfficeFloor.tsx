@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react';
-import { Application, Container, Ticker, Texture } from 'pixi.js';
+import { Application, Container, Graphics, Text, Ticker, Texture } from 'pixi.js';
 // PixiJS uses new Function() internally, blocked by Electron CSP — this patches it.
 import 'pixi.js/unsafe-eval';
 import { useStore, type Agent } from '@/store/store';
@@ -200,6 +200,42 @@ export function OfficeFloor() {
         }
       };
       addZoneSeats('boardroom');       // conference room overflow
+
+      // A clickable KANBAN BOARD on the conference-room wall — opens the big task board
+      // over the office (TaskBoardOverlay). Drawn (no art asset); tracks the map (in
+      // `world`) so it pans/zooms. Mirrors the Character onClick pattern.
+      const boardZone = mapRenderer.getZone('boardroom');
+      if (boardZone) {
+        const ts = mapRenderer.tileSize;
+        const cols = [0x8fc7e8, 0xf2d27a, 0x9bd9a8];
+        const bw = Math.min(boardZone.width, 4) * ts;
+        const bh = 1.6 * ts;
+        const bx = (boardZone.x + Math.max(0, (boardZone.width - 4) / 2)) * ts;
+        const by = boardZone.y * ts - bh * 0.2;
+        const board = new Container();
+        board.position.set(bx, by);
+        const g = new Graphics();
+        g.rect(0, 0, bw, bh).fill(0xfbf7ec).stroke({ width: 3, color: 0x1c1410 });
+        g.rect(0, 0, bw, bh * 0.22).fill(0xe8dfc8);
+        const pad = bw * 0.04;
+        const colW = (bw - pad * (cols.length + 1)) / cols.length;
+        const colY = bh * 0.3;
+        const colH = bh * 0.62;
+        cols.forEach((c, i) => {
+          const cx = pad + i * (colW + pad);
+          g.rect(cx, colY, colW, colH).fill(c).stroke({ width: 1.5, color: 0x1c1410 });
+          g.rect(cx + colW * 0.12, colY + colH * 0.1, colW * 0.76, colH * 0.18).fill(0xffffff);
+          g.rect(cx + colW * 0.12, colY + colH * 0.36, colW * 0.76, colH * 0.18).fill(0xffffff);
+        });
+        board.addChild(g);
+        const label = new Text({ text: 'TASKS', style: { fontFamily: 'monospace', fontSize: Math.round(ts * 0.28), fill: 0x1c1410, fontWeight: 'bold' } });
+        label.position.set(6, 2);
+        board.addChild(label);
+        board.eventMode = 'static';
+        board.cursor = 'pointer';
+        board.on('pointertap', () => useStore.getState().setTasksBoardOpen(true));
+        world.addChild(board);
+      }
       // The bottom-right open area is the cafeteria (break room) — see the
       // coffee-break director below. It is deliberately NOT added as overflow
       // desk seating, so the café tables stay free for breaks.

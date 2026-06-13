@@ -30,6 +30,7 @@ import { COMMAND_GROUPS } from '../shared/claudeCommands';
 // The mailbox + task-ledger vocabulary is owned by @jsh562/agent-core (so the extracted
 // coding toolkit is host-agnostic); re-exported below so existing `import { HiveMessage }
 // from '../hive'` consumers across the app are unchanged.
+import { reconcileBlocked } from '@jsh562/agent-core';
 import type { MessageAct, HiveMessage, HiveTask, AgentRole } from '@jsh562/agent-core';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -644,15 +645,58 @@ export class HiveManager {
     return root ? this.readJson(join(root, 'tasks.json'), { tasks: [] }) : { tasks: [] };
   }
 
-  /** Persist the task ledger to hive/tasks.json and commit it. Mirrors the
-   *  board/message persist pattern: write JSON, log the change, single-commit. */
+  /** The current task ledger as a typed array (empty when none). */
+  private taskList(): HiveTask[] {
+    const t = this.tasks() as { tasks?: HiveTask[] } | undefined;
+    return Array.isArray(t?.tasks) ? t!.tasks : [];
+  }
+
+  /** Pick who should integrate a card: a dedicated (non-god) integrator desk if one
+   *  exists, else the god. Excludes the card's own assignee. */
+  private integratorFor(assignee?: string): string | null {
+    const reg = this.registry();
+    const dedicated = Object.values(reg.agents).find(
+      (a) => !a.archived && !a.isGod && a.id !== assignee && (a.roles ?? []).includes('integrator')
+    );
+    return dedicated?.id ?? reg.godId ?? null;
+  }
+
+  /** Fire best-effort notifications on task transitions (diff prev→next): a card that was
+   *  auto-unblocked (blocked→todo) pings its assignee to resume; a card that newly entered
+   *  `review` pings the integrator to merge + sign off. From 'system' so it's never the
+   *  recipient itself (the router drops self-sends). */
+  private notifyTaskTransitions(prev: HiveTask[], next: HiveTask[]): void {
+    const before = new Map(prev.map((t) => [t.id, t]));
+    for (const t of next) {
+      const was = before.get(t.id);
+      if (was?.status === 'blocked' && t.status === 'todo' && t.assignee) {
+        this.send({ to: t.assignee, act: 'inform', subject: `Unblocked: ${t.title}`,
+          body: `Task "${t.title}" (${t.id}) is unblocked — its blocker(s) are done. You can resume it.` }, 'system');
+      }
+      if (t.status === 'review' && was?.status !== 'review') {
+        const to = this.integratorFor(t.assignee);
+        if (to && to !== t.assignee) {
+          this.send({ to, act: 'request', subject: `Integrate: ${t.title}`,
+            body: `Task "${t.title}" (${t.id}) is in review and ready to integrate. Find its repo + branch via hive_list_agents, then hive_integrate (preview) → apply, and mark it done.` }, 'system');
+        }
+      }
+    }
+  }
+
+  /** Persist the task ledger to hive/tasks.json and commit it. Auto-reconciles blockers
+   *  (drops done blockers; flips a fully-unblocked card back to todo) BEFORE persisting,
+   *  then notifies on transitions (unblocked → assignee; entered review → integrator). The
+   *  single chokepoint for both the agent tool path and the renderer IPC. */
   writeTasks(tasks: HiveTask[]): void {
     const root = this.root();
     if (!root) return;
     this.ensureHive();
-    this.writeJson(join(root, 'tasks.json'), { tasks });
-    this.appendLog({ kind: 'tasks', count: tasks.length });
-    this.commit(`hive: tasks (${tasks.length})`);
+    const prev = this.taskList();
+    const next = reconcileBlocked(tasks);
+    this.writeJson(join(root, 'tasks.json'), { tasks: next });
+    this.appendLog({ kind: 'tasks', count: next.length });
+    this.commit(`hive: tasks (${next.length})`);
+    try { this.notifyTaskTransitions(prev, next); } catch (e) { console.error('[hive] task notify failed:', e); }
   }
   memory(id: string): string {
     const p = join(this.agentDir(id), 'memory.md');
