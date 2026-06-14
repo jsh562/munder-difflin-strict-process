@@ -22,6 +22,7 @@ export function AgentStrip({ config }: AgentStripProps) {
   const setAddAgentOpen = useStore(s => s.setAddAgentOpen);
   const paused = useStore(s => s.paused);
   const godDesired = useStore(s => s.godDesired);
+  const liveness = useStore(s => s.liveness);
   // Live restart-required settings ([[restartSig]]) — a desk whose spawn snapshot differs is
   // running with outdated settings and gets a ⟳ "restart to apply" marker on its card.
   const liveSig = restartSigOf({
@@ -118,6 +119,7 @@ export function AgentStrip({ config }: AgentStripProps) {
               ? `Changed since this desk spawned: ${staleKeys.map((k) => RESTART_SIG_LABELS[k]).join(', ')} — click to restart and apply`
               : undefined}
             onRestart={() => scheduleDeskRestart(a.id)}
+            warm={a.id in liveness ? liveness[a.id] : undefined}
             onClick={() => select(a.id)}
           />
         );

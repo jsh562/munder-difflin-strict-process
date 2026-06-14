@@ -193,6 +193,11 @@ interface State {
    *  queue-drain (#4) leave it alone, so a paused agent truly idles. */
   paused: Record<string, boolean>;
   setPaused: (id: string, on: boolean) => void;
+  /** Per-agent LIVENESS (id → has a live worker right now), mirrored from main's `fleet:state`
+   *  push. Drives the warm●/cold○ dot: warm = live worker; a desk on the floor with no entry or
+   *  `false` is cold (parked, revives on delegation). Distinct from `status` (what it's DOING). */
+  liveness: Record<string, boolean>;
+  setLiveness: (map: Record<string, boolean>) => void;
   select: (id: string) => void;
   updateAgent: (id: string, patch: Partial<Agent>) => void;
   /** E005 {FR-003} — re-assign an existing desk to an explicit model (DR-1 state
@@ -466,6 +471,8 @@ export const useStore = create<State>((set) => ({
   },
   paused: {},
   setPaused: (id, on) => set((s) => ({ paused: { ...s.paused, [id]: on } })),
+  liveness: {},
+  setLiveness: (map) => set({ liveness: map }),
   select: (id) => set((s) => { persistAgents(s.agents, id); return { selectedId: id }; }),
   // E005 INVARIANT (DR-4/DR-9/SC-004) — an agent's `model`/`assignmentSource` are a
   // creation-time SNAPSHOT of the fleet default (or an explicit pick), frozen onto

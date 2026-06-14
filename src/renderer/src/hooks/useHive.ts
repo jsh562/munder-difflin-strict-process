@@ -466,7 +466,9 @@ export function useHive(config: HarnessConfig | null): void {
   //     (displayStatus layers those on top). Honors pause / stopped-god / breaker pins like #2e.
   useEffect(() => {
     return window.cth.onFleetState?.((state) => {
-      const { updateAgent, agents, paused, godDesired: desired } = useStore.getState();
+      const { updateAgent, agents, paused, godDesired: desired, setLiveness } = useStore.getState();
+      // Mirror per-desk liveness (warm = live worker) for the warm●/cold○ dot.
+      setLiveness(Object.fromEntries(state.map((s) => [s.id, s.running])));
       for (const s of state) {
         const a = agents.find((x) => x.id === s.id);
         if (!a) continue;
@@ -480,6 +482,25 @@ export function useHive(config: HarnessConfig | null): void {
       }
     });
   }, []);
+
+  // 2g) Boot floor→registry sync: a native desk the operator keeps on the floor is NOT retired,
+  //     even when its worker is currently cold (revive-on-demand). Earlier sessions wrongly
+  //     archived a native desk on EVERY worker exit, so the god's roster (built from the registry)
+  //     read still-wanted role-holders as archived/unavailable. Un-archive the floor's native
+  //     desks ONCE on boot so they show as AVAILABLE (cold); idempotent (main's setArchived no-ops
+  //     when unchanged) and LAZY (does not respawn — they wake when the god delegates to them).
+  const didUnarchiveFloor = useRef(false);
+  useEffect(() => {
+    if (!config?.onboardingComplete || didUnarchiveFloor.current) return;
+    didUnarchiveFloor.current = true;
+    const { agents, fleetDefaultModel } = useStore.getState();
+    for (const a of agents) {
+      if (a.isGod || a.isAssistant) continue;
+      if (isNativeRuntimeDesk(a, fleetDefaultModel)) {
+        void window.cth.hiveSetArchived(a.id, false).catch(() => { /* best-effort */ });
+      }
+    }
+  }, [config?.onboardingComplete]);
 
   // 2c) Context gauge backfill: poll each live agent's current context size
   //     (tokens) from its session transcript — only until the status line

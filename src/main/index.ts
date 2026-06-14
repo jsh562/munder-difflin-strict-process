@@ -475,6 +475,7 @@ function nativeGodPrompt(godRoles: AgentRole[]): string {
   return [
     'You are the GOD / ORCHESTRATOR of this hive of agents (you are "Michael"). Your job is to ORCHESTRATE, not implement: keep awareness of the whole team and delegate the work.',
     '- KNOW THE TEAM: before delegating, call hive_list_agents to see who exists, who is running, and each desk\'s roles — assign to the best AVAILABLE desk, never blind.',
+    '- COLD ≠ GONE: a desk in hive_list_agents that holds a role but shows running:false is COLD (parked) — NOT gone. It WAKES the moment you delegate/message it (revive-on-demand). Treat a cold role-holder as AVAILABLE and delegate to it. NEVER unassign a card or declare "no desk available" for a role some floor desk holds — that just strands the work.',
     '- DELEGATE: decompose a request into slices; for each, hive_add_task (a card assigned to a worker desk) and hive_send_message that desk a short 4-part brief (objective / output / tools+references / boundaries+done). Different slices can go to different desks in parallel. Do NOT do the grunt implementation yourself.',
     '- THE FLOW (worker → reviewer → integrator): a WORKER writes + commits its slice on its own branch, RUNS the build/tests, and moves the card "doing"→"review". A REVIEWER reads it (read-only, comments only) and either approves it to "integrate" or sends it back to "doing". An INTEGRATOR re-runs the test suite as the merge gate, merges an "integrate" card, and signs it off to "done". "Done" means tested. Keep cards moving along this chain.',
     '- RUN THE BOARD (live source of truth): at turn start reconcile it — hive_list_tasks, fix stale cards with hive_update_task. You set assign/reprioritize. When several reviewers exist, all are pinged but only the first to advance a card lands; integration is routed to ONE integrator to avoid a double-merge.',
@@ -536,6 +537,7 @@ function nativeSddpGodPrompt(): string {
     '- QC: a QC desk runs tests/lint/security + verifies stories vs spec → it sets .qc-passed, or files bug tasks back to workers.',
     '- Integrate: an INTEGRATOR merges only AFTER .qc-passed, then signs off (done).',
     '- You ORCHESTRATE + GATE; you do not author or implement. Use hive_feature_status to see each feature\'s phase. Run features as a PIPELINE (one in Plan while another is in QC) and parallelize Implement across workers.',
+    '- COLD ≠ GONE: a desk in hive_list_agents holding a role but showing running:false is COLD (parked), not gone — it WAKES when you delegate/message it. Treat a cold planner/reviewer/qc/integrator as AVAILABLE and route the phase to it; NEVER stall a feature or unassign for lack of a role-holder that exists on the floor.',
     'The human operator is watching this transcript and can message you — surface anything genuinely critical.'
   ].join('\n');
 }
@@ -613,7 +615,13 @@ const nativeRuntime = new NativeRuntime({
     }
     return result;
   },
-  onWorkerExit: (id) => { archiveAgent(id); syncKeepAwake(); },
+  // A native worker exit is TRANSIENT, not a retire: the desk is revive-on-demand and stays on
+  // the operator's floor, so do NOT archive it (archiving would hide a still-wanted role-holder
+  // from the god's routing). Clear its turn state + drop its breaker counters; the desk reads as
+  // "cold" (archived:false, not running) and revives when the god delegates to it. Only an
+  // explicit operator KILL (onKill → hive:setArchived) retires a native desk. (Claude PTYs keep
+  // archiving via teardownPty — they aren't revive-on-demand.)
+  onWorkerExit: (id) => { markTurn(id, false); try { breaker.forget(id); } catch { /* best-effort */ } syncKeepAwake(); },
   usageFor: (id) => usageProvider.getAgentUsage(id),
   credentialEnvFor: (providerId) => injectionEnvForProvider(readConfig(), providerId),
   // Per-desk native preamble additions (the worker prepends these to its system prompt):
