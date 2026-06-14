@@ -71,7 +71,13 @@ export function AddAgentModal({ onClose, config }: AddAgentModalProps) {
     setCommand(buildSpawnCommand(config, id));
   };
   const [goal, setGoal] = useState('');
-  const [isolate, setIsolate] = useState(false);
+  // Workspace selection is STEERED to the registered project repos (the primary choice); a
+  // custom folder is the escape hatch. `repos` is local so a just-registered custom repo
+  // shows up as a chip immediately (the modal's `config` prop doesn't live-refresh).
+  const [repos, setRepos] = useState<string[]>(config.registeredRepos);
+  // When the operator picks a custom folder that is a git repo but isn't registered yet,
+  // offer to register it so the whole team can target it (and so integration recognizes it).
+  const [offerRegister, setOfferRegister] = useState<string | undefined>();
   // Capability roles. Worker (writes code) on by default; Reviewer (read-only comments)
   // and Integrator (merges others' branches) off — tick them for dedicated desks.
   const [roleWorker, setRoleWorker] = useState(true);
@@ -87,8 +93,22 @@ export function AddAgentModal({ onClose, config }: AddAgentModalProps) {
   const pickFolder = async () => {
     setError(undefined);
     const res = await window.cth.chooseFolder();
-    if (res.ok) setCwd(res.path);
-    else if (res.error !== 'cancelled') setError(res.error);
+    if (!res.ok) { if (res.error !== 'cancelled') setError(res.error); return; }
+    setCwd(res.path);
+    // Steer toward registration: if the picked folder is a git repo not already on the list,
+    // surface a one-click "register" so the team shares it (and integration recognizes it).
+    if (!repos.includes(res.path) && (await window.cth.gitIsRepo(res.path))) {
+      setOfferRegister(res.path);
+    } else {
+      setOfferRegister(undefined);
+    }
+  };
+
+  const registerRepo = async (path: string) => {
+    const next = Array.from(new Set([...repos, path]));
+    setRepos(next);
+    setOfferRegister(undefined);
+    await window.cth.updateConfig({ registeredRepos: next });
   };
 
   const submit = async () => {
@@ -117,8 +137,8 @@ export function AddAgentModal({ onClose, config }: AddAgentModalProps) {
       args,
       cols: 100,
       rows: 30,
-      // When set, the main process spawns this agent in its own git worktree.
-      isolate,
+      // Worker desks always get their own git worktree (the base tree is the integration
+      // target — see main's pty:spawn), so no per-agent isolate flag is needed.
       // Provision this agent in the hive (memory + mailbox + identity/protocol + roles).
       hive: {
         id,
@@ -216,13 +236,13 @@ export function AddAgentModal({ onClose, config }: AddAgentModalProps) {
               />
             </Row>
 
-            <Row label="Folder">
-              {config.registeredRepos.length > 0 && (
+            <Row label="Workspace (project repo)">
+              {repos.length > 0 ? (
                 <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 6 }}>
-                  {config.registeredRepos.map((r) => (
+                  {repos.map((r) => (
                     <button
                       key={r}
-                      onClick={() => setCwd(r)}
+                      onClick={() => { setCwd(r); setOfferRegister(undefined); }}
                       title={r}
                       style={{
                         padding: '3px 8px 1px',
@@ -240,20 +260,37 @@ export function AddAgentModal({ onClose, config }: AddAgentModalProps) {
                     </button>
                   ))}
                 </div>
+              ) : (
+                <div style={{ fontSize: 12, color: 'var(--cth-ink-500)', marginBottom: 6 }}>
+                  No project repos yet — pick one below (add more in Settings → Project repos).
+                </div>
               )}
+              {/* Escape hatch: a custom folder. Offered as the secondary action so the registered
+                  repos stay the primary choice. */}
               <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
                 <input
                   value={cwd}
-                  onChange={(e) => setCwd(e.target.value)}
+                  onChange={(e) => { setCwd(e.target.value); setOfferRegister(undefined); }}
                   placeholder="/path/to/your/project"
                   style={{ ...inputStyle, flex: 1, fontFamily: 'var(--cth-font-mono)', fontSize: 14 }}
                 />
                 <PixelButton variant="secondary" size="md" onClick={pickFolder}>
                   <span style={{ display: 'inline-flex', gap: 4, alignItems: 'center' }}>
-                    <Icon name="folder" /> pick
+                    <Icon name="folder" /> custom…
                   </span>
                 </PixelButton>
               </div>
+              {offerRegister && (
+                <div style={{
+                  display: 'flex', alignItems: 'center', gap: 8, marginTop: 6,
+                  padding: '6px 10px', background: 'var(--cth-mint-light)',
+                  boxShadow: 'inset 0 0 0 1px var(--cth-mint)', fontSize: 13
+                }}>
+                  <span style={{ flex: 1 }}>Register this repo so the whole team can target it?</span>
+                  <PixelButton variant="primary" size="sm" onClick={() => void registerRepo(offerRegister)}>register</PixelButton>
+                  <PixelButton variant="ghost" size="sm" onClick={() => setOfferRegister(undefined)}>not now</PixelButton>
+                </div>
+              )}
             </Row>
 
             <Row label="Model">
@@ -302,18 +339,6 @@ export function AddAgentModal({ onClose, config }: AddAgentModalProps) {
                 style={{ ...inputStyle, fontFamily: 'var(--cth-font-ui)', resize: 'none' }}
               />
             </Row>
-
-            <label style={{ display: 'flex', gap: 8, alignItems: 'center', cursor: 'pointer' }}>
-              <input
-                type="checkbox"
-                checked={isolate}
-                onChange={(e) => setIsolate(e.target.checked)}
-                style={{ width: 16, height: 16, cursor: 'pointer' }}
-              />
-              <span style={{ fontFamily: 'var(--cth-font-ui)', fontSize: 14, color: 'var(--cth-ink-900)' }}>
-                Git isolation (own worktree)
-              </span>
-            </label>
 
             <Row label="Roles">
               <div style={{ display: 'flex', gap: 16, alignItems: 'center', flexWrap: 'wrap' }}>

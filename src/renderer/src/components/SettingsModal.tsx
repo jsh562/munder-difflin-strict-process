@@ -23,6 +23,15 @@ type SlackConfig = HarnessConfig & {
   slackPort?: number;
 };
 
+/** A small helper line under a settings row (indented to align past the 140px label column). */
+const subLabelStyle: CSSProperties = {
+  paddingLeft: 152,
+  marginTop: -2,
+  fontSize: 12,
+  lineHeight: '16px',
+  color: 'var(--cth-ink-500)'
+};
+
 /** Pixel-aesthetic text input, mirroring AddAgentModal's inputStyle. */
 const slackInputStyle: CSSProperties = {
   width: '100%',
@@ -107,6 +116,26 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
       setWtSelected(new Set());
       await loadWorktrees();
     } finally { setWtBusy(false); }
+  };
+
+  // Project repos — the registered code repos the fleet works in (Add-Agent quick-picks,
+  // read-roots, integrate allow-list). This is the post-onboarding manager (onboarding seeds
+  // them once; there was no UI to add/remove afterward). Integration also auto-follows where
+  // desks actually work, so a repo a desk sits in is integratable even without this list —
+  // but registering one makes it a quick-pick + readable fleet-wide. Local state mirrors the
+  // config so changes reflect immediately.
+  const [projectRepos, setProjectRepos] = useState<string[]>(config.registeredRepos ?? []);
+  const addProjectRepo = async () => {
+    const res = await window.cth.chooseFolder();
+    if (!res.ok || projectRepos.includes(res.path)) return;
+    const next = [...projectRepos, res.path];
+    setProjectRepos(next);
+    await window.cth.updateConfig({ registeredRepos: next });
+  };
+  const removeProjectRepo = async (path: string) => {
+    const next = projectRepos.filter((r) => r !== path);
+    setProjectRepos(next);
+    await window.cth.updateConfig({ registeredRepos: next });
   };
 
   const toggleNotifications = async () => {
@@ -525,6 +554,34 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
                 }}>{config.harnessHome ?? '—'}</span>
                 <PixelButton variant="secondary" size="sm" onClick={pickNewHome}>change…</PixelButton>
               </div>
+              <div style={subLabelStyle}>Shared by every desk — holds the hive bookkeeping (board, tasks, each desk's memory + inbox). Not project code.</div>
+
+              {/* Project repos — the registered code repos the fleet works in. The post-onboarding
+                  manager (add/remove); also feeds Add-Agent quick-picks + read-roots. */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                  <span style={{ width: 140, flexShrink: 0, color: 'var(--cth-ink-500)', fontSize: 14 }}>Project repos</span>
+                  <span style={{ flex: 1, fontSize: 13, color: 'var(--cth-ink-500)' }}>
+                    {projectRepos.length === 0 ? 'none registered yet' : `${projectRepos.length} repo${projectRepos.length === 1 ? '' : 's'}`}
+                  </span>
+                  <PixelButton variant="secondary" size="sm" onClick={() => void addProjectRepo()}>
+                    <span style={{ display: 'inline-flex', gap: 4, alignItems: 'center' }}><Icon name="plus" /> add</span>
+                  </PixelButton>
+                </div>
+                {projectRepos.length > 0 && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 180, overflowY: 'auto', paddingLeft: 152 }}>
+                    {projectRepos.map((r) => (
+                      <div key={r} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 }}>
+                        <Icon name="folder" />
+                        <span style={{ flex: 1, fontFamily: 'var(--cth-font-mono, monospace)', color: 'var(--cth-ink-900)', wordBreak: 'break-all' }}>{r}</span>
+                        <PixelButton variant="ghost" size="sm" onClick={() => void removeProjectRepo(r)}><Icon name="x" /></PixelButton>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <div style={subLabelStyle}>The code repos your team works in. A desk's own workspace is integrated/read automatically — add other repos here. (A repo must be a git repo.)</div>
+              </div>
+
               {/* God workspace — Michael's own scratch dir (native god), kept separate
                   from the hive bookkeeping. Unset ⇒ auto `<harnessHome>/workspace`. */}
               <div style={{ display: 'flex', gap: 12, fontSize: 14, lineHeight: '20px', alignItems: 'center' }}>
@@ -538,6 +595,7 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
                   <PixelButton variant="secondary" size="sm" onClick={resetGodWorkspace}>reset</PixelButton>
                 )}
               </div>
+              <div style={subLabelStyle}>The god's own neutral folder (native god) — not a project. The god reads the project repos and delegates; give it a role to have it edit/merge directly.</div>
 
               {/* Worktrees — isolated agents' worktrees are kept on exit so committed work
                   survives for integration/review; this is where you bulk-clean stale ones. */}

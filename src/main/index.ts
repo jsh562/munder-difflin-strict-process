@@ -8,12 +8,13 @@ import {
   modelForRole, OPS_STANDUP_MISSION, HEARTBEAT_MISSION, type HarnessConfig, type ScheduledMission
 } from './config';
 import { listDir, readFileText, writeFileText } from './fs';
+import { normalizeRepoPath, normalizedPathSet } from './paths';
 import {
   getBranch, getStatus, getLog, getBranches, getAheadBehind, isRepo,
   addWorktree, removeWorktree, listWorktrees, planWorktree, type GitWorktree,
   previewMerge, mergeBranch, agentBranchFor
 } from './git';
-import { HiveManager, roleCanEditCode, type AgentMeta, type HiveMessage, type HiveTask, type AgentRole } from './hive';
+import { HiveManager, roleCanEditCode, canIntegrate as rolesCanIntegrate, canReview as rolesCanReview, boardCapabilityLine, type AgentMeta, type HiveMessage, type HiveTask, type AgentRole } from './hive';
 import { HookServer } from './hooks';
 import { CircuitBreaker, type BreakerInput } from './breaker';
 import type { UsageProvider } from './usage';
@@ -388,9 +389,10 @@ const agentToolDeps: AgentToolDeps = {
   },
   // Holds the `integrator` role? Gates hive_integrate + task sign-off. Read live from the
   // registry so toggling a role takes effect immediately (no respawn needed for the gate).
-  canIntegrate: (id) => (hive.registry().agents[id]?.roles ?? []).includes('integrator'),
+  // Uses the centralized predicate (won-agent-core) shared with the advertised-catalog filter.
+  canIntegrate: (id) => rolesCanIntegrate(hive.registry().agents[id]?.roles),
   // Holds the `reviewer` role? Lets it approve/send-back a card in `review`.
-  canReview: (id) => (hive.registry().agents[id]?.roles ?? []).includes('reviewer'),
+  canReview: (id) => rolesCanReview(hive.registry().agents[id]?.roles),
   // A desk's project repo — stamps a task's `project` on assignment (off-project detection).
   repoFor: (id) => repoForId(id),
   // SDDP mode (read live) gates the lifecycle hard-checks in hive_update_task; the feature
@@ -411,12 +413,17 @@ const agentToolDeps: AgentToolDeps = {
   // compare versions or read a peer's branch — the god/reviewer especially need this), while
   // WRITES stay confined to the desk's own cwd (resolveInsideCwd). Read wide, write narrow.
   readRoots: () => {
-    const home = readConfig().harnessHome;
+    const cfg = readConfig();
+    const home = cfg.harnessHome;
     return Array.from(new Set<string>([
       ...(home ? [home] : []), // the hive home: every desk reads memory/inbox/board/tasks + peers'
-      ...(readConfig().registeredRepos ?? []),
+      ...(cfg.registeredRepos ?? []),
       ...worktreeOrigins.values(),
-      ...worktreePaths.values()
+      ...worktreePaths.values(),
+      // Follow where desks actually work, so a roleless god / reviewer can READ a project repo
+      // (or the god workspace) even if it was never registered — mirrors the integrate allow-list.
+      ...Object.values(hive.registry().agents).filter((a) => !a.archived).map((a) => a.cwd),
+      ...(cfg.godWorkspace ? [cfg.godWorkspace] : [])
     ]));
   },
   // A desk may WRITE its OWN hive agent dir (memory.md, inbox/.done, scratch) — ungated by
@@ -424,11 +431,23 @@ const agentToolDeps: AgentToolDeps = {
   // hive ROOT, not under agents/<id>, so they stay tool-managed (single-committer).
   agentDir: (id) => { const r = hive.root(); return r ? join(r, 'agents', id) : null; },
   // The god's integration seam (hive_integrate): review/merge a worker's branch into its
-  // repo. Scoped to REGISTERED repos (+ live worktree origins) for safety; git runs in
-  // main (single-committer). apply:false previews, true merges (conflicts abort + report).
+  // repo. Scoped for safety to the repos the fleet actually WORKS IN — every desk's cwd, live
+  // worktree origins, the configured god workspace — plus the explicit registered-repos list.
+  // (So a project a desk sits in is integratable without separately "registering" it; an
+  // arbitrary path is still rejected.) Paths are NORMALIZED before comparison so a model-supplied
+  // separator/case/trailing-slash variant still matches. Git runs in main (single-committer);
+  // apply:false previews, true merges (conflicts abort + report).
   integrate: async (repo, branch, apply) => {
-    const allowed = new Set<string>([...(readConfig().registeredRepos ?? []), ...worktreeOrigins.values()]);
-    if (!allowed.has(repo)) return { content: `repo is not registered (cannot integrate): ${repo}`, success: false };
+    const cfg = readConfig();
+    const allowed = normalizedPathSet([
+      ...Object.values(hive.registry().agents).map((a) => a.cwd),
+      ...worktreeOrigins.values(),
+      ...(cfg.registeredRepos ?? []),
+      cfg.godWorkspace
+    ]);
+    if (!allowed.has(normalizeRepoPath(repo))) {
+      return { content: `repo is not a known project (no desk works there, and it is not registered): ${repo}`, success: false };
+    }
     if (!apply) {
       const p = await previewMerge(repo, branch);
       if (!p.ok) return { content: `preview failed: ${p.error}`, success: false };
@@ -643,15 +662,22 @@ const nativeRuntime = new NativeRuntime({
     const sddp = readConfig().sddpMode === true;
     if (agent?.isGod) {
       env.NATIVE_AGENT_GOD_PROMPT = sddp ? nativeSddpGodPrompt(roles) : nativeGodPrompt(roles);
-    } else if (sddp) {
-      // One SDDP preamble assembled from the roles the desk holds (planner/worker/
-      // reviewer/qc/integrator). agentWorker prepends it to the system prompt.
-      env.NATIVE_AGENT_SDDP_PROMPT = nativeSddpRolePrompt(roles);
     } else {
-      // A non-god desk can hold reviewer and/or integrator on top of (or instead of) worker;
-      // inject each role's preamble so its responsibilities are spelled out.
-      if (roles.includes('reviewer')) env.NATIVE_AGENT_REVIEWER_PROMPT = NATIVE_AGENT_REVIEWER_PROMPT;
-      if (roles.includes('integrator')) env.NATIVE_AGENT_INTEGRATOR_PROMPT = NATIVE_AGENT_INTEGRATOR_PROMPT;
+      if (sddp) {
+        // One SDDP preamble assembled from the roles the desk holds (planner/worker/
+        // reviewer/qc/integrator). agentWorker prepends it to the system prompt.
+        env.NATIVE_AGENT_SDDP_PROMPT = nativeSddpRolePrompt(roles);
+      } else {
+        // A non-god desk can hold reviewer and/or integrator on top of (or instead of) worker;
+        // inject each role's preamble so its responsibilities are spelled out.
+        if (roles.includes('reviewer')) env.NATIVE_AGENT_REVIEWER_PROMPT = NATIVE_AGENT_REVIEWER_PROMPT;
+        if (roles.includes('integrator')) env.NATIVE_AGENT_INTEGRATOR_PROMPT = NATIVE_AGENT_INTEGRATOR_PROMPT;
+      }
+      // "Know before you attempt": the board transitions THIS desk may make on hive_update_task
+      // (which can't be hidden like an integrator-only tool — every role needs some of it), so it
+      // stops attempting moves the execution gate would reject. Non-god only — the god's own
+      // prompt covers its delegator powers (incl. reassign), which this line would contradict.
+      env.NATIVE_AGENT_BOARD_LINE = boardCapabilityLine(roles);
     }
     // Advertise only the tools this desk can actually use: drop the code-editing tools for a
     // read-only desk and hive_integrate for a non-integrator, so the model never SEES (and never
@@ -1205,23 +1231,17 @@ ipcMain.handle('pty:spawn', async (_evt, opts: SpawnOptions & { hive?: AgentMeta
   if (!opts || typeof opts.id !== 'string' || typeof opts.cwd !== 'string' || typeof opts.command !== 'string') {
     return { ok: false, error: 'invalid SpawnOptions' };
   }
-  // Git isolation: give the agent its own worktree on an `agent/<id>` branch so it can't
-  // clobber other agents' (or the user's) working tree. AUTO-isolate when the target repo
-  // already hosts another (non-archived) worker — the newcomer gets a worktree while the
-  // FIRST agent keeps the main tree (the integration base); the explicit "isolate" checkbox
-  // forces it regardless. A RESTART of an already-isolated desk REATTACHES to its existing
-  // worktree (see provisionWorktree) even when neither flag is set, so a role-toggle
-  // auto-restart never silently drops a desk back into the shared tree. Best-effort — a
-  // failure falls back to the shared cwd. (The god/assistant never isolate; their cwd isn't a repo.)
+  // Git isolation: EVERY worker desk on a git repo gets its own worktree on an `agent/<id>`
+  // branch — including the first. The repo's base/main tree is reserved as the INTEGRATION
+  // TARGET and is never an agent's cwd (no desk commits straight to the trunk); the integrator
+  // merges branches into it host-side via hive_integrate→mergeBranch, which needs no agent in
+  // the base tree. A RESTART of an already-isolated desk REATTACHES to its existing worktree
+  // (planWorktree, independent of forceNew), so a role-toggle restart never drops a desk into
+  // the shared tree. Best-effort — a failure falls back to the shared cwd. (The god/assistant
+  // never isolate; their cwd is a neutral home, not a project repo.)
   const isWorkerDesk = !!opts.hive && !opts.hive.isGod && !opts.hive.isAssistant;
-  const repoOccupied =
-    isWorkerDesk &&
-    ([...worktreeOrigins.values()].includes(opts.cwd) ||
-      Object.values(hive.registry().agents).some(
-        (a) => !a.archived && a.cwd === opts.cwd && a.id !== opts.hive!.id
-      ));
   if (isWorkerDesk && await isRepo(opts.cwd)) {
-    const wt = await provisionWorktree(opts.cwd, opts.hive?.id ?? opts.id, opts.isolate === true || repoOccupied);
+    const wt = await provisionWorktree(opts.cwd, opts.hive?.id ?? opts.id, /* forceNew (always isolate) */ true);
     if (wt) {
       opts.cwd = wt.path;
       worktreePaths.set(opts.id, wt.path);

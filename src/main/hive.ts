@@ -30,13 +30,13 @@ import { COMMAND_GROUPS } from '../shared/claudeCommands';
 // The mailbox + task-ledger vocabulary is owned by @jsh562/won-agent-core (so the extracted
 // coding toolkit is host-agnostic); re-exported below so existing `import { HiveMessage }
 // from '../hive'` consumers across the app are unchanged.
-import { reconcileBlocked, roleCanEditCode } from '@jsh562/won-agent-core';
+import { reconcileBlocked, roleCanEditCode, canIntegrate, canReview, boardCapabilityLine } from '@jsh562/won-agent-core';
 import type { MessageAct, HiveMessage, HiveTask, AgentRole, FeatureStatus } from '@jsh562/won-agent-core';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 export type { MessageAct, HiveMessage, HiveTask, AgentRole };
-export { roleCanEditCode };
+export { roleCanEditCode, canIntegrate, canReview, boardCapabilityLine };
 
 export interface AgentMeta {
   id: string;
@@ -551,6 +551,10 @@ export class HiveManager {
             : ''
         ].filter(Boolean).join(' ');
     const guardrailsLine = 'Guardrails: a circuit breaker watches the floor — a "Circuit breaker: steer/constrain" message means you are looping or overspending, so STOP repeating, summarize what you tried, and follow it. Be token-frugal (a floor-wide or per-agent token budget can pause you). The shared plan has two parts: board.md (freeform; god is the sole scribe) and tasks.json (structured kanban — todo/doing/blocked/review/integrate/done).';
+    // "Know before you attempt": the board transitions this desk's roles allow on the kanban, so it
+    // doesn't try a move the hook/execution gate would reject. Non-god/non-assistant only — the god
+    // line already covers its delegator powers (incl. reassign), which this would contradict.
+    const boardLine = !meta.isGod && !meta.isAssistant ? boardCapabilityLine(meta.roles) : '';
     return [
       `You are "${meta.name}" (${meta.id}), an autonomous agent in a collaborating hive of Claude agents.`,
       `Your private workspace is ${dir}. The shared hive is ${root}. Full protocol: ${root}/PROTOCOL.md.`,
@@ -563,6 +567,7 @@ export class HiveManager {
       guardrailsLine,
       memoryLine,
       godLine,
+      boardLine,
       `Env vars available to you: AGENT_ID, AGENT_NAME, HIVE_ROOT, AGENT_DIR.`
     ].filter(Boolean).join('\n');
   }

@@ -1,4 +1,4 @@
-import { roleCanEditCode, type AgentRole } from '@jsh562/won-agent-core';
+import { roleCanEditCode, canIntegrate, type AgentRole } from '@jsh562/won-agent-core';
 
 /**
  * The native tool names a desk should NOT be advertised, given the capability roles it holds — so
@@ -11,6 +11,6 @@ import { roleCanEditCode, type AgentRole } from '@jsh562/won-agent-core';
 export function deniedNativeToolNames(roles: readonly AgentRole[]): string[] {
   const denied: string[] = [];
   if (!roleCanEditCode(roles)) denied.push('write_file', 'edit_file', 'bash');
-  if (!roles.includes('integrator')) denied.push('hive_integrate');
+  if (!canIntegrate(roles)) denied.push('hive_integrate');
   return denied;
 }
