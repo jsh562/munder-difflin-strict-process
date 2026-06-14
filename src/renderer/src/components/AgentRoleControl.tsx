@@ -5,8 +5,13 @@ import { scheduleDeskRestart } from '@/lib/restartDesk';
 const ROLE_META: Record<AgentRole, { tip: string; on: string }> = {
   worker: { tip: 'Worker: writes the code — takes delegated implementation', on: 'var(--cth-sky)' },
   reviewer: { tip: "Reviewer: reads a 'review' card and COMMENTS only (read-only — cannot edit code); approves to 'integrate' or sends it back", on: 'var(--cth-lilac)' },
-  integrator: { tip: "Integrator: merges other desks' branches (hive_integrate) + signs tasks off; may edit only to resolve a conflict", on: 'var(--cth-peach)' }
+  integrator: { tip: "Integrator: merges other desks' branches (hive_integrate) + signs tasks off; may edit only to resolve a conflict", on: 'var(--cth-peach)' },
+  planner: { tip: 'Planner (SDDP): authors the spec / plan / tasks artifacts for a feature (Specify→Clarify→Plan→Tasks)', on: 'var(--cth-mint)' },
+  qc: { tip: 'QC (SDDP): runs the automated QC phase — tests / lint / security + verifies stories vs spec; files bug tasks or signs .qc-passed', on: 'var(--cth-coral)' }
 };
+/** Standard roles always shown; planner/qc only when the floor is in SDDP mode. */
+const STANDARD_ROLES: AgentRole[] = ['worker', 'reviewer', 'integrator'];
+const SDDP_ROLES: AgentRole[] = ['planner', 'worker', 'reviewer', 'qc', 'integrator'];
 
 /**
  * Toggle a desk's capability roles (worker / reviewer / integrator). `worker` = writes code;
@@ -19,9 +24,12 @@ const ROLE_META: Record<AgentRole, { tip: string; on: string }> = {
  */
 export function AgentRoleControl({ agent }: { agent: Agent }) {
   const setAgentRoles = useStore((s) => s.setAgentRoles);
+  const sddpMode = useStore((s) => s.sddpMode);
   if (agent.isAssistant) return null;
   const roles: AgentRole[] = agent.roles ?? (agent.isGod ? ['integrator', 'reviewer'] : ['worker']);
   const has = (r: AgentRole) => roles.includes(r);
+  // planner/qc chips appear only in SDDP mode (so they don't clutter the standard flow).
+  const chips = sddpMode ? SDDP_ROLES : STANDARD_ROLES;
   const toggle = (r: AgentRole) => {
     const next = has(r) ? roles.filter((x) => x !== r) : [...roles, r];
     setAgentRoles(agent.id, next);
@@ -34,7 +42,7 @@ export function AgentRoleControl({ agent }: { agent: Agent }) {
     <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
         <span style={{ fontFamily: 'var(--cth-font-display)', fontSize: 8, color: 'var(--cth-ink-500)' }}>ROLES</span>
-        {(['worker', 'reviewer', 'integrator'] as AgentRole[]).map((r) => (
+        {chips.map((r) => (
           <button
             key={r}
             onClick={() => toggle(r)}
@@ -51,7 +59,7 @@ export function AgentRoleControl({ agent }: { agent: Agent }) {
       {/* Derived write-state, so the desk's edit capability is unmistakable at a glance:
           worker OR integrator ⇒ can edit code; otherwise read-only (comments + delegates). */}
       {(() => {
-        const canEdit = has('worker') || has('integrator');
+        const canEdit = has('worker') || has('integrator') || has('planner') || has('qc');
         return (
           <span style={{ fontSize: 10, color: canEdit ? 'var(--cth-ink-700)' : 'var(--cth-mint)', lineHeight: '13px' }}>
             {canEdit ? '✎ can edit code' : '👁 read-only — delegates, cannot write_file/edit_file/bash'}

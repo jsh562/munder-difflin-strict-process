@@ -455,6 +455,77 @@ const NATIVE_AGENT_INTEGRATOR_PROMPT = [
   '- A reported merge conflict aborts cleanly — resolve it yourself (you may edit ONLY to settle the conflict) or send the card back to its author (status "doing", with a `note`) to rebase/resolve; never force it.'
 ].join('\n');
 
+// ─── SPEC-DRIVEN (SDDP) mode prompts ─────────────────────────────────────────
+// When the floor is in SDDP mode, desks follow the spec-driven lifecycle. These REPLACE
+// the standard role prompts (selected in workerEnv). The methodology is ported from the
+// sddp27 kit as prompts so a NATIVE (DeepSeek) desk can follow it without the Claude-only
+// /sddp-* skills. The phases + gates are additionally machine-checkable via hive_feature_status.
+const SDDP_LIFECYCLE = [
+  'SPEC-DRIVEN (SDDP) MODE is active. Work flows per FEATURE through a strict, gated lifecycle, with artifacts kept in `specs/<feature>/`:',
+  'Specify (spec.md) → Clarify → Plan (plan.md) → Tasks (tasks.md) → Implement → QC (.qc-passed) → Integrate.',
+  'Never skip a phase: each phase reads the prior artifact and writes the next. Preserve artifact IDs (T###, FR-###, SC-###) and checkbox state (`[ ]`→`[X]` only); never delete `[NEEDS CLARIFICATION]` markers. Check a feature\'s current phase + the next unmet gate with hive_feature_status.'
+].join('\n');
+
+function nativeSddpGodPrompt(): string {
+  return [
+    'You are the GOD / ORCHESTRATOR in SPEC-DRIVEN mode (you are "Michael"). Drive each feature through the lifecycle and ENFORCE the gates — assign each phase to the desk that holds the right role; never let work jump ahead:',
+    SDDP_LIFECYCLE,
+    '- Specify→Clarify→Plan→Tasks: assign to a PLANNER desk (it authors spec.md, resolves clarifications, plan.md, tasks.md). Answer its clarification questions.',
+    '- SPEC/PLAN gate: have a REVIEWER read spec.md/plan.md/tasks.md (read-only) and approve, or send back to the planner.',
+    '- Implement: once tasks.md exists, turn its tasks into cards (hive_import_tasks if available, else hive_add_task) assigned to WORKER desks — P1 first, independent tasks in parallel.',
+    '- CODE gate: a REVIEWER reviews each implemented slice.',
+    '- QC: a QC desk runs tests/lint/security + verifies stories vs spec → it sets .qc-passed, or files bug tasks back to workers.',
+    '- Integrate: an INTEGRATOR merges only AFTER .qc-passed, then signs off (done).',
+    '- You ORCHESTRATE + GATE; you do not author or implement. Use hive_feature_status to see each feature\'s phase. Run features as a PIPELINE (one in Plan while another is in QC) and parallelize Implement across workers.',
+    'The human operator is watching this transcript and can message you — surface anything genuinely critical.'
+  ].join('\n');
+}
+
+// Per-role SDDP guidance for a NON-god desk (a desk may hold several SDDP roles).
+const NATIVE_SDDP_PLANNER_PROMPT = [
+  'You hold the SDDP PLANNER role: you AUTHOR a feature\'s spec → plan → tasks in `specs/<feature>/` — you do NOT implement.',
+  '- Specify: write spec.md — problem, scope, requirements (FR-### functional / TR-### technical), success criteria (SC-### with measurable Given/When/Then). Mark unknowns `[NEEDS CLARIFICATION]`.',
+  '- Clarify: resolve those markers — ask "god"/operator the few highest-impact questions in ONE batch, then update spec.md (add a `## Clarifications` section).',
+  '- Plan: write plan.md — tech stack, data model, API contracts, and architecture decisions (ADRs).',
+  '- Tasks: write tasks.md — `- [ ] T### [P?] [US#|OBJ#] {FR-###} Description [after:T###]`, grouped by phase (Setup/Foundational/Delivery/Polish), with P1 = a viable MVP and every task independently testable. Preserve all IDs.',
+  '- Self-check the spec for completeness + testability + requirement coverage, then message "god" that it is ready for the spec review.'
+].join('\n');
+
+const NATIVE_SDDP_WORKER_PROMPT = [
+  'You hold the SDDP WORKER role: you IMPLEMENT from tasks.md (you do not change the spec).',
+  '- Take a task assigned to you, do EXACTLY that task, respect `after:T###` ordering, run the build/tests, then mark its checkbox `[ ]`→`[X]` in tasks.md and commit on your branch.',
+  '- Move your card doing→review when the slice is done. If a task is wrong or under-specified, do NOT guess — message "god" to route it back to the planner.'
+].join('\n');
+
+const NATIVE_SDDP_REVIEWER_PROMPT = [
+  'You hold the SDDP REVIEWER role: read-only, two gates.',
+  '- SPEC/PLAN gate: read spec.md/plan.md/tasks.md — is it complete, testable, and does every requirement (FR-###) have tasks? Approve to proceed or send back to the planner with a `note`.',
+  '- CODE gate: review an implemented slice before QC — comment via hive_update_task `note`; approve to "integrate"/QC or send back to the worker ("doing"). You never edit code.'
+].join('\n');
+
+const NATIVE_SDDP_QC_PROMPT = [
+  'You hold the SDDP QC role: run the automated QC phase on an implemented feature.',
+  '- Run the build, tests, linter, and security checks (bash); verify each user story / success criterion (SC-###) against the code + test results.',
+  '- Write `specs/<feature>/qc-report.md`. If everything passes, create the `.qc-passed` marker (the feature is ready to integrate). If anything fails, file bug tasks (`- [ ] T### [BUG:severity] {FR-###} [category] desc — file:line`) into tasks.md and send the work back to the worker(s).',
+  '- You RUN + VERIFY; you do not implement fixes (those go to workers).'
+].join('\n');
+
+const NATIVE_SDDP_INTEGRATOR_PROMPT = [
+  'You hold the SDDP INTEGRATOR role: merge a feature ONLY after it has `.qc-passed`.',
+  '- Then hive_integrate (preview → apply) to merge the feature\'s branch into the repo base, and sign its cards off to "done". On conflict, resolve it (conflict-only edits) or send it back.'
+].join('\n');
+
+/** Assemble the SDDP preamble for a NON-god desk from the roles it holds. */
+function nativeSddpRolePrompt(roles: AgentRole[]): string {
+  const parts = [SDDP_LIFECYCLE];
+  if (roles.includes('planner')) parts.push(NATIVE_SDDP_PLANNER_PROMPT);
+  if (roles.includes('worker')) parts.push(NATIVE_SDDP_WORKER_PROMPT);
+  if (roles.includes('reviewer')) parts.push(NATIVE_SDDP_REVIEWER_PROMPT);
+  if (roles.includes('qc')) parts.push(NATIVE_SDDP_QC_PROMPT);
+  if (roles.includes('integrator')) parts.push(NATIVE_SDDP_INTEGRATOR_PROMPT);
+  return parts.join('\n\n');
+}
+
 // E003 — native (non-Claude) agents run in isolated utilityProcess workers,
 // fronted by the ProviderRuntime port. The drain runs in MAIN (single-committer
 // hive); a worker exit reuses the same archive path as a PTY exit (AD-004).
@@ -495,8 +566,15 @@ const nativeRuntime = new NativeRuntime({
     const env: Record<string, string> = { NATIVE_AGENT_ENV_NOTE: describeBashEnv() };
     const agent = hive.registry().agents[id];
     const roles = agent?.roles ?? [];
+    // SDDP mode is a WHOLESALE switch: when on, desks get the spec-driven preamble set
+    // instead of the standard role prompts (a desk is either standard or SDDP, never mixed).
+    const sddp = readConfig().sddpMode === true;
     if (agent?.isGod) {
-      env.NATIVE_AGENT_GOD_PROMPT = nativeGodPrompt(roles);
+      env.NATIVE_AGENT_GOD_PROMPT = sddp ? nativeSddpGodPrompt() : nativeGodPrompt(roles);
+    } else if (sddp) {
+      // One SDDP preamble assembled from the roles the desk holds (planner/worker/
+      // reviewer/qc/integrator). agentWorker prepends it to the system prompt.
+      env.NATIVE_AGENT_SDDP_PROMPT = nativeSddpRolePrompt(roles);
     } else {
       // A non-god desk can hold reviewer and/or integrator on top of (or instead of) worker;
       // inject each role's preamble so its responsibilities are spelled out.
@@ -1053,7 +1131,7 @@ ipcMain.handle('pty:spawn', async (_evt, opts: SpawnOptions & { hive?: AgentMeta
     try {
       const inj = hive.ensureAgent(
         { ...opts.hive, cwd: opts.cwd },
-        { semanticMemory: memory.active(), theme: readConfig().terminalTheme ?? 'light' }
+        { semanticMemory: memory.active(), theme: readConfig().terminalTheme ?? 'light', sddp: readConfig().sddpMode === true }
       );
       opts.args = [...(opts.args ?? []), ...inj.args];
       // Point the agent's mempalace CLI at the shared palace (no-op if inactive).
@@ -1418,7 +1496,7 @@ ipcMain.handle('hive:setRoles', (_evt, id: unknown, roles: unknown) => {
   if (typeof id !== 'string') return { ok: false, error: 'invalid id' };
   if (!hive.enabled()) return { ok: false, error: 'hive disabled (no harnessHome)' };
   const valid = Array.isArray(roles)
-    ? roles.filter((r): r is AgentRole => r === 'worker' || r === 'reviewer' || r === 'integrator')
+    ? roles.filter((r): r is AgentRole => r === 'worker' || r === 'reviewer' || r === 'integrator' || r === 'planner' || r === 'qc')
     : [];
   hive.setRoles(id, valid);
   return { ok: true };

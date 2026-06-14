@@ -1,5 +1,6 @@
 import { useState, useEffect, type CSSProperties } from 'react';
 import type { HarnessConfig } from '@/store/config';
+import { useStore } from '@/store/store';
 import { ModalOverlay } from './ModalOverlay';
 import { PixelButton } from './PixelButton';
 import { Icon } from './Icon';
@@ -141,6 +142,19 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
     catch { setNativeBashEnabled(!next); /* revert on failure */ }
   };
 
+  // SDDP (spec-driven) mode — a per-floor wholesale switch (prompts + roles + gates +
+  // feature-phase banner). OFF by default; standard behaviour is unchanged when off.
+  const [sddpMode, setSddpMode] = useState<boolean>(
+    (config as HarnessConfig & { sddpMode?: boolean }).sddpMode === true
+  );
+  const toggleSddpMode = async () => {
+    const next = !sddpMode;
+    setSddpMode(next); // optimistic
+    useStore.getState().setSddpMode(next); // mirror live so chips/banner update this session
+    try { await window.cth.updateConfig({ sddpMode: next }); }
+    catch { setSddpMode(!next); useStore.getState().setSddpMode(!next); /* revert on failure */ }
+  };
+
   // ─── circuit-breaker config (Lane A #6 canonical fields, widened view) ───────
   // Drives Jim's real breaker: floor-wide TOKEN budget (costCapTokens) + output-
   // token velocity ceiling (circuitBreaker.tokenVelocityPerMin). The token cap
@@ -269,10 +283,11 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
     let alive = true;
     window.cth.getConfig().then((c) => {
       if (!alive) return;
-      const cc = c as BreakerCfgView & SlackConfig & { notifications?: boolean; webSearchEnabled?: boolean; nativeBashEnabled?: boolean; godWorkspace?: string };
+      const cc = c as BreakerCfgView & SlackConfig & { notifications?: boolean; webSearchEnabled?: boolean; nativeBashEnabled?: boolean; sddpMode?: boolean; godWorkspace?: string };
       setNotifications(cc.notifications === true);
       setWebSearchEnabled(cc.webSearchEnabled === true);
       setNativeBashEnabled(cc.nativeBashEnabled === true);
+      setSddpMode(cc.sddpMode === true);
       setGodWorkspace(cc.godWorkspace);
       setAgentBudget(cc.costCapTokens != null ? String(cc.costCapTokens) : '');
       setVelocityCeiling(cc.circuitBreaker?.tokenVelocityPerMin != null ? String(cc.circuitBreaker.tokenVelocityPerMin) : '');
@@ -781,6 +796,30 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
                   onClick={toggleNativeBash}
                 >
                   {nativeBashEnabled ? 'on' : 'off'}
+                </PixelButton>
+              </div>
+
+              <div style={{ height: 2, background: 'var(--cth-ink-300)' }} />
+
+              {/* Spec-driven (SDDP) mode — per-floor wholesale switch */}
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                  <span style={{ fontSize: 14, lineHeight: '20px', color: 'var(--cth-ink-900)' }}>
+                    Spec-driven mode (SDDP)
+                  </span>
+                  <span style={{ fontSize: 12, lineHeight: '16px', color: 'var(--cth-ink-500)' }}>
+                    Desks follow the spec-driven lifecycle (Specify&rarr;Clarify&rarr;Plan&rarr;Tasks&rarr;Implement&rarr;QC&rarr;Integrate):
+                    the <code>planner</code> and <code>qc</code> roles activate, role prompts switch to the SDDP variants, the
+                    board shows a feature-phase banner, and phase gates are enforced. Off by default; standard behaviour is
+                    unchanged when off. Restart desks to re-inject prompts after toggling.
+                  </span>
+                </div>
+                <PixelButton
+                  variant={sddpMode ? 'primary' : 'secondary'}
+                  size="sm"
+                  onClick={toggleSddpMode}
+                >
+                  {sddpMode ? 'on' : 'off'}
                 </PixelButton>
               </div>
 

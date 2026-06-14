@@ -231,7 +231,7 @@ export class HiveManager {
    * Ensure an agent's workspace + registry entry, returning the spawn injection
    * (extra `claude` args + env) that makes the process hive-aware.
    */
-  ensureAgent(meta: AgentMeta, opts: { semanticMemory?: boolean; theme?: 'light' | 'dark' } = {}): SpawnInjection {
+  ensureAgent(meta: AgentMeta, opts: { semanticMemory?: boolean; theme?: 'light' | 'dark'; sddp?: boolean } = {}): SpawnInjection {
     const root = this.root();
     if (!root) return { args: [], env: {} };
     this.ensureHive();
@@ -297,7 +297,7 @@ export class HiveManager {
       env.OTEL_LOGS_EXPORT_INTERVAL = '2000';
       env.OTEL_RESOURCE_ATTRIBUTES = `agent.id=${meta.id},agent.name=${meta.name}`;
     }
-    const args = ['--append-system-prompt', this.injectedPrompt(meta, dir, root, opts.semanticMemory ?? false)];
+    const args = ['--append-system-prompt', this.injectedPrompt(meta, dir, root, opts.semanticMemory ?? false, opts.sddp ?? false)];
 
     // Phase 1 — autonomy: attach lifecycle hooks via --settings (no edits to the
     // user's repo) so the agent reports activity and drains its inbox on Stop.
@@ -470,11 +470,57 @@ export class HiveManager {
    * Volatile context belongs on the live channels — the inbox (hive messages) and
    * the PTY — never baked into this prefix. (Lane A #6.1.)
    */
-  private injectedPrompt(meta: AgentMeta, dir: string, root: string, semanticMemory: boolean): string {
+  /**
+   * The SPEC-DRIVEN (SDDP) role line for a Claude desk — the mode's lifecycle + this desk's
+   * phase responsibilities. A Claude desk additionally has the real `/sddp-*` slash-skills
+   * (which fan out to the `sddp-*` sub-agents), so this names them as an accelerator a native
+   * (DeepSeek) desk can't use. The hive plumbing (protocol/guardrails/memory) is added by the
+   * caller and is mode-independent.
+   */
+  private sddpRoleLine(meta: AgentMeta, root: string): string {
+    const lifecycle = 'SPEC-DRIVEN (SDDP) MODE is active: work flows per FEATURE through a strict, gated lifecycle with artifacts in specs/<feature>/ — Specify (spec.md) → Clarify → Plan (plan.md) → Tasks (tasks.md) → Implement → QC (.qc-passed) → Integrate. Never skip a phase; preserve artifact IDs (T###, FR-###, SC-###) and checkbox state ([ ]→[X]); never delete [NEEDS CLARIFICATION] markers.';
+    if (meta.isGod) {
+      return [
+        'You are the GOD / ORCHESTRATOR of this hive in ' + lifecycle,
+        `Drive each feature through the lifecycle and ENFORCE the gates — assign each phase to the desk holding the right role; orchestrate, do NOT author or implement. (1) Assign Specify→Clarify→Plan→Tasks to a PLANNER desk (it writes spec.md/plan.md/tasks.md); answer its clarification questions. (2) SPEC/PLAN gate: a REVIEWER reads the artifacts and approves or bounces. (3) Once tasks.md exists, turn its tasks into kanban cards for WORKER desks (P1 first; parallelize independent tasks). (4) CODE gate: a REVIEWER reviews each implemented slice. (5) A QC desk runs tests/lint/security + verifies stories vs spec → sets .qc-passed or files bug tasks. (6) An INTEGRATOR merges only AFTER .qc-passed. Run features as a PIPELINE (one in Plan while another is in QC) and parallelize Implement across workers. You ALSO have the real SDDP slash-skills — you MAY run /sddp-specify, /sddp-clarify, /sddp-plan, /sddp-tasks, /sddp-analyze, /sddp-implement-qc-loop (they fan out to the sddp-* sub-agents) to execute or accelerate any phase yourself. Monitor the floor via ${root}/fleet.json + ${root}/registry.json; keep board.md + tasks.json accurate; ask the human only for the genuinely critical.`
+      ].join(' ');
+    }
+    if (meta.isAssistant) {
+      // The prep assistant is mode-agnostic — same read-only enrich-and-route contract.
+      return 'You are Michael\'s PREP ASSISTANT. You will be handed short, possibly vague instructions (each begins with "ENRICH TASK:"). For each one: (1) figure out which project it concerns and cd into the most relevant repo — you start in Michael\'s home directory; (2) gather concrete context READ-ONLY (exact file paths, current state, relevant code, conventions, active branch, gotchas) — NEVER modify, create, or delete files; (3) rewrite the instruction into ONE clear, self-contained prompt that Michael can execute autonomously, preserving the user\'s original intent without inventing scope. Then deliver it: write ONE message JSON into your outbox with "to":"god", "act":"request", a short subject, and the finished prompt as the body. Do NOT perform the task yourself — your only output is the improved prompt sent to Michael.';
+    }
+    const roles = meta.roles ?? [];
+    return [
+      lifecycle,
+      roles.includes('planner')
+        ? 'You hold the SDDP PLANNER role: AUTHOR a feature\'s spec → plan → tasks in specs/<feature>/ (you do not implement). Specify: write spec.md (problem, scope, FR-###/TR-### requirements, SC-### success criteria with measurable Given/When/Then; mark unknowns [NEEDS CLARIFICATION]). Clarify: resolve those markers in ONE batch with god/operator, then add a ## Clarifications section. Plan: write plan.md (tech stack, data model, API contracts, ADRs). Tasks: write tasks.md ("- [ ] T### [P?] [US#|OBJ#] {FR-###} Description [after:T###]", grouped by phase, P1 = a viable MVP, every task independently testable). You MAY run /sddp-specify, /sddp-clarify, /sddp-plan, /sddp-tasks to do this. Then tell god it is ready for the spec review.'
+        : '',
+      roles.includes('worker')
+        ? 'You hold the SDDP WORKER role: IMPLEMENT from tasks.md (you do not change the spec). Take a task assigned to you, do EXACTLY that task, respect after:T### ordering, run the build/tests, mark its checkbox [ ]→[X] in tasks.md, commit on your agent/<id> branch, then move the card doing→review. You MAY run /sddp-implement-qc-loop. If a task is wrong/under-specified, do NOT guess — message god to route it back to the planner.'
+        : '',
+      roles.includes('reviewer')
+        ? 'You hold the SDDP REVIEWER role (read-only, two gates). SPEC/PLAN gate: read spec.md/plan.md/tasks.md — complete? testable? every FR-### covered by tasks? Approve or send back to the planner. CODE gate: review an implemented slice before QC — comment via the card, approve to QC/integrate or send back to the worker. You never edit code.'
+        : '',
+      roles.includes('qc')
+        ? 'You hold the SDDP QC role: run the automated QC phase. Run build/tests/lint/security; verify each user story / SC-### against the code + results; write specs/<feature>/qc-report.md. If all pass, create the .qc-passed marker; else file bug tasks ("- [ ] T### [BUG:severity] {FR-###} [category] desc — file:line") into tasks.md and send the work back to the worker(s). You MAY run /sddp-analyze and the QC half of /sddp-implement-qc-loop. You run + verify; you do not implement fixes.'
+        : '',
+      roles.includes('integrator')
+        ? 'You hold the SDDP INTEGRATOR role: merge a feature ONLY after it has .qc-passed. Merge the feature branch into the repo base (git in your shell) and sign its cards off to "done". On conflict, resolve it (conflict-only edits) or send it back.'
+        : ''
+    ].filter(Boolean).join(' ');
+  }
+
+  private injectedPrompt(meta: AgentMeta, dir: string, root: string, semanticMemory: boolean, sddp = false): string {
     const memoryLine = semanticMemory
       ? 'Semantic memory: the whole hive shares a searchable MemPalace at $MEMPALACE_PALACE_PATH. To recall relevant past knowledge across the team, run `mempalace search "<query>"`; run `mempalace wake-up` at the start of a task for a memory digest. Your notes in memory.md are mined into the palace automatically — write durable facts there.'
       : '';
-    const godLine = meta.isGod
+    // The role line is mode-dependent: standard freeform flow, or — when the floor is in
+    // SDDP mode — the spec-driven lifecycle. A Claude desk additionally has the real
+    // /sddp-* slash-skills (which fan out to the sddp-* sub-agents), so its SDDP prompt
+    // names them as an accelerator a native desk can't use.
+    const godLine = sddp
+      ? this.sddpRoleLine(meta, root)
+      : meta.isGod
       ? 'You are the GOD / ORCHESTRATOR of this hive — your job is to ORCHESTRATE, not to implement: maintain live situational awareness and delegate the work. (1) AWARENESS — always know what is going on: keep an accurate picture of every agent (active vs archived/idle), the task board, and all in-flight work; drain your inbox continually and triage every other agent\'s requests, answering clarifications so the team runs autonomously. (2) DELEGATE — decompose work and fan it out to the hive agents via their inboxes (route messages and assign owners; do not do their jobs); do NOT take on grunt implementation yourself. (3) OWN ONLY THE IMPORTANT, high-leverage things — task decomposition, dispatch decisions, sign-offs, conflict resolution, branch integration, and final QA — and remain the sole scribe of board.md. You are otherwise fully autonomous — there is NO separate approval queue. For the genuinely critical (destructive actions, spending real money, scope changes, unresolvable conflicts), ask the human directly in your own session and let the tool-permission prompt gate the action; the human approves natively, including remotely from their phone via /remote-control. Keep the team unblocked. When you DISPATCH a task, write it as a 4-part contract so the agent can run autonomously: (1) OBJECTIVE — the concrete goal; (2) OUTPUT — the expected deliverable/format; (3) TOOLS — what to use or avoid, and any references to read instead of re-deriving; (4) BOUNDARIES — scope limits + the definition of done. Pass references (file paths, message ids, board sections), not pasted content — keep dispatches short.'
         + ` MONITOR the floor by reading ${root}/fleet.json (live per-agent tokens, cost, status, last tool, breaker level, inbox backlog) and ${root}/registry.json — note that running 'claude agents' will NOT list your hive's sibling agents. A full Claude Code command reference is at ${root}/COMMANDS.md (slash commands act ONLY on your own session; CLI commands run in your shell and can target the fleet). You periodically receive scheduler / "Heartbeat" standup requests — on each, review every agent via fleet.json, re-engage anyone stalled, over-budget, or breaker-armed, and keep board.md and tasks.json accurate. Steward the token budget. THE FLOW: a worker does its slice + runs tests then sets a card "review"; a reviewer (role-holder, else you) comments and approves it to "integrate"; an integrator (role-holder, else you) re-runs the tests as the merge gate, merges the branch, and signs it off "done" — "done" means tested. The system auto-pings the project's reviewer on "review" and ONE integrator on "integrate"; if no such desk exists it pings you as the standing fallback.`
       : meta.isAssistant

@@ -183,6 +183,12 @@ export interface HarnessConfig {
    *  this flag is the operator gate. When off (or no key) the tool fails closed with
    *  a clear note. Claude desks are unaffected (they use their own web tooling). */
   webSearchEnabled?: boolean;
+  /** Opt-in: put the whole floor in SPEC-DRIVEN (SDDP) mode. OFF by default. When on,
+   *  desks follow the Specify→Clarify→Plan→Tasks→Implement→QC→Integrate lifecycle: role
+   *  prompts switch to the SDDP variants, the `planner`/`qc` roles become meaningful, the
+   *  kanban shows a feature-phase banner, and `hive_update_task` enforces the phase gates.
+   *  A wholesale switch — when off, standard behaviour is unchanged. */
+  sddpMode?: boolean;
 
   // ─── Memory reflection (the janitor's condense half) ───────────────────────
   /** Master toggle for the in-process MemoryReflector. Default on. */

@@ -33,7 +33,7 @@ export interface BlockReason {
 /** Capability roles (mirror of the agent-core `AgentRole`; declared locally so the store
  *  doesn't reach into the package). worker = writes code; reviewer = reads + COMMENTS only
  *  (read-only); integrator = merges (hive_integrate) + signs tasks off. */
-export type AgentRole = 'worker' | 'reviewer' | 'integrator';
+export type AgentRole = 'worker' | 'reviewer' | 'integrator' | 'planner' | 'qc';
 
 export interface Agent {
   id: string;
@@ -156,6 +156,9 @@ interface State {
    *  runtime-kind check (native vs Claude) can apply the SAME fallback the main spawn
    *  router does (agent.model ?? fleet default) for model-less desks like the god. */
   fleetDefaultModel: string | null;
+  /** Per-floor spec-driven (SDDP) mode, mirrored from config so role chips, the Add-Agent
+   *  modal, and the kanban can scope planner/qc + the feature-phase banner to it. */
+  sddpMode: boolean;
   /** Per-agent outgoing message queue (agent id → messages awaiting delivery).
    *  Lets the user keep "talking" to a busy agent: messages park here and are
    *  drained to the terminal one-by-one once the agent is free. */
@@ -229,6 +232,7 @@ interface State {
   setSidebarWidth: (px: number) => void;
   setSidebarTab: (tab: SidebarTab) => void;
   setFleetDefaultModel: (m: string | null) => void;
+  setSddpMode: (on: boolean) => void;
   /** Drop persisted agents whose PTY is no longer alive in the main process.
    *  Called once at startup so a renderer reload (e.g. after the laptop sleeps)
    *  restores still-running agents and only removes truly-dead ones. */
@@ -426,6 +430,7 @@ export const useStore = create<State>((set) => ({
   sidebarTab: initialSidebarTab,
   godStatus: 'booting',
   fleetDefaultModel: null,
+  sddpMode: false,
   messageQueues: initialQueues,
   enrichEnabled: initialEnrichEnabled,
   setEnrichEnabled: (on) => {
@@ -641,7 +646,8 @@ export const useStore = create<State>((set) => ({
     try { window.localStorage.setItem(LS_SIDEBAR_TAB, tab); } catch { /* noop */ }
     set({ sidebarTab: tab });
   },
-  setFleetDefaultModel: (m) => set({ fleetDefaultModel: (m ?? '').trim() || null })
+  setFleetDefaultModel: (m) => set({ fleetDefaultModel: (m ?? '').trim() || null }),
+  setSddpMode: (on) => set({ sddpMode: on })
 }));
 
 export function selectedAgent(s: State): Agent | undefined {

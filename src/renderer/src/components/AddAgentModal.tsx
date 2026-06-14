@@ -77,6 +77,10 @@ export function AddAgentModal({ onClose, config }: AddAgentModalProps) {
   const [roleWorker, setRoleWorker] = useState(true);
   const [roleReviewer, setRoleReviewer] = useState(false);
   const [roleIntegrator, setRoleIntegrator] = useState(false);
+  // SDDP-only roles (shown only when the floor is in spec-driven mode).
+  const sddpMode = useStore((s) => s.sddpMode);
+  const [rolePlanner, setRolePlanner] = useState(false);
+  const [roleQc, setRoleQc] = useState(false);
   const [error, setError] = useState<string | undefined>();
   const [busy, setBusy] = useState(false);
 
@@ -99,7 +103,9 @@ export function AddAgentModal({ onClose, config }: AddAgentModalProps) {
     const roles: AgentRole[] = [
       ...(roleWorker ? ['worker' as const] : []),
       ...(roleReviewer ? ['reviewer' as const] : []),
-      ...(roleIntegrator ? ['integrator' as const] : [])
+      ...(roleIntegrator ? ['integrator' as const] : []),
+      ...(sddpMode && rolePlanner ? ['planner' as const] : []),
+      ...(sddpMode && roleQc ? ['qc' as const] : [])
     ];
     // The command field contains `claude --permission-mode bypassPermissions`
     // for auto mode. Split into argv-style for node-pty.
@@ -323,6 +329,18 @@ export function AddAgentModal({ onClose, config }: AddAgentModalProps) {
                   <input type="checkbox" checked={roleIntegrator} onChange={(e) => setRoleIntegrator(e.target.checked)} style={{ width: 16, height: 16, cursor: 'pointer' }} />
                   <span style={{ fontFamily: 'var(--cth-font-ui)', fontSize: 14, color: 'var(--cth-ink-900)' }}>Integrator</span>
                 </label>
+                {sddpMode && (
+                  <label style={{ display: 'flex', gap: 6, alignItems: 'center', cursor: 'pointer' }} title="SDDP: authors the spec / plan / tasks artifacts for a feature (Specify→Clarify→Plan→Tasks).">
+                    <input type="checkbox" checked={rolePlanner} onChange={(e) => setRolePlanner(e.target.checked)} style={{ width: 16, height: 16, cursor: 'pointer' }} />
+                    <span style={{ fontFamily: 'var(--cth-font-ui)', fontSize: 14, color: 'var(--cth-ink-900)' }}>Planner</span>
+                  </label>
+                )}
+                {sddpMode && (
+                  <label style={{ display: 'flex', gap: 6, alignItems: 'center', cursor: 'pointer' }} title="SDDP: runs the automated QC phase — tests/lint/security + story verification; files bug tasks or signs .qc-passed.">
+                    <input type="checkbox" checked={roleQc} onChange={(e) => setRoleQc(e.target.checked)} style={{ width: 16, height: 16, cursor: 'pointer' }} />
+                    <span style={{ fontFamily: 'var(--cth-font-ui)', fontSize: 14, color: 'var(--cth-ink-900)' }}>QC</span>
+                  </label>
+                )}
               </div>
             </Row>
 

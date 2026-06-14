@@ -49,6 +49,7 @@ export function App() {
       // Mirror the fleet-default model into the store so the runtime-kind check can
       // apply the same fallback the main spawn router uses for model-less desks (god).
       useStore.getState().setFleetDefaultModel((c as { defaultModel?: string }).defaultModel ?? null);
+      useStore.getState().setSddpMode((c as { sddpMode?: boolean }).sddpMode === true);
     });
     return () => { cancelled = true; };
   }, []);

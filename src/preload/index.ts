@@ -9,7 +9,7 @@ export interface HiveAgentMeta {
   role?: string;
   capabilities?: string[];
   /** Capability roles (worker / reviewer / integrator). Optional at spawn — defaulted host-side. */
-  roles?: ('worker' | 'reviewer' | 'integrator')[];
+  roles?: ('worker' | 'reviewer' | 'integrator' | 'planner' | 'qc')[];
   cwd: string;
   isGod?: boolean;
   isAssistant?: boolean;
@@ -140,6 +140,9 @@ export interface HarnessConfig {
    *  (still cwd-sandboxed + breaker-watched + destructive-command guarded). OFF by
    *  default. Claude desks are unaffected (their shell rides the CLI's own gate). */
   nativeBashEnabled?: boolean;
+  /** Per-floor spec-driven (SDDP) mode: desks follow Specify→…→QC→Integrate; planner/qc
+   *  roles + feature-phase banner + phase gates activate. OFF by default. */
+  sddpMode?: boolean;
   slackEnabled?: boolean;
   slackSigningSecret?: string;
   slackBotToken?: string;
@@ -662,7 +665,7 @@ const api = {
     ipcRenderer.invoke('hive:setArchived', id, archived),
   /** Set an agent's capability roles (worker / reviewer / integrator). Durable in the
    *  registry; the capability gate applies immediately, the role's prompt on next respawn. */
-  hiveSetRoles: (id: string, roles: ('worker' | 'reviewer' | 'integrator')[]): Promise<{ ok: boolean; error?: string }> =>
+  hiveSetRoles: (id: string, roles: ('worker' | 'reviewer' | 'integrator' | 'planner' | 'qc')[]): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('hive:setRoles', id, roles),
 
   // ─── Slack integration (Slack message → Michael's queue) ─────────────────────

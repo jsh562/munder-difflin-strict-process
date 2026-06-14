@@ -61,10 +61,14 @@ if (parentPort) {
   const godPrompt = (process.env.NATIVE_AGENT_GOD_PROMPT ?? '').trim();
   const reviewerPrompt = (process.env.NATIVE_AGENT_REVIEWER_PROMPT ?? '').trim();
   const integratorPrompt = (process.env.NATIVE_AGENT_INTEGRATOR_PROMPT ?? '').trim();
+  // SDDP mode: a single spec-driven preamble assembled host-side from the desk's roles
+  // (replaces the standard reviewer/integrator prompts above when the floor is in SDDP mode).
+  const sddpPrompt = (process.env.NATIVE_AGENT_SDDP_PROMPT ?? '').trim();
   const envNote = (process.env.NATIVE_AGENT_ENV_NOTE ?? '').trim();
   // Order: base toolkit preamble → role prompt(s) (god orchestrator; or a non-god desk's
-  // reviewer and/or integrator preamble — a desk can hold both) → shell note.
-  const nativePreamble = [NATIVE_AGENT_PREAMBLE, godPrompt, reviewerPrompt, integratorPrompt, envNote]
+  // reviewer and/or integrator preamble — a desk can hold both; or the SDDP preamble when
+  // the floor is in spec-driven mode) → shell note.
+  const nativePreamble = [NATIVE_AGENT_PREAMBLE, godPrompt, reviewerPrompt, integratorPrompt, sddpPrompt, envNote]
     .filter(Boolean)
     .join('\n\n');
 
