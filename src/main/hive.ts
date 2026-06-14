@@ -27,11 +27,11 @@ import { randomBytes, createHash } from 'node:crypto';
 import type { AgentUsageSample } from './usage';
 import type { AgentEvent } from '../shared/agentEvent';
 import { COMMAND_GROUPS } from '../shared/claudeCommands';
-// The mailbox + task-ledger vocabulary is owned by @jsh562/agent-core (so the extracted
+// The mailbox + task-ledger vocabulary is owned by @jsh562/won-agent-core (so the extracted
 // coding toolkit is host-agnostic); re-exported below so existing `import { HiveMessage }
 // from '../hive'` consumers across the app are unchanged.
-import { reconcileBlocked, roleCanEditCode } from '@jsh562/agent-core';
-import type { MessageAct, HiveMessage, HiveTask, AgentRole, FeatureStatus } from '@jsh562/agent-core';
+import { reconcileBlocked, roleCanEditCode } from '@jsh562/won-agent-core';
+import type { MessageAct, HiveMessage, HiveTask, AgentRole, FeatureStatus } from '@jsh562/won-agent-core';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -775,13 +775,6 @@ export class HiveManager {
     return reg.godId && reg.godId !== task.assignee ? [reg.godId] : [];
   }
 
-  /** The SINGLE desk to route a `role` action to (deterministic — first by id). Used where
-   *  fanning out would be unsafe, e.g. `integrate` (two integrators running `hive_integrate`
-   *  in parallel would double-merge). */
-  private roleHolderForTask(role: AgentRole, task: HiveTask): string | null {
-    return this.roleHoldersForTask(role, task)[0] ?? null;
-  }
-
   /** Fire best-effort notifications on task transitions (diff prev→next), from 'system'
    *  (so the router never drops a self-send): auto-unblocked or sent-back → assignee;
    *  entered `review` → the project's reviewer(s); entered `integrate` → the integrator. */
@@ -789,6 +782,17 @@ export class HiveManager {
     const before = new Map(prev.map((t) => [t.id, t]));
     const ping = (to: string, act: HiveMessage['act'], subject: string, body: string) =>
       this.send({ to, act, subject, body }, 'system');
+    // A lane with NO live role-holder must not rot silently: log it AND escalate to god + human
+    // (needs_human) so the operator revives a desk or gives an active desk the role. Fires once
+    // per status transition (so a card escalates when it enters the starved lane, not repeatedly).
+    const escalateNoHandler = (role: AgentRole, t: HiveTask, lane: string): void => {
+      this.appendLog({ kind: 'drop', reason: 'no-handler', to: role, id: t.id });
+      this.send({
+        to: 'god', act: 'request', needs_human: true,
+        subject: `No active ${role} — "${t.title}" stuck in ${lane}`,
+        body: `Card "${t.title}" (${t.id}) reached ${lane} but NO active desk holds the ${role} role, so it can't proceed. Revive a ${role} desk, or give an ACTIVE desk the ${role} role (Add-Agent, the desk's role toggle, or restore team).`
+      }, 'system');
+    };
     for (const t of next) {
       const was = before.get(t.id);
       const wasStatus = was?.status;
@@ -804,8 +808,8 @@ export class HiveManager {
           ping(to, 'request', `Review: ${t.title}`,
             `Task "${t.title}" (${t.id}) is ready for REVIEW. Read its branch (read-only), comment via hive_update_task note; approve by setting it to 'integrate', or send it back with status 'doing' and what to fix.`);
         }
-        // No reviewer AND no god fallback ⇒ the card would sit unwatched — make it visible.
-        if (reviewers.length === 0) this.appendLog({ kind: 'drop', reason: 'no-handler', to: 'reviewer', id: t.id });
+        // No reviewer AND no god fallback ⇒ the card would sit unwatched — escalate, don't drop.
+        if (reviewers.length === 0) escalateNoHandler('reviewer', t, 'review');
       }
       if (t.status === 'integrate') {
         // SDDP: a feature card can't be merged until QC passes (.qc-passed). If it's missing,
@@ -821,15 +825,19 @@ export class HiveManager {
             ping(to, 'request', `QC: ${t.title}`,
               `Feature "${t.feature}" (card ${t.id}) is implemented and awaiting QC before integrate. Run build/tests/lint + verify the stories/SC-### against the spec, write specs/${t.feature}/qc-report.md, then create the .qc-passed marker (or file bug tasks back to the worker).`);
           }
-          if (qcs.length === 0) this.appendLog({ kind: 'drop', reason: 'no-handler', to: 'qc', id: t.id });
+          if (qcs.length === 0) escalateNoHandler('qc', t, 'integrate (awaiting QC)');
         } else {
-          // ONE integrator only (parallel hive_integrate would double-merge).
-          const to = this.roleHolderForTask('integrator', t);
+          // ONE integrator only (parallel hive_integrate would double-merge). Use REAL
+          // role-holders (godFallback=false): the god counts only if it actually HOLDS the
+          // integrator role — a pure-delegator god does not, so we escalate instead of pinging a
+          // god that can't merge (the operator's "no active integrator" case). roleHoldersForTask
+          // already prefers a LIVE holder, so this routes to the integrator that's actually up.
+          const to = this.roleHoldersForTask('integrator', t, false)[0] ?? null;
           if (to) {
             ping(to, 'request', `Integrate: ${t.title}`,
               `Task "${t.title}" (${t.id}) is approved and ready to INTEGRATE. Find its repo + branch via hive_list_agents, run the test suite as the merge gate, then hive_integrate (preview → apply), resolve any conflict or send it back, then mark it 'done'.`);
           } else {
-            this.appendLog({ kind: 'drop', reason: 'no-handler', to: 'integrator', id: t.id });
+            escalateNoHandler('integrator', t, 'integrate');
           }
         }
       }

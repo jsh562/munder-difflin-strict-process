@@ -37,7 +37,7 @@ export interface HiveTask {
 
 type Status = HiveTask['status'];
 
-/** SDDP: a feature's on-disk marker state (mirrors FeatureStatus in agent-core/preload). */
+/** SDDP: a feature's on-disk marker state (mirrors FeatureStatus in won-agent-core/preload). */
 interface FeatureStatus {
   feature: string;
   hasSpec: boolean;
@@ -52,7 +52,7 @@ interface FeatureStatus {
 const SDDP_PHASES = ['Specify', 'Clarify', 'Plan', 'Tasks', 'Implement', 'QC', 'Integrate'] as const;
 type FeaturePhase = (typeof SDDP_PHASES)[number];
 
-/** Current phase from the on-disk markers (mirrors agent-core's featurePhase derivation).
+/** Current phase from the on-disk markers (mirrors won-agent-core's featurePhase derivation).
  *  Clarify is folded into the Plan window; `hasClarifications` is shown separately. */
 function featurePhase(s: FeatureStatus): FeaturePhase {
   if (s.qcPassed) return 'Integrate';
@@ -238,6 +238,17 @@ export function TasksKanban({ onAssign }: { onAssign: (prefill: string) => void 
     return null;
   }, [agents, archivedAgents]);
 
+  // Fleet health: a lane with cards but NO active desk that can handle it — the "cards rot in
+  // integrate because no live integrator" case. Mirrors the hive's routing (the god counts only
+  // if it actually holds the role). Surfaced so the operator revives/assigns instead of waiting.
+  const hasActiveRole = (role: 'reviewer' | 'integrator'): boolean =>
+    agents.some((a) => (a.roles ?? (a.isGod ? ['integrator', 'reviewer'] : ['worker'])).includes(role));
+  const laneGaps = ([
+    { status: 'review' as Status, role: 'reviewer' as const },
+    { status: 'integrate' as Status, role: 'integrator' as const }
+  ]).map((g) => ({ ...g, count: tasks.filter((t) => t.status === g.status).length }))
+    .filter((g) => g.count > 0 && !hasActiveRole(g.role));
+
   return (
     <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', background: 'var(--cth-paper-200)' }}>
       {/* Toolbar */}
@@ -294,6 +305,22 @@ export function TasksKanban({ onAssign }: { onAssign: (prefill: string) => void 
           </span>
         </PixelButton>
       </div>
+
+      {/* Fleet-health line: cards stuck in a lane with no active role-holder (e.g. "no active
+          integrator"). The hive also escalates this to god + human; here it's a glance for the
+          operator to revive a desk or assign the role (role toggle / restore team / add agent). */}
+      {laneGaps.length > 0 && (
+        <div style={{
+          display: 'flex', flexWrap: 'wrap', gap: 12, padding: '6px 10px', flexShrink: 0,
+          background: 'var(--cth-coral-light)', boxShadow: 'inset 0 -1px 0 var(--cth-coral)'
+        }}>
+          {laneGaps.map((g) => (
+            <span key={g.status} style={{ fontSize: 11, lineHeight: '15px', color: 'var(--cth-ink-900)' }}>
+              ⚠ {g.count} in {g.status} · <b>no active {g.role}</b> — revive one or give an active desk the {g.role} role
+            </span>
+          ))}
+        </div>
+      )}
 
       {adding && (
         <AddTaskForm
