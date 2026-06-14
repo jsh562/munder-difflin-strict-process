@@ -475,14 +475,19 @@ export class HiveManager {
       : '';
     const godLine = meta.isGod
       ? 'You are the GOD / ORCHESTRATOR of this hive — your job is to ORCHESTRATE, not to implement: maintain live situational awareness and delegate the work. (1) AWARENESS — always know what is going on: keep an accurate picture of every agent (active vs archived/idle), the task board, and all in-flight work; drain your inbox continually and triage every other agent\'s requests, answering clarifications so the team runs autonomously. (2) DELEGATE — decompose work and fan it out to the hive agents via their inboxes (route messages and assign owners; do not do their jobs); do NOT take on grunt implementation yourself. (3) OWN ONLY THE IMPORTANT, high-leverage things — task decomposition, dispatch decisions, sign-offs, conflict resolution, branch integration, and final QA — and remain the sole scribe of board.md. You are otherwise fully autonomous — there is NO separate approval queue. For the genuinely critical (destructive actions, spending real money, scope changes, unresolvable conflicts), ask the human directly in your own session and let the tool-permission prompt gate the action; the human approves natively, including remotely from their phone via /remote-control. Keep the team unblocked. When you DISPATCH a task, write it as a 4-part contract so the agent can run autonomously: (1) OBJECTIVE — the concrete goal; (2) OUTPUT — the expected deliverable/format; (3) TOOLS — what to use or avoid, and any references to read instead of re-deriving; (4) BOUNDARIES — scope limits + the definition of done. Pass references (file paths, message ids, board sections), not pasted content — keep dispatches short.'
-        + ` MONITOR the floor by reading ${root}/fleet.json (live per-agent tokens, cost, status, last tool, breaker level, inbox backlog) and ${root}/registry.json — note that running 'claude agents' will NOT list your hive's sibling agents. A full Claude Code command reference is at ${root}/COMMANDS.md (slash commands act ONLY on your own session; CLI commands run in your shell and can target the fleet). You periodically receive scheduler / "Heartbeat" standup requests — on each, review every agent via fleet.json, re-engage anyone stalled, over-budget, or breaker-armed, and keep board.md and tasks.json accurate. Steward the token budget.`
+        + ` MONITOR the floor by reading ${root}/fleet.json (live per-agent tokens, cost, status, last tool, breaker level, inbox backlog) and ${root}/registry.json — note that running 'claude agents' will NOT list your hive's sibling agents. A full Claude Code command reference is at ${root}/COMMANDS.md (slash commands act ONLY on your own session; CLI commands run in your shell and can target the fleet). You periodically receive scheduler / "Heartbeat" standup requests — on each, review every agent via fleet.json, re-engage anyone stalled, over-budget, or breaker-armed, and keep board.md and tasks.json accurate. Steward the token budget. THE FLOW: a worker does its slice + runs tests then sets a card "review"; a reviewer (role-holder, else you) comments and approves it to "integrate"; an integrator (role-holder, else you) re-runs the tests as the merge gate, merges the branch, and signs it off "done" — "done" means tested. The system auto-pings the project's reviewer on "review" and ONE integrator on "integrate"; if no such desk exists it pings you as the standing fallback.`
       : meta.isAssistant
       ? 'You are Michael\'s PREP ASSISTANT. You will be handed short, possibly vague instructions (each begins with "ENRICH TASK:"). For each one: (1) figure out which project it concerns and cd into the most relevant repo — you start in Michael\'s home directory; (2) gather concrete context READ-ONLY (exact file paths, current state, relevant code, conventions, active branch, gotchas) — NEVER modify, create, or delete files; (3) rewrite the instruction into ONE clear, self-contained prompt that Michael can execute autonomously, preserving the user\'s original intent without inventing scope. Then deliver it: write ONE message JSON into your outbox with "to":"god", "act":"request", a short subject, and the finished prompt as the body. Do NOT perform the task yourself — your only output is the improved prompt sent to Michael.'
-      : 'For anything ambiguous, cross-cutting, or needing sign-off, address a message to "god".'
-        + ((meta.roles ?? []).includes('integrator')
-          ? ' You also hold the INTEGRATOR role: when a teammate marks a task "review", review their agent/<id> branch and merge it into the repo base (via git in your shell), then mark the card done; route conflicts back to the author.'
-          : '');
-    const guardrailsLine = 'Guardrails: a circuit breaker watches the floor — a "Circuit breaker: steer/constrain" message means you are looping or overspending, so STOP repeating, summarize what you tried, and follow it. Be token-frugal (a floor-wide or per-agent token budget can pause you). The shared plan has two parts: board.md (freeform; god is the sole scribe) and tasks.json (structured kanban — todo/doing/blocked/done).';
+      : [
+          'As a WORKER, the task board flows doing → (run build/tests) → review → integrate → done: do your slice, RUN the tests, commit on your agent/<id> branch, then set the card to "review" — a reviewer comments and approves it to "integrate", where an integrator merges + signs off. Do NOT advance past "review" or mark a card "done" yourself; if a card comes back to you, read its latest comment and address it. For anything ambiguous, cross-cutting, or needing sign-off, address a message to "god".',
+          (meta.roles ?? []).includes('reviewer')
+            ? 'You also hold the REVIEWER role: on a card in "review", read the author\'s agent/<id> branch READ-ONLY (do not change their code), check the tests cover the change and pass, comment on the card, then approve it to "integrate" or send it back to "doing" with exactly what to fix. You never merge or mark "done".'
+            : '',
+          (meta.roles ?? []).includes('integrator')
+            ? 'You also hold the INTEGRATOR role: on a card in "integrate", run the test suite as the merge gate, then merge the author\'s agent/<id> branch into the repo base (git in your shell) and mark the card "done"; route conflicts or red tests back to the author. You may edit only to resolve a conflict.'
+            : ''
+        ].filter(Boolean).join(' ');
+    const guardrailsLine = 'Guardrails: a circuit breaker watches the floor — a "Circuit breaker: steer/constrain" message means you are looping or overspending, so STOP repeating, summarize what you tried, and follow it. Be token-frugal (a floor-wide or per-agent token budget can pause you). The shared plan has two parts: board.md (freeform; god is the sole scribe) and tasks.json (structured kanban — todo/doing/blocked/review/integrate/done).';
     return [
       `You are "${meta.name}" (${meta.id}), an autonomous agent in a collaborating hive of Claude agents.`,
       `Your private workspace is ${dir}. The shared hive is ${root}. Full protocol: ${root}/PROTOCOL.md.`,
@@ -658,8 +663,10 @@ export class HiveManager {
   }
 
   /** Desks holding `role` "for the task's project": prefer those whose repo matches the
-   *  task's project (the assignee's repo); else any non-archived holder; else the god. The
-   *  card's own assignee is always excluded. Returns desk ids (may be several). */
+   *  task's project (the assignee's repo); else any non-archived holder; else — when NO
+   *  dedicated holder exists — the god (who holds integrator+reviewer by default and, as
+   *  `isGod`, can advance any card regardless of role). The card's own assignee is always
+   *  excluded. Returns desk ids, sorted by id so a single-pick is deterministic. */
   private roleHoldersForTask(role: AgentRole, task: HiveTask): string[] {
     const reg = this.registry();
     const holders = Object.values(reg.agents).filter(
@@ -668,8 +675,16 @@ export class HiveManager {
     const project = task.assignee ? this.repoFor(task.assignee) : null;
     const sameProject = project ? holders.filter((a) => this.repoFor(a.id) === project) : [];
     const chosen = sameProject.length ? sameProject : holders;
-    if (chosen.length) return chosen.map((a) => a.id);
+    if (chosen.length) return chosen.map((a) => a.id).sort();
+    // Zero dedicated holders for the project ⇒ the god is the standing fallback.
     return reg.godId && reg.godId !== task.assignee ? [reg.godId] : [];
+  }
+
+  /** The SINGLE desk to route a `role` action to (deterministic — first by id). Used where
+   *  fanning out would be unsafe, e.g. `integrate` (two integrators running `hive_integrate`
+   *  in parallel would double-merge). */
+  private roleHolderForTask(role: AgentRole, task: HiveTask): string | null {
+    return this.roleHoldersForTask(role, task)[0] ?? null;
   }
 
   /** Fire best-effort notifications on task transitions (diff prev→next), from 'system'
@@ -695,14 +710,19 @@ export class HiveManager {
         }
       }
       if (t.status === 'integrate') {
-        for (const to of this.roleHoldersForTask('integrator', t)) {
+        // ONE integrator only (parallel hive_integrate would double-merge).
+        const to = this.roleHolderForTask('integrator', t);
+        if (to) {
           ping(to, 'request', `Integrate: ${t.title}`,
-            `Task "${t.title}" (${t.id}) is approved and ready to INTEGRATE. Find its repo + branch via hive_list_agents, hive_integrate (preview → apply), resolve any conflict or send it back, then mark it 'done'.`);
+            `Task "${t.title}" (${t.id}) is approved and ready to INTEGRATE. Find its repo + branch via hive_list_agents, run the test suite as the merge gate, then hive_integrate (preview → apply), resolve any conflict or send it back, then mark it 'done'.`);
         }
       }
       if (t.status === 'doing' && (wasStatus === 'review' || wasStatus === 'integrate') && t.assignee) {
+        // Hand the worker the actual feedback (newest comment), not just "see the card".
+        const last = t.comments?.at(-1);
+        const feedback = last ? ` Latest feedback (${last.by}): "${last.text}"` : ' See the card comments and address them.';
         ping(t.assignee, 'inform', `Changes requested: ${t.title}`,
-          `Task "${t.title}" (${t.id}) was sent back to you (from ${wasStatus}). See the latest note on the card and address it.`);
+          `Task "${t.title}" (${t.id}) was sent back to you (from ${wasStatus}).${feedback}`);
       }
     }
   }

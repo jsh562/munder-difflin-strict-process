@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { join, resolve, sep } from 'node:path';
 
 /** Run git in `cwd` with `args`. Returns stdout text or an error. */
 function runGit(cwd: string, args: string[], timeoutMs = 8000): Promise<{
@@ -209,6 +210,52 @@ export function agentBranchFor(wtPath: string): string {
   const base = wtPath.split(/[\\/]/).filter(Boolean).pop() ?? 'agent';
   const slug = base.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'agent';
   return `agent/${slug}`;
+}
+
+/** Small deterministic hash (djb2 → base36) — repo-discriminates a worktree path when a
+ *  desk changes project, so its new worktree can't collide with an old repo's at the same id. */
+export function shortHash(s: string): string {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = (((h << 5) + h) ^ s.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(36);
+}
+
+export interface WorktreePlan {
+  /** reattach = reuse an existing worktree (no git op); create = `addWorktree`; skip = run in
+   *  the shared cwd (no isolation). */
+  action: 'reattach' | 'create' | 'skip';
+  path: string;
+}
+
+/**
+ * Decide a worker desk's worktree WITHOUT touching git/fs (pure → unit-testable). A desk's
+ * worktree path is keyed by its (slugified) agent id, so:
+ *  - if a worktree for this agent is already REGISTERED to `origCwd` → **reattach** (a restart
+ *    of an isolated desk must reuse it, not try to re-create it — independent of `forceNew`);
+ *  - if the primary path is taken on disk by a DIFFERENT repo (a workspace change) → use a
+ *    repo-hashed fallback path (reattach there if registered, else create) so the two repos'
+ *    worktrees never collide;
+ *  - otherwise **create** a fresh worktree, but only when isolation is wanted (`forceNew`);
+ *  - an unsafe (escaping) path → **skip**.
+ * `registered` = resolved paths git reports as worktrees of `origCwd`; `exists` = a disk check.
+ */
+export function planWorktree(args: {
+  wtRoot: string; agentId: string; origCwd: string; forceNew: boolean;
+  registered: string[]; exists: (p: string) => boolean;
+}): WorktreePlan {
+  const { wtRoot, agentId, origCwd, forceNew, registered, exists } = args;
+  const seg = agentId.replace(/[^A-Za-z0-9._-]/g, '-');
+  const under = (p: string) => resolve(p).startsWith(resolve(wtRoot) + sep);
+  const reg = new Set(registered.map((p) => resolve(p)));
+  const primary = join(wtRoot, seg);
+  if (!under(primary)) return { action: 'skip', path: primary };
+  if (reg.has(resolve(primary))) return { action: 'reattach', path: primary };
+  const collision = exists(primary); // taken on disk but not a worktree of this repo
+  const target = collision ? join(wtRoot, `${seg}-${shortHash(origCwd)}`) : primary;
+  if (collision && !under(target)) return { action: 'skip', path: target };
+  if (collision && reg.has(resolve(target))) return { action: 'reattach', path: target };
+  if (!forceNew) return { action: 'skip', path: target };
+  return { action: 'create', path: target };
 }
 
 /** Provision an isolated git worktree for an agent at `wtPath`, branching off

@@ -10,7 +10,7 @@ import {
 import { listDir, readFileText, writeFileText } from './fs';
 import {
   getBranch, getStatus, getLog, getBranches, getAheadBehind, isRepo,
-  addWorktree, removeWorktree, listWorktrees, type GitWorktree,
+  addWorktree, removeWorktree, listWorktrees, planWorktree, type GitWorktree,
   previewMerge, mergeBranch, agentBranchFor
 } from './git';
 import { HiveManager, type AgentMeta, type HiveMessage, type HiveTask, type AgentRole } from './hive';
@@ -192,6 +192,37 @@ const worktreeOrigins = new Map<string, string>();
 hive.setRepoResolver((id) => worktreeOrigins.get(`pty-${id}`) ?? hive.registry().agents[id]?.cwd ?? null);
 
 /**
+ * Reattach-or-isolate a worker desk's git worktree. The desk's worktree path is keyed by its
+ * (slugified) agent id, so a RESTART of a previously-isolated desk must REUSE the existing
+ * worktree — not try to re-create it (which fails because the path is taken, then the desk
+ * silently runs in the shared tree and loses its `agent/<id>` branch). The pure decision lives
+ * in `planWorktree` (git.ts, unit-tested); this wires the real git/fs around it. Best-effort:
+ * any failure returns null (fall back to the shared cwd rather than blocking the spawn).
+ */
+async function provisionWorktree(
+  origCwd: string, agentId: string, forceNew: boolean
+): Promise<{ path: string; origin: string } | null> {
+  try {
+    const wtRoot = join(readConfig().harnessHome ?? origCwd, 'worktrees');
+    const list = await listWorktrees(origCwd);
+    const registered = Array.isArray(list) ? list.map((w) => w.path) : [];
+    const plan = planWorktree({ wtRoot, agentId, origCwd, forceNew, registered, exists: existsSync });
+    if (plan.action === 'skip') return null;
+    if (plan.action === 'reattach') return { path: plan.path, origin: origCwd };
+    // create
+    const br = await getBranch(origCwd);
+    const baseBranch = 'current' in br && br.current ? br.current : 'main';
+    const wt = await addWorktree(origCwd, plan.path, baseBranch);
+    if (wt.ok) return { path: plan.path, origin: origCwd };
+    console.error('[worktree] addWorktree failed:', wt.error);
+    return null;
+  } catch (e) {
+    console.error('[worktree] provision failed:', e);
+    return null;
+  }
+}
+
+/**
  * Tear down everything tied to a PTY id: archive its hive agent, remove its
  * isolated git worktree, and drop the bookkeeping-map entries. Runs on BOTH an
  * explicit `pty:kill` AND a natural PTY exit (the child finished, crashed, or
@@ -356,14 +387,14 @@ function nativeGodPrompt(godIntegrates: boolean, godReviews: boolean): string {
     'You are the GOD / ORCHESTRATOR of this hive of agents (you are "Michael"). Your job is to ORCHESTRATE, not implement: keep awareness of the whole team and delegate the work.',
     '- KNOW THE TEAM: before delegating, call hive_list_agents to see who exists, who is running, and each desk\'s roles — assign to the best AVAILABLE desk, never blind.',
     '- DELEGATE: decompose a request into slices; for each, hive_add_task (a card assigned to a worker desk) and hive_send_message that desk a short 4-part brief (objective / output / tools+references / boundaries+done). Different slices can go to different desks in parallel. Do NOT do the grunt implementation yourself.',
-    '- THE FLOW (worker → reviewer → integrator): a WORKER writes + commits its slice on its own branch and moves the card "doing"→"review". A REVIEWER reads it (read-only, comments only) and either approves it to "integrate" or sends it back to "doing". An INTEGRATOR merges an "integrate" card and signs it off to "done". Keep cards moving along this chain.',
-    '- RUN THE BOARD (live source of truth): at turn start reconcile it — hive_list_tasks, fix stale cards with hive_update_task. You set assign/reprioritize.',
+    '- THE FLOW (worker → reviewer → integrator): a WORKER writes + commits its slice on its own branch, RUNS the build/tests, and moves the card "doing"→"review". A REVIEWER reads it (read-only, comments only) and either approves it to "integrate" or sends it back to "doing". An INTEGRATOR re-runs the test suite as the merge gate, merges an "integrate" card, and signs it off to "done". "Done" means tested. Keep cards moving along this chain.',
+    '- RUN THE BOARD (live source of truth): at turn start reconcile it — hive_list_tasks, fix stale cards with hive_update_task. You set assign/reprioritize. When several reviewers exist, all are pinged but only the first to advance a card lands; integration is routed to ONE integrator to avoid a double-merge.',
     godReviews
-      ? '- REVIEW work (you hold the reviewer role): when a card enters "review", read the desk\'s branch (read-only), comment via a hive_update_task note, then approve it to "integrate" or send it back to "doing" with what to fix.'
-      : '- DELEGATE REVIEW: you do NOT hold the reviewer role. The desk(s) holding "reviewer" are auto-pinged on "review"; keep them fed and unblocked rather than reviewing yourself.',
+      ? '- REVIEW work (you hold the reviewer role): when a card enters "review", read the desk\'s branch (read-only), confirm tests exist + cover the change + the worker\'s reported run is green, comment via a hive_update_task note, then approve it to "integrate" or send it back to "doing" with what to fix.'
+      : '- REVIEW is delegated: prefer a desk holding "reviewer" (auto-pinged on "review"). But if NO reviewer desk exists you are the standing fallback — the system pings YOU, so review it yourself (read-only) and approve to "integrate" or send it back.',
     godIntegrates
-      ? '- INTEGRATE approved work (you hold the integrator role): each worker commits its slice on its own worktree branch (hive_list_agents shows each desk\'s repo + branch). On an "integrate" card, hive_integrate (no apply) to inspect the commits/diff, then hive_integrate apply:true to merge into the repo\'s base — then mark the card "done". A reported conflict means resolve it yourself (you may edit only to resolve the conflict) or send it back to the author. You own sign-off (done/reopen).'
-      : '- DELEGATE INTEGRATION: you do NOT hold the integrator role. When a card reaches "integrate", find the desk whose roles include "integrator" via hive_list_agents and hive_send_message it the task id + its repo + branch to merge + sign off (the system also auto-pings that desk on "integrate", so this is a backstop). You never merge or hand-edit yourself.',
+      ? '- INTEGRATE approved work (you hold the integrator role): each worker commits its slice on its own worktree branch (hive_list_agents shows each desk\'s repo + branch). On an "integrate" card, RUN the test suite as the merge gate, hive_integrate (no apply) to inspect the commits/diff, then hive_integrate apply:true to merge into the repo\'s base — then mark the card "done". A reported conflict (or red tests) means resolve it yourself (you may edit only to resolve the conflict) or send it back to the author. You own sign-off (done/reopen).'
+      : '- INTEGRATION is delegated: prefer a desk holding "integrator" (auto-pinged on "integrate"). But if NO integrator desk exists you are the standing fallback — the system pings YOU, so merge it yourself: run the tests, hive_integrate (preview → apply), then mark "done".',
     '- YOU CANNOT TOUCH PROJECT FILES: your working directory is your own scratch workspace, NOT any project repo — your tools are sandboxed to it, so you literally cannot read or edit project code. Each project lives in a worker desk\'s own repo, so ALL implementation MUST be delegated; trying to do it yourself will just fail.',
     '- IF NO WORKER DESKS ARE ALIVE to take the work, do NOT attempt it yourself — tell the operator exactly which team/desks to spawn, then orchestrate once they are up.',
     '- COORDINATE: answer agents\' questions so the team runs autonomously; read a peer\'s memory with hive_read_memory when you need context; record durable decisions with write_memory.',
@@ -376,17 +407,17 @@ function nativeGodPrompt(godIntegrates: boolean, godReviews: boolean): string {
 // it comments and routes the card.
 const NATIVE_AGENT_REVIEWER_PROMPT = [
   'You also hold the REVIEWER role: you REVIEW other desks\' finished work — you READ and COMMENT, you do NOT change code (write_file/edit_file/bash are blocked for you).',
-  '- You are PINGED automatically when a card enters "review"; you should ALSO, on each wake, scan hive_list_tasks for cards in "review" and review them — don\'t wait to be asked.',
-  '- hive_list_agents shows each desk\'s repo + worktree branch. Read the branch\'s diff/files (read_file/list_dir/grep — read-only), then leave a hive_update_task note (and hive_send_message the author for anything substantive).',
-  '- APPROVE: when it\'s good, hive_update_task the card to "integrate" (an integrator will merge it). REQUEST CHANGES: send it back with status "doing" and a clear note of exactly what to fix. You never merge and never mark "done".'
+  '- You are PINGED automatically when a card enters "review"; you should ALSO, on each wake, scan hive_list_tasks for cards in "review" and review them — don\'t wait to be asked. If several reviewers exist you may all look, but only the first to advance the card lands — so check it\'s still in "review" before acting.',
+  '- hive_list_agents shows each desk\'s repo + worktree branch. Read the branch\'s diff/files (read_file/list_dir/grep — read-only). CHECK THE TESTS: confirm tests exist, cover the change, and the worker recorded a green run (you cannot run them yourself — you are read-only). Leave your feedback as a hive_update_task `note` (it becomes an attributed comment on the card; the worker is handed it automatically on send-back).',
+  '- APPROVE: when it\'s good (and tested), hive_update_task the card to "integrate" (an integrator will merge it). REQUEST CHANGES: send it back with status "doing" and a `note` of exactly what to fix. You never merge and never mark "done".'
 ].join('\n');
 
 // Injected into a NON-god desk that holds the `integrator` role (a dedicated integrator).
 const NATIVE_AGENT_INTEGRATOR_PROMPT = [
-  'You also hold the INTEGRATOR role: you MERGE other desks\' approved work and sign it off (you do not re-implement it).',
-  '- You are PINGED automatically when a card enters "integrate"; you should ALSO, on each wake, scan hive_list_tasks for any cards in "integrate" and merge them — don\'t wait to be asked.',
-  '- hive_list_agents shows each desk\'s repo + worktree branch. For an "integrate" card, use hive_integrate (no apply) to inspect the commits + diff, then hive_integrate apply:true to merge that branch into the repo\'s base branch, then hive_update_task it to "done".',
-  '- A reported merge conflict aborts cleanly — resolve it yourself (you may edit ONLY to settle the conflict) or send the card back to its author (hive_send_message, status "doing") to rebase/resolve; never force it.'
+  'You also hold the INTEGRATOR role: you MERGE other desks\' approved work and sign it off (you do not re-implement it). You are the project\'s last quality gate.',
+  '- You are PINGED automatically when a card enters "integrate" (one integrator is picked, so no double-merge); you should ALSO, on each wake, scan hive_list_tasks for any cards in "integrate" and merge them — don\'t wait to be asked.',
+  '- hive_list_agents shows each desk\'s repo + worktree branch. For an "integrate" card: FIRST run the test suite (bash) as the merge gate — if it is red, send the card back to its author (status "doing") with a `note`; do not merge red work. If green, hive_integrate (no apply) to inspect commits + diff, then hive_integrate apply:true to merge into the repo\'s base branch, then hive_update_task it to "done".',
+  '- A reported merge conflict aborts cleanly — resolve it yourself (you may edit ONLY to settle the conflict) or send the card back to its author (status "doing", with a `note`) to rebase/resolve; never force it.'
 ].join('\n');
 
 // E003 — native (non-Claude) agents run in isolated utilityProcess workers,
@@ -938,9 +969,11 @@ ipcMain.handle('pty:spawn', async (_evt, opts: SpawnOptions & { hive?: AgentMeta
   // Git isolation: give the agent its own worktree on an `agent/<id>` branch so it can't
   // clobber other agents' (or the user's) working tree. AUTO-isolate when the target repo
   // already hosts another (non-archived) worker — the newcomer gets a worktree while the
-  // FIRST agent keeps the main tree (the integration base); the explicit "isolate"
-  // checkbox forces it regardless. Best-effort — a failure falls back to the shared cwd
-  // rather than blocking the spawn. (The god/assistant never isolate; their cwd isn't a repo.)
+  // FIRST agent keeps the main tree (the integration base); the explicit "isolate" checkbox
+  // forces it regardless. A RESTART of an already-isolated desk REATTACHES to its existing
+  // worktree (see provisionWorktree) even when neither flag is set, so a role-toggle
+  // auto-restart never silently drops a desk back into the shared tree. Best-effort — a
+  // failure falls back to the shared cwd. (The god/assistant never isolate; their cwd isn't a repo.)
   const isWorkerDesk = !!opts.hive && !opts.hive.isGod && !opts.hive.isAssistant;
   const repoOccupied =
     isWorkerDesk &&
@@ -948,32 +981,12 @@ ipcMain.handle('pty:spawn', async (_evt, opts: SpawnOptions & { hive?: AgentMeta
       Object.values(hive.registry().agents).some(
         (a) => !a.archived && a.cwd === opts.cwd && a.id !== opts.hive!.id
       ));
-  if ((opts.isolate === true || repoOccupied) && await isRepo(opts.cwd)) {
-    try {
-      const origCwd = opts.cwd;
-      const wtRoot = join(readConfig().harnessHome ?? origCwd, 'worktrees');
-      // The id is renderer-supplied (validated only as a string). Slugify it so a
-      // crafted id can't inject path separators, then assert the resolved path
-      // stays under the worktrees root (defends against bare '..' that slugify
-      // leaves intact). If it would escape, bail isolation → fall back to cwd.
-      const seg = (opts.hive?.id ?? opts.id).replace(/[^A-Za-z0-9._-]/g, '-');
-      const wtPath = join(wtRoot, seg);
-      if (!resolve(wtPath).startsWith(resolve(wtRoot) + sep)) {
-        console.error('[worktree] refusing unsafe worktree path for id:', opts.hive?.id ?? opts.id);
-      } else {
-        const br = await getBranch(origCwd);
-        const baseBranch = 'current' in br && br.current ? br.current : 'main';
-        const wt = await addWorktree(origCwd, wtPath, baseBranch);
-        if (wt.ok) {
-          opts.cwd = wtPath;
-          worktreePaths.set(opts.id, wtPath);
-          worktreeOrigins.set(opts.id, origCwd);
-        } else {
-          console.error('[worktree] addWorktree failed:', wt.error);
-        }
-      }
-    } catch (e) {
-      console.error('[worktree] isolation failed:', e);
+  if (isWorkerDesk && await isRepo(opts.cwd)) {
+    const wt = await provisionWorktree(opts.cwd, opts.hive?.id ?? opts.id, opts.isolate === true || repoOccupied);
+    if (wt) {
+      opts.cwd = wt.path;
+      worktreePaths.set(opts.id, wt.path);
+      worktreeOrigins.set(opts.id, wt.origin);
     }
   }
   // If the agent carries hive metadata, provision its workspace and inject the

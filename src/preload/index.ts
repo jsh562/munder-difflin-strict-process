@@ -37,6 +37,13 @@ export interface HiveRegistry {
   agents: Record<string, HiveAgentMeta & { status: string; lastSeen: number; archived?: boolean }>;
 }
 
+/** An attributed comment on a task card (reviewer feedback, worker test result). */
+export interface HiveComment {
+  by: string;
+  at: string;
+  text: string;
+}
+
 /** A card on the task kanban, persisted to hive/tasks.json. */
 export interface HiveTask {
   id: string;
@@ -47,6 +54,8 @@ export interface HiveTask {
   dependsOn: string[];
   /** Task id(s) currently blocking this card (set when status='blocked'). */
   blockedBy?: string[];
+  /** Attributed feedback thread (newest last). */
+  comments?: HiveComment[];
   priority: number;
   createdAt: string;
 }

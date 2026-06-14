@@ -9,6 +9,12 @@ import { useStore } from '@/store/store';
  *  re-declared locally so the renderer doesn't reach into the preload package
  *  (same convention as store/config.ts). Structurally compatible with
  *  window.cth.hiveWriteTasks. */
+export interface HiveComment {
+  by: string;
+  at: string;
+  text: string;
+}
+
 export interface HiveTask {
   id: string;
   title: string;
@@ -18,6 +24,8 @@ export interface HiveTask {
   dependsOn: string[];
   /** Task id(s) this card is waiting on while `blocked` (shown as "blocked by"). */
   blockedBy?: string[];
+  /** Attributed feedback thread (newest last). */
+  comments?: HiveComment[];
   priority: number;
   createdAt: string;
 }
@@ -70,6 +78,16 @@ function parseTasks(raw: unknown): HiveTask[] {
         ? (t.status as Status) : 'todo',
       dependsOn: Array.isArray(t.dependsOn) ? t.dependsOn.filter((d): d is string => typeof d === 'string') : [],
       blockedBy: Array.isArray(t.blockedBy) ? t.blockedBy.filter((d): d is string => typeof d === 'string') : undefined,
+      comments: Array.isArray(t.comments)
+        ? (t.comments as unknown[])
+            .filter((c): c is Record<string, unknown> => !!c && typeof c === 'object')
+            .map((c) => ({
+              by: typeof c.by === 'string' ? c.by : '?',
+              at: typeof c.at === 'string' ? c.at : '',
+              text: typeof c.text === 'string' ? c.text : ''
+            }))
+            .filter((c) => c.text)
+        : undefined,
       priority: typeof t.priority === 'number' ? t.priority : 3,
       createdAt: typeof t.createdAt === 'string' ? t.createdAt : new Date().toISOString()
     }));
@@ -195,6 +213,7 @@ export function TasksKanban({ onAssign }: { onAssign: (prefill: string) => void 
                     key={t.id}
                     task={t}
                     assigneeName={nameFor(t.assignee)}
+                    nameFor={nameFor}
                     flashing={flashId === t.id}
                     blockers={(t.blockedBy ?? []).map((bid) => ({ id: bid, title: titleFor(bid) }))}
                     otherTasks={tasks.filter((x) => x.id !== t.id).map((x) => ({ id: x.id, title: x.title }))}
@@ -216,9 +235,10 @@ export function TasksKanban({ onAssign }: { onAssign: (prefill: string) => void 
 
 // ─── Card ────────────────────────────────────────────────────────────────────
 
-function TaskCard({ task, assigneeName, flashing, blockers, otherTasks, registerRef, onMove, onAssign, onJump, onSetBlockedBy }: {
+function TaskCard({ task, assigneeName, nameFor, flashing, blockers, otherTasks, registerRef, onMove, onAssign, onJump, onSetBlockedBy }: {
   task: HiveTask;
   assigneeName?: string;
+  nameFor: (id?: string) => string | undefined;
   flashing?: boolean;
   blockers: { id: string; title: string }[];
   otherTasks: { id: string; title: string }[];
@@ -262,6 +282,27 @@ function TaskCard({ task, assigneeName, flashing, blockers, otherTasks, register
               }}
             >{b.title}</button>
           ))}
+        </div>
+      )}
+
+      {/* Comment thread (reviewer feedback / test results) — newest 2, author + text. */}
+      {task.comments && task.comments.length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+          {task.comments.slice(-2).map((c, i) => (
+            <div key={i} style={{
+              padding: '3px 6px 2px', background: 'var(--cth-lilac-light)',
+              boxShadow: 'inset 0 0 0 1px var(--cth-ink-300)', fontSize: 11, lineHeight: '15px',
+              color: 'var(--cth-ink-900)'
+            }}>
+              <span style={{ fontFamily: 'var(--cth-font-display)', fontSize: 8, color: 'var(--cth-ink-700)' }}>
+                {(nameFor(c.by) ?? c.by).toUpperCase()}
+              </span>
+              <span style={{ marginLeft: 4 }}>{c.text}</span>
+            </div>
+          ))}
+          {task.comments.length > 2 && (
+            <span style={{ fontSize: 10, color: 'var(--cth-ink-300)' }}>+{task.comments.length - 2} earlier</span>
+          )}
         </div>
       )}
 
