@@ -189,7 +189,13 @@ const worktreeOrigins = new Map<string, string>();
 // Tell the hive how to resolve a desk's *project repo* (used to match a task's
 // reviewer/integrator to the project it belongs to). An isolated desk's cwd is its
 // worktree, so prefer the worktree's ORIGIN repo; otherwise the desk's registry cwd.
-hive.setRepoResolver((id) => worktreeOrigins.get(`pty-${id}`) ?? hive.registry().agents[id]?.cwd ?? null);
+/** Resolve a desk's *project repo*: an isolated desk's cwd is its worktree, so prefer the
+ *  worktree's ORIGIN repo; otherwise the desk's registry cwd. Used both by the hive (to match
+ *  a task's reviewer/integrator to its project) and by the scheduler (per-project missions). */
+function repoForId(id: string): string | null {
+  return worktreeOrigins.get(`pty-${id}`) ?? hive.registry().agents[id]?.cwd ?? null;
+}
+hive.setRepoResolver(repoForId);
 
 /**
  * Reattach-or-isolate a worker desk's git worktree. The desk's worktree path is keyed by its
@@ -329,13 +335,25 @@ const agentToolDeps: AgentToolDeps = {
   canIntegrate: (id) => (hive.registry().agents[id]?.roles ?? []).includes('integrator'),
   // Holds the `reviewer` role? Lets it approve/send-back a card in `review`.
   canReview: (id) => (hive.registry().agents[id]?.roles ?? []).includes('reviewer'),
-  // May edit code? Worker/integrator + god/assistant yes; a PURE reviewer is read-only.
+  // May edit code (write_file/edit_file/bash)? Role-driven, NO god/assistant special-case:
+  // the `worker` role (writes features + tests) and the `integrator` role (writes merge-fix
+  // code) grant editing; a reviewer / no-edit-role / assistant desk is read-only. This is the
+  // god's delegation lever — a god holding neither worker nor integrator (e.g. reviewer-only)
+  // physically cannot implement, so it must delegate. Read live so a role toggle applies at once.
   canEditCode: (id) => {
     const a = hive.registry().agents[id];
     if (!a) return true; // unknown desk → don't over-restrict
     const roles = a.roles ?? [];
-    return a.isGod === true || a.isAssistant === true || roles.includes('worker') || roles.includes('integrator');
+    return roles.includes('worker') || roles.includes('integrator');
   },
+  // Extra READ roots: every desk may READ any registered project repo + any worktree (to
+  // compare versions or read a peer's branch — the god/reviewer especially need this), while
+  // WRITES stay confined to the desk's own cwd (resolveInsideCwd). Read wide, write narrow.
+  readRoots: () => Array.from(new Set<string>([
+    ...(readConfig().registeredRepos ?? []),
+    ...worktreeOrigins.values(),
+    ...worktreePaths.values()
+  ])),
   // The god's integration seam (hive_integrate): review/merge a worker's branch into its
   // repo. Scoped to REGISTERED repos (+ live worktree origins) for safety; git runs in
   // main (single-committer). apply:false previews, true merges (conflicts abort + report).
@@ -395,7 +413,9 @@ function nativeGodPrompt(godIntegrates: boolean, godReviews: boolean): string {
     godIntegrates
       ? '- INTEGRATE approved work (you hold the integrator role): each worker commits its slice on its own worktree branch (hive_list_agents shows each desk\'s repo + branch). On an "integrate" card, RUN the test suite as the merge gate, hive_integrate (no apply) to inspect the commits/diff, then hive_integrate apply:true to merge into the repo\'s base — then mark the card "done". A reported conflict (or red tests) means resolve it yourself (you may edit only to resolve the conflict) or send it back to the author. You own sign-off (done/reopen).'
       : '- INTEGRATION is delegated: prefer a desk holding "integrator" (auto-pinged on "integrate"). But if NO integrator desk exists you are the standing fallback — the system pings YOU, so merge it yourself: run the tests, hive_integrate (preview → apply), then mark "done".',
-    '- YOU CANNOT TOUCH PROJECT FILES: your working directory is your own scratch workspace, NOT any project repo — your tools are sandboxed to it, so you literally cannot read or edit project code. Each project lives in a worker desk\'s own repo, so ALL implementation MUST be delegated; trying to do it yourself will just fail.',
+    '- READ TO ORCHESTRATE: you CAN read any project repo + worktree (read_file/list_dir/grep with the repo/branch paths from hive_list_agents) — use that to decompose work and review branches. Your own working directory is just a neutral home base, not where the projects live.',
+    '- DO NOT IMPLEMENT: building feature code is the WORKERS\' job — always delegate it. You have code-EDITING tools (write_file/edit_file/bash) ONLY while you hold a `worker` or `integrator` role; if the operator leaves both off you are a pure orchestrator with NO edit tools and MUST delegate everything. Even when you hold `integrator`, edit ONLY to merge / resolve conflicts — never to build a feature slice yourself.',
+    '- STAY WITH THE OWNER: a card stays with its original worker through review and send-back — the code lives on that worker\'s `agent/<id>` worktree branch, so only that worker can naturally continue it. Only reassign a card if its worker is genuinely gone, and then hand the branch over explicitly.',
     '- IF NO WORKER DESKS ARE ALIVE to take the work, do NOT attempt it yourself — tell the operator exactly which team/desks to spawn, then orchestrate once they are up.',
     '- COORDINATE: answer agents\' questions so the team runs autonomously; read a peer\'s memory with hive_read_memory when you need context; record durable decisions with write_memory.',
     'The human operator is watching this transcript and can message you directly — surface anything genuinely critical to them.'
@@ -521,6 +541,38 @@ function clearMissionTimers(): void {
  *  interval. Each tick dispatches the mission to its target agent and stamps
  *  lastFiredAt back into config. Called on boot (after the router starts) and
  *  after every missions:save. */
+/** Dispatch a mission once: send its body to its target(s) — the single `to` recipient, or,
+ *  when `project` is set, EVERY non-archived desk whose project repo matches (per-project
+ *  scoping) — then run auto-compact and stamp lastFiredAt. Shared by the interval timer and
+ *  the on-demand "fire now" IPC. Best-effort; never throws into the timer. */
+function fireMission(m: ScheduledMission): void {
+  try {
+    if (hive.enabled()) {
+      const targets = m.project
+        ? Object.values(hive.registry().agents)
+            .filter((a) => !a.archived && repoForId(a.id) === m.project)
+            .map((a) => a.id)
+        : [m.to];
+      for (const to of targets) {
+        hive.send({ to, act: 'request', subject: m.label, body: m.body }, 'scheduler');
+      }
+    }
+    // Auto-compact: do NOT jam /compact into busy terminals. Hand it to the renderer, which
+    // queues a /compact per agent (deduped — never two at once) and delivers it only when
+    // that agent goes idle (its drain loop), so a working agent compacts between steps.
+    if (m.autoCompact) {
+      try { liveWebContents()?.send('mission:autoCompact'); } catch { /* window gone */ }
+    }
+    const current = readConfig().missions ?? [];
+    const next = current.map((x) => (x.id === m.id ? { ...x, lastFiredAt: Date.now() } : x));
+    writeConfig({ missions: next });
+    // Let the SCHEDULES panel refresh its "last fired" without a reload (#2.3).
+    try { liveWebContents()?.send('missions:updated'); } catch { /* window gone */ }
+  } catch (e) {
+    console.error('[scheduler] mission', m.id, e);
+  }
+}
+
 function syncMissions(): void {
   clearMissionTimers();
   const missions = readConfig().missions ?? [];
@@ -530,29 +582,7 @@ function syncMissions(): void {
     // with an adaptive cadence. Registered into the same missionTimers map so
     // clearMissionTimers() tears it down identically on quit/reset.
     if (m.kind === 'heartbeat') { armHeartbeat(m); continue; }
-    const fire = (): void => {
-      try {
-        if (hive.enabled()) {
-          hive.send({ to: m.to, act: 'request', subject: m.label, body: m.body }, 'scheduler');
-        }
-        // Auto-compact: do NOT jam /compact into busy terminals. Hand it to the
-        // renderer, which queues a /compact per agent (deduped — never two at
-        // once) and delivers it only when that agent goes idle (its drain loop),
-        // so a working agent compacts between steps, never mid-step.
-        if (m.autoCompact) {
-          try { liveWebContents()?.send('mission:autoCompact'); } catch { /* window gone */ }
-        }
-        const current = readConfig().missions ?? [];
-        const next = current.map((x) =>
-          x.id === m.id ? { ...x, lastFiredAt: Date.now() } : x
-        );
-        writeConfig({ missions: next });
-        // Let the SCHEDULES panel refresh its "last fired" without a reload (#2.3).
-        try { liveWebContents()?.send('missions:updated'); } catch { /* window gone */ }
-      } catch (e) {
-        console.error('[scheduler] mission', m.id, e);
-      }
-    };
+    const fire = (): void => fireMission(m);
     // Honor lastFiredAt so a partially-elapsed interval is not restarted from
     // zero on reboot or when an unrelated mission is edited: wait only the time
     // remaining until the next due fire, then settle into a steady interval.
@@ -1613,6 +1643,16 @@ ipcMain.handle('missions:save', (_evt, missions) => {
   });
   writeConfig({ missions: merged });
   syncMissions();
+  return { ok: true };
+});
+// Fire a mission immediately (the SCHEDULES "fire now" button), independent of its
+// interval — dispatches its body to the target(s) right now. lastFiredAt updates, so the
+// next interval fire shifts accordingly. (Heartbeat fires on its own adaptive beat, but a
+// manual fire still drops its prompt into god's inbox, which is a useful nudge.)
+ipcMain.handle('missions:fireNow', (_evt, id: unknown) => {
+  const m = (readConfig().missions ?? []).find((x) => x.id === id);
+  if (!m) return { ok: false, error: 'no such mission' };
+  fireMission(m);
   return { ok: true };
 });
 

@@ -103,6 +103,8 @@ export interface ScheduledMission {
   kind?: 'dispatch' | 'heartbeat';
   /** Heartbeat only: floor-quiet threshold in ms. */
   quietThresholdMs?: number;
+  /** Per-project scoping (a repo path): fire to that project's desks instead of `to`. */
+  project?: string;
 }
 
 /** Circuit-breaker thresholds (Lane A #6.6b). Mirrors src/main/config.ts. */
@@ -611,6 +613,9 @@ const api = {
   listMissions: (): Promise<ScheduledMission[]> => ipcRenderer.invoke('missions:list'),
   saveMissions: (missions: ScheduledMission[]): Promise<{ ok: boolean }> =>
     ipcRenderer.invoke('missions:save', missions),
+  /** Fire a mission immediately (the "fire now" button), regardless of its interval. */
+  fireMission: (id: string): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('missions:fireNow', id),
   /** Fires when the scheduler stamps a mission's lastFiredAt (a beat/dispatch),
    *  so the SCHEDULES panel can refresh "last fired" without a reload. */
   onMissionsUpdated: (cb: () => void): (() => void) => {

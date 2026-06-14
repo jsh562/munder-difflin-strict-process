@@ -24,6 +24,10 @@ export interface ScheduledMission {
    *  inbox/outbox mtimes, any PTY output) has moved in this many ms. Default
    *  ~5 min. NOT derived from registry.status (which never transitions in main). */
   quietThresholdMs?: number;
+  /** Per-project scoping (a repo path). When set, the mission fires to every non-archived
+   *  desk whose project matches this repo (instead of the single `to`), so a standup/triage
+   *  can target one project's team. Absent ⇒ the plain `to` recipient. */
+  project?: string;
 }
 
 /** The built-in hourly ops standup: god reviews who's doing what + whether tasks

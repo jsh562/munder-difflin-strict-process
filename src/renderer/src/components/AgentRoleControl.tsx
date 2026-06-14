@@ -31,21 +31,30 @@ export function AgentRoleControl({ agent }: { agent: Agent }) {
     scheduleDeskRestart(agent.id);
   };
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-      <span style={{ fontFamily: 'var(--cth-font-display)', fontSize: 8, color: 'var(--cth-ink-500)' }}>ROLES</span>
-      {(['worker', 'reviewer', 'integrator'] as AgentRole[]).map((r) => (
-        <button
-          key={r}
-          onClick={() => toggle(r)}
-          title={ROLE_META[r].tip}
-          style={{
-            padding: '2px 8px 1px', border: 'none', cursor: 'pointer',
-            background: has(r) ? ROLE_META[r].on : 'var(--cth-cream-200)',
-            boxShadow: `inset 0 0 0 1px ${has(r) ? 'var(--cth-ink-900)' : 'var(--cth-ink-700)'}`,
-            fontFamily: 'var(--cth-font-ui)', fontSize: 11, color: 'var(--cth-ink-900)'
-          }}
-        >{r}</button>
-      ))}
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+        <span style={{ fontFamily: 'var(--cth-font-display)', fontSize: 8, color: 'var(--cth-ink-500)' }}>ROLES</span>
+        {(['worker', 'reviewer', 'integrator'] as AgentRole[]).map((r) => (
+          <button
+            key={r}
+            onClick={() => toggle(r)}
+            title={ROLE_META[r].tip}
+            style={{
+              padding: '2px 8px 1px', border: 'none', cursor: 'pointer',
+              background: has(r) ? ROLE_META[r].on : 'var(--cth-cream-200)',
+              boxShadow: `inset 0 0 0 1px ${has(r) ? 'var(--cth-ink-900)' : 'var(--cth-ink-700)'}`,
+              fontFamily: 'var(--cth-font-ui)', fontSize: 11, color: 'var(--cth-ink-900)'
+            }}
+          >{r}</button>
+        ))}
+      </div>
+      {/* The god is an orchestrator: worker + integrator both grant code-editing, so leave
+          both OFF for a pure delegator. Surfaced here because it's non-obvious. */}
+      {agent.isGod && (
+        <span style={{ fontSize: 10, color: 'var(--cth-ink-500)', lineHeight: '13px' }}>
+          worker + integrator both let Michael edit code — leave both OFF (reviewer-only) for a pure orchestrator that only delegates.
+        </span>
+      )}
     </div>
   );
 }

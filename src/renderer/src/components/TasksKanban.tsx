@@ -4,6 +4,7 @@ import { PixelButton } from './PixelButton';
 import { PixelBadge } from './PixelBadge';
 import { Icon } from './Icon';
 import { useStore } from '@/store/store';
+import { TRIAGE_PROMPT } from '@shared/missionTemplates';
 
 /** A card on the task kanban. Mirrors HiveTask in the main/preload process —
  *  re-declared locally so the renderer doesn't reach into the preload package
@@ -102,6 +103,8 @@ export function TasksKanban({ onAssign }: { onAssign: (prefill: string) => void 
   const agents = useStore((s) => s.agents);
   const [tasks, setTasks] = useState<HiveTask[]>([]);
   const [adding, setAdding] = useState(false);
+  // Transient confirmation after dispatching the god a board triage.
+  const [triageMsg, setTriageMsg] = useState<string | null>(null);
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
   // Jump-to-blocker: a transient highlight + scroll-into-view when a "blocked by" chip is
   // clicked. Card DOM nodes register here by task id.
@@ -154,6 +157,21 @@ export function TasksKanban({ onAssign }: { onAssign: (prefill: string) => void 
   const nameFor = (id?: string): string | undefined =>
     id ? (agents.find((a) => a.id === id)?.name ?? id) : undefined;
 
+  // One-click: ask the god (Michael) to triage the board — assign/prioritize the TODO
+  // backlog + flag stalls — via the same dispatch-to-god path the Floor tab uses.
+  const triage = useCallback(async () => {
+    try {
+      const r = await window.cth.hiveSend(
+        { to: 'god', act: 'request', subject: 'Triage board', body: TRIAGE_PROMPT },
+        'human'
+      );
+      setTriageMsg(r.ok ? 'sent to Michael' : `failed: ${r.error ?? '?'}`);
+    } catch {
+      setTriageMsg('failed');
+    }
+    setTimeout(() => setTriageMsg(null), 4000);
+  }, []);
+
   return (
     <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', background: 'var(--cth-paper-200)' }}>
       {/* Toolbar */}
@@ -164,11 +182,27 @@ export function TasksKanban({ onAssign }: { onAssign: (prefill: string) => void 
         <span style={{ fontFamily: 'var(--cth-font-display)', fontSize: 9, color: 'var(--cth-ink-500)' }}>
           {tasks.length} task{tasks.length === 1 ? '' : 's'}
         </span>
+        {triageMsg && (
+          <span style={{ fontFamily: 'var(--cth-font-ui)', fontSize: 11, color: 'var(--cth-ink-500)' }}>{triageMsg}</span>
+        )}
+        {/* Ask Michael to triage the backlog (assign + prioritize TODOs, flag stalls). */}
+        <PixelButton
+          variant="secondary"
+          size="sm"
+          onClick={triage}
+          style={{ marginLeft: 'auto' }}
+        >
+          <span
+            title="Ask Michael to review the board: assign + prioritize TODO cards and flag stalls (he won't implement)"
+            style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}
+          >
+            <Icon name="sparkle" /> triage
+          </span>
+        </PixelButton>
         <PixelButton
           variant={adding ? 'secondary' : 'primary'}
           size="sm"
           onClick={() => setAdding((v) => !v)}
-          style={{ marginLeft: 'auto' }}
         >
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
             <Icon name={adding ? 'x' : 'plus'} /> {adding ? 'cancel' : 'add task'}

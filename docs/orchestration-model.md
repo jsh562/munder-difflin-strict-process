@@ -8,12 +8,12 @@ Cast: **God** (`Michael`, the orchestrator — a singleton) and **workers** (Dee
 
 ## 1. Agents & workspaces
 
-- Every agent is created with one working directory (`cwd`), chosen in the Add-Agent dialog. Its file tools (`read_file`/`write_file`/`edit_file`/`bash`/`grep`/`list_dir`) are sandboxed to that `cwd`.
+- Every agent is created with one working directory (`cwd`), chosen in the Add-Agent dialog. **File access is two-axis (read wide, write narrow):** a desk may **READ** its own `cwd` *plus every registered repo + worktree* (so it can compare versions or read a peer's branch — the god/reviewer especially need this), but may **WRITE** (`write_file`/`edit_file`/`bash`) only inside its own `cwd`, and only with a code-editing role (see §5). Desks should prefer their own `cwd` and reach into other repos only to compare/reference.
 - **To split one project across agents:** spawn the collaborators **on the same repo**; each gets its own **git worktree** on an `agent/<id>` branch so parallel edits don't collide. This is **automatic** — a worker spawned into a repo that already hosts another agent is isolated for you; the **first** agent stays on the repo's main tree (the integration base), and the explicit "isolate" checkbox still forces it. Use separate repos only for genuinely separate projects.
 - **Worktrees persist.** On agent exit the worktree + its branch are **kept** (committed work survives for the god to integrate); review and bulk-delete stale ones in **Settings → Worktrees**. (They are no longer force-removed on exit.)
-- The **god** runs in its own neutral **scratch workspace** — `config.godWorkspace`, else `<harnessHome>/workspace` — separate from both the hive bookkeeping (`registry.json`, `board.md`, `tasks.json`, `agents/<id>/memory.md`, inboxes) and any worker's repo. It never *implements* in a repo; it integrates via the governed tool in §5.
-- Caveat: `bash` runs in a real shell, so it can currently reach outside the sandboxed `cwd`. Sandbox isolation is therefore partial.
-- **Later:** "god spawns workers on demand" (auto-provision a team into a project); retroactively isolating the *first* agent when a second arrives; tightening the `bash` sandbox.
+- The **god** runs in its own neutral **home workspace** — `config.godWorkspace`, else `<harnessHome>/workspace` — separate from both the hive bookkeeping (`registry.json`, `board.md`, `tasks.json`, `agents/<id>/memory.md`, inboxes) and any worker's repo. It is a neutral base, *not* where the projects live: the god **reads** the project repos/worktrees to decompose + review, and only **edits** if the operator gives it a `worker`/`integrator` role (off by default → it delegates; see §5).
+- Caveat: `bash` runs in a real shell, so when a desk *has* bash (a worker/integrator) it can reach outside its `cwd` for writes. The write sandbox is therefore partial for edit-capable desks; a role-less desk (god/reviewer/assistant) has no bash at all.
+- **Later:** "god spawns workers on demand" (auto-provision a team into a project); retroactively isolating the *first* agent when a second arrives; tightening the `bash` write sandbox for workers.
 
 ## 2. Status & control
 
@@ -41,7 +41,8 @@ Messages move work; the board records it — a living, single-source-of-truth wi
 - **Ownership lanes** (no write races — the hive is single-committer, the convention keeps lanes clean):
   - **God owns** create, assign, and (with the role) **sign-off**.
   - **Workers own** progress on their own cards (up to `review`).
-  - **Reviewers own** the `review` gate; **integrators own** the `integrate`→`done` merge + sign-off.
+  - **Reviewers own** the `review` gate; 
+  - **integrators own** the `integrate`→`done` merge + sign-off.
 - **Validation loop**: a worker finishes its slice (**runs the tests**, records the result as a comment) → sets its card **`review`** → the project's **reviewer(s)** are auto-pinged, read it (read-only), confirm tests cover + pass, and either **approve** (→`integrate`) or **send it back** (→`doing`) → on `integrate` **one** project **integrator** is auto-pinged, **re-runs the suite as the merge gate**, merges the branch, and sets **`done`** (or sends it back). No worker self-declares done; "done" means tested.
 
 ```
@@ -55,9 +56,11 @@ todo ─(god assigns)─▶ doing ─(worker)─▶ review ─(reviewer approves
 ## 5. Roles: who writes, who reviews, who merges
 
 Work moves through three **capability roles** (separate from the god/assistant *identity*) — each desk can hold any combination:
-- **`worker`** — writes the code. Eligible for delegated implementation; the god assigns slices here. **Can edit code** (write_file/edit_file/bash).
-- **`reviewer`** — reviews a `review` card and **comments only** — it is **read-only**: write_file/edit_file/bash are **denied** for a pure reviewer. It reads the branch, leaves a `hive_update_task` note, then **approves** (→`integrate`) or **sends back** (→`doing`). It never merges and never sets `done`.
-- **`integrator`** — merges an `integrate` card's branch (`hive_integrate`) and **signs tasks off** (`done`). May edit **only to resolve a merge conflict**. The **god holds `integrator` + `reviewer` by default**; both are **reassignable** — un-toggle on the god and toggle on a dedicated desk, or keep both.
+- **`worker`** — writes the code **and its tests**. Eligible for delegated implementation; the god assigns slices here. **Can edit code** (write_file/edit_file/bash).
+- **`reviewer`** — reviews a `review` card and **comments only** — it is **read-only**: write_file/edit_file/bash are **denied**. It reads the branch, leaves a `hive_update_task` note, then **approves** (→`integrate`) or **sends back** (→`doing`). It never merges and never sets `done`.
+- **`integrator`** — merges an `integrate` card's branch (`hive_integrate`) and **signs tasks off** (`done`). **Can edit code** — it runs the test suite as the merge gate and writes the code that resolves merge conflicts.
+
+**The code-editing gate (`canEditCode`) = `worker` OR `integrator`.** A desk holding neither (a pure reviewer, the assistant, or an orchestrator-only god) is **write-disabled** — `write_file`/`edit_file`/`bash` are denied; it comments and delegates. (It can still **read** any project — see §1's two-axis access — so a hands-off god/reviewer reads the code to orchestrate/review without being able to change it.) This is the **god's delegation lever**: the **god holds `integrator` + `reviewer` by default** (so it merges out of the box), but because *both* worker and integrator grant editing, a god that should only orchestrate must have **both turned off** (leave `reviewer`) — then it physically cannot implement and must delegate. (The floor-roster role control shows this hint on the god.) Give the god the `worker` role to let it implement directly (solo mode).
 
 Assign roles in **Add-Agent** (Worker / Reviewer / Integrator checkboxes) or per-desk via the desk's **gear → Desk options** modal. They persist in the registry; the **capability gate applies immediately** (read live), and changing a role **auto-restarts that desk** (~1s, debounced) so its role prompt re-injects — no app restart. A desk can hold any mix of worker/reviewer/integrator, or none.
 

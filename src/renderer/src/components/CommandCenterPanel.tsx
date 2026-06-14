@@ -18,6 +18,7 @@ import { MemoryGraphPanel } from './MemoryGraphPanel';
 import { ProviderModelPicker } from './ProviderModelPicker';
 import { useFleetTelemetry } from '@/hooks/useTelemetry';
 import { COMMAND_GROUPS } from '@shared/claudeCommands';
+import { MISSION_TEMPLATES } from '@shared/missionTemplates';
 import { useStore, type Agent } from '@/store/store';
 import { usePtyParser } from '@/hooks/usePtyParser';
 import { assignmentProvenance, isAssignmentStale } from '@shared/assignment';
@@ -42,6 +43,8 @@ interface ScheduledMission {
   /** 'heartbeat' (Lane A #1) is a context-aware adaptive beat, not a plain dispatch. */
   kind?: 'dispatch' | 'heartbeat';
   quietThresholdMs?: number;
+  /** Per-project scoping (a repo path): fire to that project's desks instead of `to`. */
+  project?: string;
 }
 
 /** Compact relative time, e.g. "4m ago" / "in 2m" / "just now". A positive ms is
@@ -297,6 +300,9 @@ function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
   const [mInterval, setMInterval] = useState<string>(String(INTERVAL_OPTS[0].ms));
   const [mTo, setMTo] = useState<string>('god');
   const [mBody, setMBody] = useState('');
+  // Per-project scoping: '' = use the `to` recipient; otherwise a repo path → that
+  // project's desks. Value `tpl:<i>` in the target select means "apply template i".
+  const [mProject, setMProject] = useState<string>('');
 
   useEffect(() => {
     window.cth.getConfig().then((c) => {
@@ -339,11 +345,23 @@ function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
       intervalMs: Number(mInterval),
       to: mTo,
       body: mBody.trim(),
-      enabled: true
+      enabled: true,
+      // A project path scopes the mission to that project's desks (overrides `to` at fire).
+      ...(mProject ? { project: mProject } : {})
     };
     persistMissions([...missions, next]);
-    setMLabel(''); setMBody('');
+    setMLabel(''); setMBody(''); setMProject('');
   };
+  // Prefill the create form from a built-in template (label/interval/to/body).
+  const applyTemplate = (i: number) => {
+    const t = MISSION_TEMPLATES[i];
+    if (!t) return;
+    setMLabel(t.label);
+    setMInterval(String(t.intervalMs));
+    setMTo(t.to);
+    setMBody(t.body);
+  };
+  const fireNow = (id: string) => { void window.cth.fireMission(id).catch(() => { /* noop */ }); };
   const targetName = (to: string) =>
     to === 'broadcast' ? 'everyone' : to === 'god' ? 'Michael' : agents.find((a) => a.id === to)?.name ?? to;
   const intervalLabel = (ms: number) => INTERVAL_OPTS.find((o) => o.ms === ms)?.label ?? `${Math.round(ms / 3600000)}h`;
@@ -653,10 +671,19 @@ function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
             <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ fontSize: 13, color: 'var(--cth-ink-900)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.label}</div>
               <div style={{ fontSize: 11, color: 'var(--cth-ink-500)' }}>
-                → {targetName(m.to)}{hb ? ` · adaptive ~${intervalLabel(m.intervalMs)} · auto digest` : ''}
+                → {m.project ? `${m.project.split(/[\\/]/).filter(Boolean).pop()} (project)` : targetName(m.to)}{hb ? ` · adaptive ~${intervalLabel(m.intervalMs)} · auto digest` : ''}
               </div>
               <div style={{ fontSize: 10, color: 'var(--cth-ink-500)' }}>{fired}{next}</div>
             </div>
+            <button
+              onClick={() => fireNow(m.id)}
+              title="Fire this mission now (ignores the interval)"
+              style={{
+                padding: '2px 7px 1px', border: 'none', cursor: 'pointer', flexShrink: 0,
+                background: 'var(--cth-cream-200)', boxShadow: 'inset 0 0 0 1px var(--cth-ink-700)',
+                fontFamily: 'var(--cth-font-ui)', fontSize: 12, color: 'var(--cth-ink-900)'
+              }}
+            >▶ now</button>
             <button
               onClick={() => toggleMission(m.id)}
               style={{
@@ -679,6 +706,17 @@ function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
           </div>
           );
         })}
+        {/* Start from a built-in template (prefills label/interval/target/body). */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 6 }}>
+          <span style={{ fontFamily: 'var(--cth-font-display)', fontSize: 8, color: 'var(--cth-ink-500)' }}>TEMPLATE</span>
+          <Select
+            value=""
+            onChange={(v) => { if (v !== '') applyTemplate(Number(v)); }}
+          >
+            <option value="">— from template —</option>
+            {MISSION_TEMPLATES.map((t, i) => <option key={t.label} value={String(i)}>{t.label}</option>)}
+          </Select>
+        </div>
         <div style={{ display: 'flex', gap: 6, marginTop: 6, marginBottom: 6 }}>
           <input
             value={mLabel}
@@ -689,11 +727,18 @@ function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
           <Select value={mInterval} onChange={setMInterval}>
             {INTERVAL_OPTS.map((o) => <option key={o.ms} value={String(o.ms)}>{o.label}</option>)}
           </Select>
-          <Select value={mTo} onChange={setMTo}>
+          {/* Target: a single recipient, OR a project (fires to that project's desks). */}
+          <Select value={mProject ? `proj:${mProject}` : mTo} onChange={(v) => {
+            if (v.startsWith('proj:')) { setMProject(v.slice(5)); }
+            else { setMProject(''); setMTo(v); }
+          }}>
             <option value="broadcast">everyone</option>
             <option value="god">Michael</option>
             {agents.filter((a) => !a.isGod).map((a) => (
               <option key={a.id} value={a.id}>{a.name}</option>
+            ))}
+            {repos.map((r) => (
+              <option key={r} value={`proj:${r}`}>{r.split(/[\\/]/).filter(Boolean).pop()} (project)</option>
             ))}
           </Select>
         </div>
