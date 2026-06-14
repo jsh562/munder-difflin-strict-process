@@ -29,7 +29,7 @@ import { ControlRegistry } from './control';
 import { ClaudeRuntime } from './runtime/claudeRuntime';
 import { NativeRuntime } from './runtime/nativeRuntime';
 import { createNativeEventBridge, loadNativeEvents } from './runtime/nativeEventBridge';
-import { executeAgentTool, type AgentToolDeps } from '@jsh562/agent-core';
+import { executeAgentTool, type AgentToolDeps, type FeatureStatus } from '@jsh562/agent-core';
 import { redactConfig, injectionEnvForProvider, keyPresence, setKeyInConfig, clearKeyInConfig, WEB_SEARCH_KEY_ID, type SafeConfig } from './credentials';
 import { searchWebDuckDuckGo } from './webSearch';
 import { resolveBashEnv, describeBashEnv } from './bashShell';
@@ -287,6 +287,35 @@ const nativeEventBridge = createNativeEventBridge({
     try { liveWebContents()?.send(`agent:event:${event.agentId}`, event); } catch { /* window tore down */ }
   }
 });
+// SDDP feature scan — read a feature's real markers from `<repo>/specs/<feature>/` so the
+// lifecycle gate + the board phase reflect the FILESYSTEM, not model memory (the key lever for
+// native desks). Returns null when the feature dir doesn't exist (callers fail open). The
+// `feature` is treated as a single path segment (no traversal) — a feature like `../etc` can't
+// escape the repo's specs dir.
+function scanFeatureStatus(repo: string | null, feature: string): FeatureStatus | null {
+  if (!repo) return null;
+  const safe = feature.replace(/[\\/]/g, '_').trim();
+  if (!safe || safe === '.' || safe === '..') return null;
+  const dir = join(repo, 'specs', safe);
+  if (!existsSync(dir)) return null;
+  const has = (f: string) => existsSync(join(dir, f));
+  let hasClarifications = false;
+  const specPath = join(dir, 'spec.md');
+  const hasSpec = existsSync(specPath);
+  if (hasSpec) {
+    try { hasClarifications = /^##\s+Clarifications/im.test(readFileSync(specPath, 'utf8')); } catch { /* unreadable ⇒ treat as none */ }
+  }
+  return {
+    feature: safe,
+    hasSpec,
+    hasClarifications,
+    hasPlan: has('plan.md'),
+    hasTasks: has('tasks.md'),
+    completed: has('.completed'),
+    qcPassed: has('.qc-passed')
+  };
+}
+
 // The native coding toolkit's injected deps: the hive surface (arrow-wrapped to keep
 // `this`), the cwd resolver (= the sandbox root), the memory-append committer, and the
 // bash opt-in (off by default). Built once; cwd + bash are read live per tool call.
@@ -338,6 +367,10 @@ const agentToolDeps: AgentToolDeps = {
   canReview: (id) => (hive.registry().agents[id]?.roles ?? []).includes('reviewer'),
   // A desk's project repo — stamps a task's `project` on assignment (off-project detection).
   repoFor: (id) => repoForId(id),
+  // SDDP mode (read live) gates the lifecycle hard-checks in hive_update_task; the feature
+  // scan backs both those gates and the hive_feature_status tool with the real on-disk markers.
+  sddpMode: () => readConfig().sddpMode === true,
+  featureStatus: (repo, feature) => scanFeatureStatus(repo, feature),
   // May edit code (write_file/edit_file/bash)? Role-driven, NO god/assistant special-case:
   // the `worker` role (writes features + tests) and the `integrator` role (writes merge-fix
   // code) grant editing; a reviewer / no-edit-role / assistant desk is read-only. This is the

@@ -58,6 +58,9 @@ export interface HiveTask {
   comments?: HiveComment[];
   /** Project repo the card belongs to (stamped on assign) — for off-project detection. */
   project?: string;
+  /** SDDP: the feature folder this card belongs to (its specs/<feature>/ dir) — drives the
+   *  lifecycle gate + the board phase. Absent ⇒ unscoped / non-SDDP card. */
+  feature?: string;
   priority: number;
   createdAt: string;
 }
