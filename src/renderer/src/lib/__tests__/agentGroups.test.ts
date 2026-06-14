@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { effectiveRoles, groupAgents, roleCounts, FLOOR_GROUP } from '../agentGroups';
+import { effectiveRoles, groupAgents, roleCounts, agentsInRole, FLOOR_GROUP } from '../agentGroups';
 import type { Agent } from '@/store/store';
 
 /** Minimal Agent for the pure grouping logic (only the fields the helpers read matter). */
@@ -54,5 +54,17 @@ describe('roleCounts — a multi-role desk counts under each role it holds', () 
 
   it('the assistant contributes no role counts', () => {
     expect(roleCounts([mk({ id: 'asst', isAssistant: true })])).toEqual({});
+  });
+});
+
+describe('agentsInRole — the desks behind a matrix cell', () => {
+  it('returns desks holding the role (defaults applied); multi-role desk appears for each', () => {
+    const w1 = mk({ id: 'w1' });                               // worker (default)
+    const wr = mk({ id: 'wr', roles: ['worker', 'reviewer'] }); // worker + reviewer
+    const rev = mk({ id: 'rev', roles: ['reviewer'] });
+    const pool = [w1, wr, rev];
+    expect(agentsInRole(pool, 'worker').map((a) => a.id)).toEqual(['w1', 'wr']);
+    expect(agentsInRole(pool, 'reviewer').map((a) => a.id)).toEqual(['wr', 'rev']);
+    expect(agentsInRole(pool, 'integrator')).toEqual([]);
   });
 });

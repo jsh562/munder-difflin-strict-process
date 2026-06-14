@@ -53,3 +53,9 @@ export function roleCounts(agents: Agent[]): Partial<Record<AgentRole, number>> 
   }
   return counts;
 }
+
+/** The desks (within a group) that hold `role` — the "which agents per role" drill-down behind a
+ *  matrix cell. Uses `effectiveRoles` so the defaults match the counts. Pure. */
+export function agentsInRole(agents: Agent[], role: AgentRole): Agent[] {
+  return agents.filter((a) => effectiveRoles(a).includes(role));
+}
