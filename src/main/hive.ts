@@ -801,7 +801,18 @@ export class HiveManager {
     for (const t of next) {
       const was = before.get(t.id);
       const wasStatus = was?.status;
-      if (wasStatus === t.status) continue; // only act on a status change
+
+      // REASSIGNMENT ping (independent of status — a pure reassign doesn't change status, so it
+      // would otherwise be silent). Hand the new assignee the prior work pointer captured on the
+      // card so they can continue from the previous desk's branch instead of redoing it.
+      if (was && was.assignee !== t.assignee && t.assignee) {
+        const where = [was.branch ? `branch \`${was.branch}\`` : null, was.project ? `in ${was.project}` : null].filter(Boolean).join(' ');
+        const prior = was.assignee && where ? ` Prior work is on ${where} (worktree kept) — read that branch before redoing it.` : '';
+        ping(t.assignee, 'request', `Assigned: ${t.title}`,
+          `Task "${t.title}" (${t.id}) was assigned to you${was.assignee ? ` (reassigned from ${was.assignee})` : ''}.${prior}`);
+      }
+
+      if (wasStatus === t.status) continue; // remaining handlers act only on a status change
 
       if (wasStatus === 'blocked' && t.status === 'todo' && t.assignee) {
         ping(t.assignee, 'inform', `Unblocked: ${t.title}`,

@@ -204,12 +204,29 @@ export async function mergeBranch(
   return { ok: false, error: res.error, conflict: /conflict/i.test(res.error) };
 }
 
+/** Derive a safe `agent/<slug>` branch name from a raw segment (an agent id or a worktree path
+ *  basename). The single slug rule shared by the path-based + id-based helpers below. */
+export function agentBranchForId(seg: string): string {
+  const slug = seg.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'agent';
+  return `agent/${slug}`;
+}
+
 /** Derive a safe `agent/<id>` branch name from a worktree path's basename. Exported so
  *  the roster can report each isolated desk's branch for the god to integrate. */
 export function agentBranchFor(wtPath: string): string {
-  const base = wtPath.split(/[\\/]/).filter(Boolean).pop() ?? 'agent';
-  const slug = base.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'agent';
-  return `agent/${slug}`;
+  return agentBranchForId(wtPath.split(/[\\/]/).filter(Boolean).pop() ?? 'agent');
+}
+
+/** How many commits `branch` is AHEAD of the repo's base (current) branch — i.e. unmerged work
+ *  that would be lost if the branch's worktree were deleted. 0 when merged, missing, or on error
+ *  (best-effort: a failed/unknown branch never blocks the operator's delete). */
+export async function branchCommitsAhead(repo: string, branch: string): Promise<number> {
+  const br = await getBranch(repo);
+  const base = 'current' in br && br.current ? br.current : null;
+  if (!base || base === branch) return 0;
+  const res = await runGit(repo, ['rev-list', '--count', `${base}..${branch}`]);
+  if (!res.ok) return 0;
+  return parseInt(res.stdout.trim(), 10) || 0;
 }
 
 /** Small deterministic hash (djb2 → base36) — repo-discriminates a worktree path when a

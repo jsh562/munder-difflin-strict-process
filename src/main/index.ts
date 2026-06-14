@@ -12,7 +12,7 @@ import { normalizeRepoPath, normalizedPathSet } from './paths';
 import {
   getBranch, getStatus, getLog, getBranches, getAheadBehind, isRepo,
   addWorktree, removeWorktree, listWorktrees, planWorktree, type GitWorktree,
-  previewMerge, mergeBranch, agentBranchFor
+  previewMerge, mergeBranch, agentBranchFor, agentBranchForId, branchCommitsAhead
 } from './git';
 import { HiveManager, roleCanEditCode, canIntegrate as rolesCanIntegrate, canReview as rolesCanReview, boardCapabilityLine, type AgentMeta, type HiveMessage, type HiveTask, type AgentRole } from './hive';
 import { HookServer } from './hooks';
@@ -379,7 +379,10 @@ const agentToolDeps: AgentToolDeps = {
           nativeRuntime.runtimeFor(a.id) !== undefined ||
           [...ptyToAgent.entries()].some(([ptyId, aid]) => aid === a.id && livePtys.has(ptyId)),
         repo: origin ?? (isWorker ? a.cwd : undefined),
-        branch: wtPath ? agentBranchFor(wtPath) : undefined
+        // Live worktree branch when mapped; else the deterministic agent/<id> for a worker desk
+        // (the map is cleared on exit, but every worker isolates onto agent/<id> and the worktree
+        // is kept) — so a COLD desk still reports the branch where its work lives.
+        branch: wtPath ? agentBranchFor(wtPath) : (isWorker ? agentBranchForId(a.id) : undefined)
       };
     });
   },
@@ -395,6 +398,14 @@ const agentToolDeps: AgentToolDeps = {
   canReview: (id) => rolesCanReview(hive.registry().agents[id]?.roles),
   // A desk's project repo — stamps a task's `project` on assignment (off-project detection).
   repoFor: (id) => repoForId(id),
+  // A desk's `agent/<id>` worktree branch — stamps a task's `branch` on assignment so a
+  // reassigned card carries a durable pointer to the prior work. Prefer the LIVE worktree
+  // branch; fall back to the deterministic name so a cold/never-spawned desk still stamps a
+  // usable pointer (every worker isolates onto agent/<id>).
+  branchFor: (id) => {
+    const wt = worktreePaths.get(`pty-${id}`);
+    return wt ? agentBranchFor(wt) : agentBranchForId(id);
+  },
   // SDDP mode (read live) gates the lifecycle hard-checks in hive_update_task; the feature
   // scan backs both those gates and the hive_feature_status tool with the real on-disk markers.
   sddpMode: () => readConfig().sddpMode === true,
@@ -1380,6 +1391,12 @@ ipcMain.handle('git:listWorktrees', async (): Promise<Array<GitWorktree & { repo
 ipcMain.handle('git:removeWorktree', async (_evt, repo: unknown, wtPath: unknown) => {
   if (typeof repo !== 'string' || typeof wtPath !== 'string') return { ok: false, error: 'invalid args' };
   return removeWorktree(repo, wtPath);
+});
+// How many commits a worktree's branch is ahead of its repo base — for the unmerged-delete
+// warning in Settings → Worktrees (deleting a kept worktree shouldn't silently lose work).
+ipcMain.handle('git:branchAhead', async (_evt, repo: unknown, branch: unknown) => {
+  if (typeof repo !== 'string' || typeof branch !== 'string') return 0;
+  return branchCommitsAhead(repo, branch);
 });
 
 // ─── IPC: clipboard ─────────────────────────────────────────────────────────

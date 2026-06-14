@@ -340,6 +340,10 @@ const api = {
     ipcRenderer.invoke('git:listWorktrees'),
   removeWorktree: (repo: string, path: string): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('git:removeWorktree', repo, path),
+  /** Commits a worktree's branch is ahead of its repo base (unmerged work) — for the
+   *  delete-confirm warning. 0 when merged/missing. */
+  gitBranchAhead: (repo: string, branch: string): Promise<number> =>
+    ipcRenderer.invoke('git:branchAhead', repo, branch),
 
   // ─── Terminal.app ────────────────────────────────────────────────────────
   openTerminalAt: (cwd: string): Promise<{ ok: boolean; error?: string }> =>

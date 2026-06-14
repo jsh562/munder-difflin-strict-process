@@ -101,19 +101,36 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
   const [worktrees, setWorktrees] = useState<Worktree[]>([]);
   const [wtSelected, setWtSelected] = useState<Set<string>>(new Set());
   const [wtBusy, setWtBusy] = useState(false);
+  // Armed when a delete press found unmerged work in the selection — requires a second
+  // (confirm) press so committed-but-unintegrated work isn't lost by accident.
+  const [wtConfirm, setWtConfirm] = useState<{ unmerged: number } | null>(null);
   const loadWorktrees = async () => {
     try { setWorktrees(await window.cth.listWorktrees()); } catch { setWorktrees([]); }
   };
   useEffect(() => { void loadWorktrees(); }, []);
   const toggleWt = (path: string) =>
     setWtSelected((s) => { const n = new Set(s); if (n.has(path)) n.delete(path); else n.add(path); return n; });
+  // Changing the selection invalidates a pending confirm.
+  useEffect(() => { setWtConfirm(null); }, [wtSelected]);
   const deleteSelectedWorktrees = async () => {
+    const selected = worktrees.filter((w) => wtSelected.has(w.path));
+    if (selected.length === 0) return;
     setWtBusy(true);
     try {
-      for (const wt of worktrees.filter((w) => wtSelected.has(w.path))) {
+      // First press: warn if any selected worktree's branch has commits not merged into base.
+      if (!wtConfirm) {
+        let unmerged = 0;
+        for (const wt of selected) {
+          if (wt.branch && (await window.cth.gitBranchAhead(wt.repo, wt.branch)) > 0) unmerged++;
+        }
+        if (unmerged > 0) { setWtConfirm({ unmerged }); return; } // arm — require a confirm press
+      }
+      // Armed (confirmed) or nothing unmerged → delete.
+      for (const wt of selected) {
         await window.cth.removeWorktree(wt.repo, wt.path).catch(() => { /* best-effort; keep going */ });
       }
       setWtSelected(new Set());
+      setWtConfirm(null);
       await loadWorktrees();
     } finally { setWtBusy(false); }
   };
@@ -607,9 +624,11 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
                   </span>
                   <PixelButton variant="secondary" size="sm" onClick={() => void loadWorktrees()} disabled={wtBusy}>refresh</PixelButton>
                   {wtSelected.size > 0 && (
-                    <PixelButton variant="destructive" size="sm" onClick={deleteSelectedWorktrees} disabled={wtBusy}>
-                      {wtBusy ? 'deleting…' : `delete ${wtSelected.size}`}
-                    </PixelButton>
+                    <span title={wtConfirm ? `${wtConfirm.unmerged} of these have commits not merged into base — click again to delete anyway` : undefined}>
+                      <PixelButton variant="destructive" size="sm" onClick={() => void deleteSelectedWorktrees()} disabled={wtBusy}>
+                        {wtBusy ? 'deleting…' : wtConfirm ? `confirm delete (${wtConfirm.unmerged} unmerged)` : `delete ${wtSelected.size}`}
+                      </PixelButton>
+                    </span>
                   )}
                 </div>
                 {worktrees.length > 0 && (
