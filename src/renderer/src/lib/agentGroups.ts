@@ -22,9 +22,14 @@ export interface AgentGroup {
 /**
  * Group desks for the strip: a leading FLOOR group (god + assistant — the cross-project
  * orchestration desks), then one group per PROJECT (`agent.project`), projects sorted
- * alphabetically. Agents keep their input order within a group. Pure + total.
+ * alphabetically. Agents keep their input order within a group.
+ *
+ * `extraProjectKeys` (registered-repo basenames) get an EMPTY group each if no desk works there
+ * yet, so the matrix doubles as a projects board — every registered repo is a row you can staff,
+ * not just the ones already occupied. Duplicates (a key that already has desks, or repeated keys)
+ * collapse to one group. Pure + total.
  */
-export function groupAgents(agents: Agent[]): AgentGroup[] {
+export function groupAgents(agents: Agent[], extraProjectKeys: string[] = []): AgentGroup[] {
   const floor = agents.filter((a) => a.isGod || a.isAssistant);
   const byProject = new Map<string, Agent[]>();
   for (const a of agents) {
@@ -32,6 +37,10 @@ export function groupAgents(agents: Agent[]): AgentGroup[] {
     const key = a.project || '(no project)';
     const arr = byProject.get(key);
     if (arr) arr.push(a); else byProject.set(key, [a]);
+  }
+  // Ensure a (possibly empty) group exists for each registered project repo.
+  for (const key of extraProjectKeys) {
+    if (key && !byProject.has(key)) byProject.set(key, []);
   }
   const groups: AgentGroup[] = [];
   if (floor.length) groups.push({ key: FLOOR_GROUP, label: 'FLOOR', agents: floor });

@@ -151,6 +151,9 @@ interface State {
   selectedId: string | null;
   feeds: Record<string, string[]>;
   addAgentOpen: boolean;
+  /** When the Add-Agent dialog is opened from a specific project repo row, the workspace to
+   *  preselect (cleared on close). Lets the matrix "add agent here" staff a repo in one click. */
+  addAgentInitialCwd?: string;
   fullscreenAgentId: string | null;
   fullscreenFilePath: string | null;
   /** When true, the big task board is open over the office (center area). */
@@ -242,6 +245,8 @@ interface State {
   /** Clear an agent's entire pending queue. */
   clearQueue: (agentId: string) => void;
   setAddAgentOpen: (open: boolean) => void;
+  /** Open the Add-Agent dialog preselected to a project repo (the matrix "add agent here"). */
+  openAddAgentForRepo: (cwd: string) => void;
   setFullscreen: (id: string | null) => void;
   setFullscreenFile: (path: string | null) => void;
   setTasksBoardOpen: (on: boolean) => void;
@@ -665,7 +670,8 @@ export const useStore = create<State>((set) => ({
       persistRestorable(restorableAgents);
       return { agents, feeds, selectedId, restorableAgents };
     }),
-  setAddAgentOpen: (open) => set({ addAgentOpen: open }),
+  setAddAgentOpen: (open) => set(open ? { addAgentOpen: true } : { addAgentOpen: false, addAgentInitialCwd: undefined }),
+  openAddAgentForRepo: (cwd) => set({ addAgentOpen: true, addAgentInitialCwd: cwd }),
   setFullscreen: (id) => set({ fullscreenAgentId: id }),
   setFullscreenFile: (path) => set({ fullscreenFilePath: path }),
   setTasksBoardOpen: (on) => set({ tasksBoardOpen: on }),

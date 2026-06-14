@@ -1,6 +1,13 @@
 import type { Agent, GodDesired } from '@/store/store';
 import type { StatusKind } from '@/components/PixelBadge';
 
+/** A coarse status bucket for the matrix cell's mini status bar — collapses the richer
+ *  `StatusKind` + the warm/cold liveness axis into one of a few visually-distinct groups. */
+export type CellBucket = 'working' | 'waiting' | 'blocked' | 'looping' | 'compacting' | 'idle' | 'cold';
+
+/** Stable left→right order for the status bar segments (active states first, parked last). */
+export const CELL_BUCKET_ORDER: CellBucket[] = ['working', 'waiting', 'blocked', 'looping', 'compacting', 'idle', 'cold'];
+
 /**
  * The status to DISPLAY for a desk — one derivation shared by the strip card, the
  * Command Center badge, and (for the spinner) the transcript, so they never disagree.
@@ -29,4 +36,37 @@ export function reconcileTurnStatus(current: StatusKind, running: boolean, inTur
   if (current !== 'working' && current !== 'idle') return null; // never clobber other statuses
   const desired: StatusKind = running && inTurn ? 'working' : 'idle';
   return desired === current ? null : desired;
+}
+
+/**
+ * Collapse a desk's DISPLAY status + its warm/cold liveness into one matrix bucket. Active states
+ * map straight through; an otherwise-idle desk reads `cold` when it's known-parked (`warm === false`,
+ * revive-on-demand) and `idle` when warm or unknown. `success`/`ghost`/anything else folds into
+ * idle/cold. Pure — the matrix bar + tooltip derive from this so they never disagree with the badge.
+ */
+export function deskBucket(
+  agent: Agent, paused: boolean, godDesired: GodDesired, warm: boolean | undefined
+): CellBucket {
+  const s = displayStatus(agent, paused, godDesired);
+  if (s === 'working' || s === 'thinking') return 'working';
+  if (s === 'waiting') return 'waiting';
+  if (s === 'blocked') return 'blocked';
+  if (s === 'looping') return 'looping';
+  if (s === 'compacting') return 'compacting';
+  // idle / success / ghost → distinguish a parked (cold) desk from a live-but-idle one.
+  return warm === false ? 'cold' : 'idle';
+}
+
+/** Tally a cell's desks by bucket (only non-zero buckets are returned). `liveness` is the
+ *  store's id→warm map; an id absent from it is treated as unknown (→ idle, not cold). Pure. */
+export function bucketCounts(
+  agents: Agent[], paused: Record<string, boolean>, godDesired: GodDesired, liveness: Record<string, boolean>
+): Partial<Record<CellBucket, number>> {
+  const counts: Partial<Record<CellBucket, number>> = {};
+  for (const a of agents) {
+    const warm = a.id in liveness ? liveness[a.id] : undefined;
+    const b = deskBucket(a, !!paused[a.id], godDesired, warm);
+    counts[b] = (counts[b] ?? 0) + 1;
+  }
+  return counts;
 }

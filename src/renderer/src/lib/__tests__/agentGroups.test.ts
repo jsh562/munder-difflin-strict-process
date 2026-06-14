@@ -40,6 +40,15 @@ describe('groupAgents — FLOOR first, then projects alphabetically', () => {
   it('omits FLOOR when there are no god/assistant desks', () => {
     expect(groupAgents([mk({ id: 'w', project: 'p' })]).map((g) => g.key)).toEqual(['p']);
   });
+
+  it('emits an EMPTY group for a registered repo with no desks (and does not duplicate occupied ones)', () => {
+    const w = mk({ id: 'w', project: 'numrs' });
+    const groups = groupAgents([w], ['numrs', 'beta', 'beta']); // numrs occupied; beta empty (+dup)
+    expect(groups.map((g) => g.key)).toEqual(['beta', 'numrs']);
+    const beta = groups.find((g) => g.key === 'beta')!;
+    expect(beta.agents).toEqual([]);
+    expect(groups.find((g) => g.key === 'numrs')!.agents.map((a) => a.id)).toEqual(['w']);
+  });
 });
 
 describe('roleCounts — a multi-role desk counts under each role it holds', () => {

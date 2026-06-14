@@ -30,10 +30,15 @@ export interface AddAgentModalProps {
 export function AddAgentModal({ onClose, config }: AddAgentModalProps) {
   const addAgent = useStore(s => s.addAgent);
 
+  // When opened from a project-repo row ("add agent here"), preselect that repo as the workspace;
+  // otherwise default to the first registered repo. The modal is mounted fresh on each open, so
+  // this initializer captures the current prefill (cleared by setAddAgentOpen(false) on close).
+  const initialCwd = useStore((s) => s.addAgentInitialCwd);
+
   const [name, setName] = useState('Jim');
   const [character, setCharacter] = useState<OfficeCharacterName>(DEFAULT_CHARACTER);
   const [accent, setAccent] = useState<AccentColorName>('sky');
-  const [cwd, setCwd] = useState<string>(config.registeredRepos[0] ?? '');
+  const [cwd, setCwd] = useState<string>(initialCwd ?? config.registeredRepos[0] ?? '');
   // The picker shows the fleet default pre-highlighted so the operator sees what a
   // new agent will inherit; `explicitlyPicked` tracks whether they actually CHOSE a
   // model (vs leaving the inherited default). This is what makes the

@@ -5,16 +5,42 @@ import { Icon } from './Icon';
 import { ROLE_META } from './AgentRoleControl';
 import { useStore, type Agent, type AgentRole } from '@/store/store';
 import { buildSpawnCommand, type HarnessConfig } from '@/store/config';
-import { displayStatus } from '@/lib/agentStatus';
+import { displayStatus, bucketCounts, CELL_BUCKET_ORDER, type CellBucket } from '@/lib/agentStatus';
 import { scheduleDeskRestart } from '@/lib/restartDesk';
 import { restartSigOf, deskStaleKeys } from '@/lib/restartSig';
-import { groupAgents, effectiveRoles, type AgentGroup } from '@/lib/agentGroups';
+import { groupAgents, effectiveRoles, FLOOR_GROUP, type AgentGroup } from '@/lib/agentGroups';
 
 export interface AgentStripProps {
   /** Needed to rebuild a spawn command when a restorable agent predates the
    *  persisted `command` field. Optional so the strip renders without config. */
   config?: HarnessConfig | null;
+  /** Called with the new config after the strip registers a project repo, so the parent's
+   *  config (and thus the matrix's empty-repo rows + Add-Agent quick-picks) updates live. */
+  onConfigChange?: (config: HarnessConfig) => void;
 }
+
+/** Last path segment (handles both separators) — a project repo's display name. */
+function basename(p: string): string {
+  return p.split(/[\\/]/).filter(Boolean).pop() ?? p;
+}
+
+/** Status-bucket → swatch color for the per-cell mini bar + legend. `cold` (parked, revive-on-
+ *  demand) reads as a hollow grey; the rest reuse the shared --cth-status-* palette. */
+const BUCKET_COLOR: Record<CellBucket, string> = {
+  working: 'var(--cth-status-working)',
+  waiting: 'var(--cth-status-waiting)',
+  blocked: 'var(--cth-status-blocked)',
+  looping: 'var(--cth-status-looping)',
+  compacting: 'var(--cth-status-compacting)',
+  idle: 'var(--cth-status-idle)',
+  cold: 'var(--cth-ink-300)'
+};
+const BUCKET_LABEL: Record<CellBucket, string> = {
+  working: 'working', waiting: 'waiting', blocked: 'needs you',
+  looping: 'looping', compacting: 'compacting', idle: 'idle', cold: 'cold'
+};
+/** Buckets shown in the always-on legend (the common ones). */
+const LEGEND_BUCKETS: CellBucket[] = ['working', 'idle', 'waiting', 'blocked', 'cold'];
 
 /** A matrix column. `god`/`assistant` are IDENTITY columns (always shown so a roleless god or the
  *  prep assistant is still visible); the rest are capability ROLE columns, in workflow order. */
@@ -30,12 +56,13 @@ const STD_ROLE_FLOW: AgentRole[] = ['worker', 'reviewer', 'integrator'];
 /** An open matrix cell → the flyout listing its desks. `col: 'all'` = the row label (all desks). */
 interface OpenCell { group: AgentGroup; col: Col | 'all'; rect: DOMRect; }
 
-export function AgentStrip({ config }: AgentStripProps) {
+export function AgentStrip({ config, onConfigChange }: AgentStripProps) {
   const agents = useStore(s => s.agents);
   const restorableAgents = useStore(s => s.restorableAgents);
   const selectedId = useStore(s => s.selectedId);
   const select = useStore(s => s.select);
   const setAddAgentOpen = useStore(s => s.setAddAgentOpen);
+  const openAddAgentForRepo = useStore(s => s.openAddAgentForRepo);
   const paused = useStore(s => s.paused);
   const godDesired = useStore(s => s.godDesired);
   const liveness = useStore(s => s.liveness);
@@ -86,8 +113,25 @@ export function AgentStrip({ config }: AgentStripProps) {
     }
   };
 
-  const groups = groupAgents(agents);
+  // Every registered project repo gets a row (empty until staffed) — the matrix doubles as a
+  // projects board. Keyed by repo basename (matching agent.project).
+  const registeredRepos = config?.registeredRepos ?? [];
+  const groups = groupAgents(agents, registeredRepos.map(basename));
   const roleFlow = sddpMode ? SDDP_ROLE_FLOW : STD_ROLE_FLOW;
+
+  // Resolve a group's project-repo PATH (for "add agent here"): an occupied row from its first
+  // desk's cwd (the renderer record holds the repo, not the worktree); an empty registered row by
+  // matching basename. null for FLOOR or an unresolvable group.
+  const groupRepoPath = (g: AgentGroup): string | null =>
+    g.key === FLOOR_GROUP ? null
+    : g.agents[0]?.cwd ?? registeredRepos.find((r) => basename(r) === g.key) ?? null;
+
+  const addProjectRepo = async () => {
+    const res = await window.cth.chooseFolder();
+    if (!res.ok || registeredRepos.includes(res.path)) return;
+    const next = await window.cth.updateConfig({ registeredRepos: [...registeredRepos, res.path] });
+    onConfigChange?.(next);
+  };
   // Columns in WORKFLOW order: god → (planner →) worker → reviewer → (qc →) integrator → assistant.
   const cols: Col[] = [
     { kind: 'god', label: 'god', bg: 'var(--cth-lemon)' },
@@ -106,21 +150,34 @@ export function AgentStrip({ config }: AgentStripProps) {
   const colLabel = (c: Col | 'all') => c === 'all' ? 'all' : c.kind === 'role' ? c.role : c.kind;
 
   const cell = (g: AgentGroup, c: Col) => {
-    const count = agentsFor(g, c).length;
+    const list = agentsFor(g, c);
+    const count = list.length;
     if (count === 0) return <span style={{ color: 'var(--cth-ink-300)', fontSize: 11 }}>·</span>;
     const isOpen = open?.group.key === g.key && open?.col !== 'all' && open?.col.kind === c.kind &&
       (c.kind !== 'role' || (open.col.kind === 'role' && open.col.role === c.role));
+    // Status mix → a thin proportional bar under the count; tooltip carries the breakdown.
+    const counts = bucketCounts(list, paused, godDesired, liveness);
+    const segs = CELL_BUCKET_ORDER.filter((b) => (counts[b] ?? 0) > 0);
+    const breakdown = segs.map((b) => `${counts[b]} ${BUCKET_LABEL[b]}`).join(', ');
     return (
       <button
         onClick={(e) => setOpen({ group: g, col: c, rect: e.currentTarget.getBoundingClientRect() })}
-        title={`${count} ${colLabel(c)} in ${g.label} — click to list`}
+        title={`${count} ${colLabel(c)} in ${g.label} — ${breakdown} — click to list`}
         style={{
-          width: '100%', height: 20, border: 'none', cursor: 'pointer',
+          width: '100%', height: 24, border: 'none', cursor: 'pointer', padding: '1px 0 0',
+          display: 'flex', flexDirection: 'column', alignItems: 'stretch', justifyContent: 'center', gap: 1,
           background: isOpen ? 'var(--cth-lemon)' : 'var(--cth-paper-100)',
           boxShadow: `inset 0 0 0 1px ${isOpen ? 'var(--cth-ink-900)' : 'var(--cth-ink-300)'}`,
           fontFamily: 'var(--cth-font-ui)', fontSize: 11, color: 'var(--cth-ink-900)'
         }}
-      >{count}</button>
+      >
+        <span style={{ lineHeight: '12px', textAlign: 'center' }}>{count}</span>
+        <span style={{ display: 'flex', width: '100%', height: 3, gap: 0.5 }} aria-hidden>
+          {segs.map((b) => (
+            <span key={b} style={{ flexGrow: counts[b] ?? 0, flexBasis: 0, background: BUCKET_COLOR[b] }} />
+          ))}
+        </span>
+      </button>
     );
   };
 
@@ -136,7 +193,7 @@ export function AgentStrip({ config }: AgentStripProps) {
       <div style={{ overflowY: 'auto', overflowX: 'hidden', flexShrink: 0 }}>
         <div style={{ display: 'grid', gridTemplateColumns: gridCols, gap: 3, alignItems: 'center' }}>
           {/* Header row: corner label, then each column chip (god + workflow roles + assistant). */}
-          <span style={{ fontFamily: 'var(--cth-font-display)', fontSize: 8, color: 'var(--cth-ink-500)' }}>PROJECT</span>
+          <span style={{ fontFamily: 'var(--cth-font-display)', fontSize: 8, color: 'var(--cth-ink-500)' }}>PROJECT REPO</span>
           {cols.map((c, i) => (
             <span key={i} title={c.kind === 'god' ? 'god / orchestrator' : c.kind === 'assistant' ? 'prep assistant' : c.role} style={{
               justifySelf: 'stretch', textAlign: 'center', padding: '1px 0', height: 16,
@@ -162,9 +219,18 @@ export function AgentStrip({ config }: AgentStripProps) {
             ))
           ])}
         </div>
+        {/* Status legend — what the per-cell mini bar colors mean. */}
+        <div style={{ display: 'flex', gap: 8, marginTop: 5, flexWrap: 'wrap' }}>
+          {LEGEND_BUCKETS.map((b) => (
+            <span key={b} style={{ display: 'inline-flex', gap: 3, alignItems: 'center', fontSize: 9, color: 'var(--cth-ink-500)' }}>
+              <span style={{ width: 7, height: 7, background: BUCKET_COLOR[b], boxShadow: 'inset 0 0 0 1px var(--cth-ink-900)' }} />
+              {BUCKET_LABEL[b]}
+            </span>
+          ))}
+        </div>
       </div>
 
-      {/* Trailing controls — restore the previous session's team + add a new desk. */}
+      {/* Trailing controls — restore the previous session's team + register a repo + add a desk. */}
       <div style={{ display: 'flex', gap: 12, alignItems: 'center', alignSelf: 'center', flexShrink: 0 }}>
         {restorableAgents.length > 0 && (
           <span title={`Respawn from last session: ${restorableAgents.map((a: Agent) => a.name).join(', ')} — same ids, memory and inboxes reattach automatically`}>
@@ -175,6 +241,11 @@ export function AgentStrip({ config }: AgentStripProps) {
             </PixelButton>
           </span>
         )}
+        <PixelButton variant="secondary" size="lg" onClick={() => void addProjectRepo()}>
+          <span style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
+            <Icon name="plus" /> project repo
+          </span>
+        </PixelButton>
         <PixelButton variant="secondary" size="lg" onClick={() => setAddAgentOpen(true)}>
           <span style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
             <Icon name="plus" /> add agent
@@ -197,6 +268,19 @@ export function AgentStrip({ config }: AgentStripProps) {
             <div style={{ fontFamily: 'var(--cth-font-display)', fontSize: 8, color: 'var(--cth-ink-500)', padding: '0 2px 2px' }}>
               {open.group.label} · {colLabel(open.col)} ({flyoutAgents.length})
             </div>
+            {flyoutAgents.length === 0 && (
+              <div style={{ fontSize: 12, color: 'var(--cth-ink-500)', padding: '2px 4px 4px' }}>
+                no desks here yet
+              </div>
+            )}
+            {/* Staff this project repo in one click — opens Add-Agent preselected to it. */}
+            {open.group.key !== FLOOR_GROUP && groupRepoPath(open.group) && (
+              <PixelButton variant="secondary" size="sm" onClick={() => { openAddAgentForRepo(groupRepoPath(open.group)!); setOpen(null); }}>
+                <span style={{ display: 'inline-flex', gap: 4, alignItems: 'center' }}>
+                  <Icon name="plus" /> add agent here
+                </span>
+              </PixelButton>
+            )}
             {flyoutAgents.map((a) => {
               const warm = a.id in liveness ? liveness[a.id] : undefined;
               const stale = !a.isAssistant && deskStaleKeys(a.spawnSig, liveSig).length > 0;

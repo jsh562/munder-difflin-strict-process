@@ -282,7 +282,7 @@ export function App() {
         </div>
       </div>
 
-      <AgentStrip config={config} />
+      <AgentStrip config={config} onConfigChange={setConfig} />
 
       {addAgentOpen && (
         <AddAgentModal onClose={() => setAddAgentOpen(false)} config={config} />
