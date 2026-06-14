@@ -22,6 +22,13 @@ export interface AgentCardProps {
   isGod?: boolean;
   /** The prep assistant. Same size as every other card (no special sizing). */
   isAssistant?: boolean;
+  /** This desk is running with settings that changed since it spawned ([[restartSig]]) —
+   *  shows a ⟳ marker that restarts the desk on click (applies the change). */
+  needsRestart?: boolean;
+  /** Tooltip for the ⟳ marker (which settings changed). */
+  needsRestartReason?: string;
+  /** Restart just this desk (re-injects its prompt with the current settings). */
+  onRestart?: () => void;
   onClick?: () => void;
 }
 
@@ -29,7 +36,7 @@ const fmtK = (n: number): string => `${Math.round(n / 1000)}k`;
 
 export function AgentCard({
   name, character, accent, status, project, action, progress = 0,
-  contextTokens, contextLimit, selected, isGod, onClick
+  contextTokens, contextLimit, selected, isGod, needsRestart, needsRestartReason, onRestart, onClick
 }: AgentCardProps) {
   // The god is always framed (stands out from the row); others only when selected.
   const framed = isGod || selected;
@@ -70,7 +77,23 @@ export function AgentCard({
                 overflow: 'hidden',
                 textOverflow: 'ellipsis'
               }}>{name.toUpperCase()}</span>
-              <PixelBadge status={status} />
+              <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexShrink: 0 }}>
+                {needsRestart && (
+                  <span
+                    role="button"
+                    tabIndex={-1}
+                    title={needsRestartReason ?? 'Settings changed since this desk spawned — click to restart and apply'}
+                    onClick={(e) => { e.stopPropagation(); onRestart?.(); }}
+                    style={{
+                      display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                      minWidth: 16, height: 16, padding: '0 4px', cursor: 'pointer',
+                      background: 'var(--cth-coral-light)', boxShadow: 'inset 0 0 0 1px var(--cth-coral)',
+                      fontSize: 10, lineHeight: '16px', color: 'var(--cth-ink-900)'
+                    }}
+                  >⟳</span>
+                )}
+                <PixelBadge status={status} />
+              </div>
             </div>
 
             <div style={{

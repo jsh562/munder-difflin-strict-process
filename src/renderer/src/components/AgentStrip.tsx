@@ -5,6 +5,8 @@ import { Icon } from './Icon';
 import { useStore, type Agent } from '@/store/store';
 import { buildSpawnCommand, type HarnessConfig } from '@/store/config';
 import { displayStatus } from '@/lib/agentStatus';
+import { scheduleDeskRestart } from '@/lib/restartDesk';
+import { restartSigOf, deskStaleKeys, RESTART_SIG_LABELS } from '@/lib/restartSig';
 
 export interface AgentStripProps {
   /** Needed to rebuild a spawn command when a restorable agent predates the
@@ -20,6 +22,13 @@ export function AgentStrip({ config }: AgentStripProps) {
   const setAddAgentOpen = useStore(s => s.setAddAgentOpen);
   const paused = useStore(s => s.paused);
   const godDesired = useStore(s => s.godDesired);
+  // Live restart-required settings ([[restartSig]]) — a desk whose spawn snapshot differs is
+  // running with outdated settings and gets a ⟳ "restart to apply" marker on its card.
+  const liveSig = restartSigOf({
+    sddpMode: useStore(s => s.sddpMode),
+    autoMode: useStore(s => s.autoMode),
+    terminalTheme: useStore(s => s.terminalTheme)
+  });
   const [restoring, setRestoring] = useState(false);
 
   /** Respawn every worker from the previous session with its ORIGINAL agent id,
@@ -56,6 +65,9 @@ export function AgentStrip({ config }: AgentStripProps) {
             action: 'starting up',
             carrying: undefined,
             currentStation: 'desk',
+            // Freshly spawned under the CURRENT config — drop the old snapshot so addAgent
+            // re-stamps spawnSig from the live mirror (don't carry a stale "needs restart").
+            spawnSig: undefined,
             recentTextTs: Date.now()
           });
         } else {
@@ -84,24 +96,32 @@ export function AgentStrip({ config }: AgentStripProps) {
       minHeight: 124,
       alignItems: 'center'
     }}>
-      {[...agents.filter(a => a.isGod), ...agents.filter(a => !a.isGod)].map(a => (
-        <AgentCard
-          key={a.id}
-          name={a.name}
-          character={a.character}
-          accent={a.accent}
-          status={displayStatus(a, !!paused[a.id], godDesired)}
-          project={a.project}
-          action={a.action}
-          progress={a.progress}
-          contextTokens={a.contextTokens}
-          contextLimit={a.contextLimit}
-          selected={a.id === selectedId}
-          isGod={a.isGod}
-          isAssistant={a.isAssistant}
-          onClick={() => select(a.id)}
-        />
-      ))}
+      {[...agents.filter(a => a.isGod), ...agents.filter(a => !a.isGod)].map(a => {
+        const staleKeys = a.isAssistant ? [] : deskStaleKeys(a.spawnSig, liveSig);
+        return (
+          <AgentCard
+            key={a.id}
+            name={a.name}
+            character={a.character}
+            accent={a.accent}
+            status={displayStatus(a, !!paused[a.id], godDesired)}
+            project={a.project}
+            action={a.action}
+            progress={a.progress}
+            contextTokens={a.contextTokens}
+            contextLimit={a.contextLimit}
+            selected={a.id === selectedId}
+            isGod={a.isGod}
+            isAssistant={a.isAssistant}
+            needsRestart={staleKeys.length > 0}
+            needsRestartReason={staleKeys.length > 0
+              ? `Changed since this desk spawned: ${staleKeys.map((k) => RESTART_SIG_LABELS[k]).join(', ')} — click to restart and apply`
+              : undefined}
+            onRestart={() => scheduleDeskRestart(a.id)}
+            onClick={() => select(a.id)}
+          />
+        );
+      })}
       {restorableAgents.length > 0 && (
         <span
           style={{ alignSelf: 'center', flexShrink: 0 }}

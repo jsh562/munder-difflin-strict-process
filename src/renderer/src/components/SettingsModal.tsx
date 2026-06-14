@@ -6,6 +6,8 @@ import { PixelButton } from './PixelButton';
 import { Icon } from './Icon';
 import { ProviderModelPicker } from './ProviderModelPicker';
 import { isAssignmentStale } from '@shared/assignment';
+import { scheduleDeskRestart } from '@/lib/restartDesk';
+import { restartSigOf, deskStaleKeys, RESTART_SIG_LABELS, type RestartSig } from '@/lib/restartSig';
 
 export interface SettingsModalProps {
   config: HarnessConfig;
@@ -150,10 +152,25 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
   const toggleSddpMode = async () => {
     const next = !sddpMode;
     setSddpMode(next); // optimistic
-    useStore.getState().setSddpMode(next); // mirror live so chips/banner update this session
+    useStore.getState().setSddpMode(next); // mirror live so chips/banner/stale-detect update this session
     try { await window.cth.updateConfig({ sddpMode: next }); }
     catch { setSddpMode(!next); useStore.getState().setSddpMode(!next); /* revert on failure */ }
   };
+
+  // ─── "Restart required" detection ────────────────────────────────────────────
+  // The restart-required settings ([[restartSig]]) are baked into a desk at spawn, so a change
+  // only applies on RESPAWN (not on resume/un-pause). Compare each live desk's spawn snapshot to
+  // the live config and surface the desks owed a restart, with a one-click restart for them.
+  const storeAgents = useStore((s) => s.agents);
+  const liveSddp = useStore((s) => s.sddpMode);
+  const liveAuto = useStore((s) => s.autoMode);
+  const liveTheme = useStore((s) => s.terminalTheme);
+  const liveSig: RestartSig = restartSigOf({ sddpMode: liveSddp, autoMode: liveAuto, terminalTheme: liveTheme });
+  const staleDesks = storeAgents
+    .map((a) => ({ a, keys: a.isAssistant ? [] : deskStaleKeys(a.spawnSig, liveSig) }))
+    .filter((x) => x.keys.length > 0);
+  const staleChangedKeys = Array.from(new Set(staleDesks.flatMap((x) => x.keys)));
+  const restartStaleDesks = () => { for (const { a } of staleDesks) scheduleDeskRestart(a.id); };
 
   // ─── circuit-breaker config (Lane A #6 canonical fields, widened view) ───────
   // Drives Jim's real breaker: floor-wide TOKEN budget (costCapTokens) + output-
@@ -477,6 +494,28 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
             </div>
           ) : !confirming ? (
             <div style={{ padding: 20, display: 'flex', flexDirection: 'column', gap: 16 }}>
+              {/* "Restart required" banner — desks running with settings that changed since they
+                  spawned (these only apply on respawn; resuming a paused desk is NOT enough). */}
+              {staleDesks.length > 0 && (
+                <div style={{
+                  display: 'flex', alignItems: 'flex-start', gap: 10, padding: '10px 12px',
+                  background: 'var(--cth-coral-light)', boxShadow: 'inset 0 0 0 1px var(--cth-coral)'
+                }}>
+                  <Icon name="bell" style={{ width: 16, height: 16, marginTop: 1, flexShrink: 0, color: 'var(--cth-ink-900)' }} />
+                  <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 3 }}>
+                    <span style={{ fontSize: 14, lineHeight: '19px', color: 'var(--cth-ink-900)' }}>
+                      {staleDesks.length} desk{staleDesks.length === 1 ? '' : 's'} running with outdated settings
+                    </span>
+                    <span style={{ fontSize: 12, lineHeight: '16px', color: 'var(--cth-ink-700)' }}>
+                      Changed since {staleDesks.length === 1 ? 'it' : 'they'} spawned: {staleChangedKeys.map((k) => RESTART_SIG_LABELS[k]).join(', ')}.
+                      These apply on desk <b>restart</b> — resuming a paused desk is not enough.
+                    </span>
+                  </div>
+                  <PixelButton variant="primary" size="sm" onClick={restartStaleDesks}>
+                    restart {staleDesks.length === 1 ? 'desk' : 'desks'}
+                  </PixelButton>
+                </div>
+              )}
               {/* Home folder — a dedicated row so it can carry a Change… action. */}
               <div style={{ display: 'flex', gap: 12, fontSize: 14, lineHeight: '20px', alignItems: 'center' }}>
                 <span style={{ width: 140, flexShrink: 0, color: 'var(--cth-ink-500)' }}>Home folder</span>
@@ -811,7 +850,8 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
                     Desks follow the spec-driven lifecycle (Specify&rarr;Clarify&rarr;Plan&rarr;Tasks&rarr;Implement&rarr;QC&rarr;Integrate):
                     the <code>planner</code> and <code>qc</code> roles activate, role prompts switch to the SDDP variants, the
                     board shows a feature-phase banner, and phase gates are enforced. Off by default; standard behaviour is
-                    unchanged when off. Restart desks to re-inject prompts after toggling.
+                    unchanged when off. Applies on desk <b>restart</b> — the banner above lets you restart affected desks
+                    (resuming a paused desk is not enough).
                   </span>
                 </div>
                 <PixelButton

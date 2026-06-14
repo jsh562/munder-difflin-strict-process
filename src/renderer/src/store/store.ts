@@ -3,6 +3,7 @@ import type { AccentColorName } from '@/design/tokens';
 import type { OfficeCharacterName } from '@/scene/office/cast';
 import type { StatusKind } from '@/components/PixelBadge';
 import { isNativeRuntimeDesk } from '@/lib/runtimeKind';
+import { restartSigOf, type RestartSig } from '@/lib/restartSig';
 
 export type ToolKind =
   | 'Read' | 'Edit' | 'Write' | 'Bash' | 'WebFetch' | 'WebSearch'
@@ -98,6 +99,11 @@ export interface Agent {
    *  (in the store's `archivedAgents` list + the hive registry) but flagged and
    *  kept off the floor; only live-PTY agents are 'active'. */
   archived?: boolean;
+  /** Snapshot of the restart-required settings ([[restartSig]]) this desk was SPAWNED under,
+   *  stamped in `addAgent` (and re-stamped on restart). Compared to the live config to flag a
+   *  desk running with outdated settings (e.g. SDDP toggled after it spawned). Absent ⇒ spawned
+   *  before this feature; treated as fresh (never flagged) until its next restart. */
+  spawnSig?: RestartSig;
 }
 
 export interface FeedEntry {
@@ -159,6 +165,11 @@ interface State {
   /** Per-floor spec-driven (SDDP) mode, mirrored from config so role chips, the Add-Agent
    *  modal, and the kanban can scope planner/qc + the feature-phase banner to it. */
   sddpMode: boolean;
+  /** The other restart-required config values ([[restartSig]]), mirrored from config so the
+   *  renderer can detect a desk running with outdated settings (these only apply on respawn).
+   *  `sddpMode` above is the third. */
+  autoMode: boolean;
+  terminalTheme: 'light' | 'dark';
   /** Per-agent outgoing message queue (agent id → messages awaiting delivery).
    *  Lets the user keep "talking" to a busy agent: messages park here and are
    *  drained to the terminal one-by-one once the agent is free. */
@@ -233,6 +244,11 @@ interface State {
   setSidebarTab: (tab: SidebarTab) => void;
   setFleetDefaultModel: (m: string | null) => void;
   setSddpMode: (on: boolean) => void;
+  setAutoMode: (on: boolean) => void;
+  setTerminalTheme: (theme: 'light' | 'dark') => void;
+  /** Re-stamp a desk's `spawnSig` from the current live mirror after a successful respawn
+   *  (restartDesk doesn't touch the store record), so a just-restarted desk reads as fresh. */
+  markAgentRespawned: (id: string) => void;
   /** Drop persisted agents whose PTY is no longer alive in the main process.
    *  Called once at startup so a renderer reload (e.g. after the laptop sleeps)
    *  restores still-running agents and only removes truly-dead ones. */
@@ -431,6 +447,8 @@ export const useStore = create<State>((set) => ({
   godStatus: 'booting',
   fleetDefaultModel: null,
   sddpMode: false,
+  autoMode: true,
+  terminalTheme: 'light',
   messageQueues: initialQueues,
   enrichEnabled: initialEnrichEnabled,
   setEnrichEnabled: (on) => {
@@ -509,7 +527,14 @@ export const useStore = create<State>((set) => ({
     set((s) => ({ feeds: { ...s.feeds, [id]: [...(s.feeds[id] ?? []), line] } })),
   addAgent: (agent) =>
     set((s) => {
-      const agents = [...s.agents, agent];
+      // Stamp the restart-required settings this desk is spawning under (the live mirror), so
+      // a later change to one of them flags this desk as needing a restart. A caller that already
+      // set spawnSig (e.g. a restore carrying its own) keeps it.
+      const stamped: Agent = {
+        ...agent,
+        spawnSig: agent.spawnSig ?? restartSigOf({ sddpMode: s.sddpMode, autoMode: s.autoMode, terminalTheme: s.terminalTheme })
+      };
+      const agents = [...s.agents, stamped];
       // Re-spawning an archived agent un-archives it: an id is active xor archived.
       const archivedAgents = s.archivedAgents.filter((a) => a.id !== agent.id);
       // A live (re)spawn also consumes any restorable entry for the same id.
@@ -647,7 +672,17 @@ export const useStore = create<State>((set) => ({
     set({ sidebarTab: tab });
   },
   setFleetDefaultModel: (m) => set({ fleetDefaultModel: (m ?? '').trim() || null }),
-  setSddpMode: (on) => set({ sddpMode: on })
+  setSddpMode: (on) => set({ sddpMode: on }),
+  setAutoMode: (on) => set({ autoMode: on }),
+  setTerminalTheme: (theme) => set({ terminalTheme: theme }),
+  markAgentRespawned: (id) =>
+    set((s) => {
+      if (!s.agents.some((a) => a.id === id)) return s;
+      const sig = restartSigOf({ sddpMode: s.sddpMode, autoMode: s.autoMode, terminalTheme: s.terminalTheme });
+      const agents = s.agents.map((a) => (a.id === id ? { ...a, spawnSig: sig } : a));
+      persistAgents(agents, s.selectedId);
+      return { agents };
+    })
 }));
 
 export function selectedAgent(s: State): Agent | undefined {

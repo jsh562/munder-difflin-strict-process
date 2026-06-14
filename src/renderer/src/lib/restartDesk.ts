@@ -72,6 +72,12 @@ export function scheduleDeskRestart(agentId: string, delayMs = 1200): void {
   restartTimers.set(agentId, setTimeout(() => {
     restartTimers.delete(agentId);
     const agent = useStore.getState().agents.find((a) => a.id === agentId);
-    if (agent) void restartDesk(agent).catch(() => { /* best-effort — desk may be down */ });
+    if (agent) {
+      void restartDesk(agent)
+        // A respawn re-reads the live config, so re-stamp the desk's spawn signature: it now
+        // runs the current restart-required settings and should no longer read as "needs restart".
+        .then((r) => { if (r.ok) useStore.getState().markAgentRespawned(agentId); })
+        .catch(() => { /* best-effort — desk may be down */ });
+    }
   }, delayMs));
 }
