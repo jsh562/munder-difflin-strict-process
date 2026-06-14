@@ -48,6 +48,16 @@ export function AgentRoleControl({ agent }: { agent: Agent }) {
           >{r}</button>
         ))}
       </div>
+      {/* Derived write-state, so the desk's edit capability is unmistakable at a glance:
+          worker OR integrator ⇒ can edit code; otherwise read-only (comments + delegates). */}
+      {(() => {
+        const canEdit = has('worker') || has('integrator');
+        return (
+          <span style={{ fontSize: 10, color: canEdit ? 'var(--cth-ink-700)' : 'var(--cth-mint)', lineHeight: '13px' }}>
+            {canEdit ? '✎ can edit code' : '👁 read-only — delegates, cannot write_file/edit_file/bash'}
+          </span>
+        );
+      })()}
       {/* The god is an orchestrator: worker + integrator both grant code-editing, so leave
           both OFF for a pure delegator. Surfaced here because it's non-obvious. */}
       {agent.isGod && (

@@ -14,10 +14,14 @@
 import { createServer, type Server } from 'node:net';
 import { existsSync, rmSync } from 'node:fs';
 import { Notification, type WebContents } from 'electron';
-import type { HiveManager } from './hive';
+import { roleCanEditCode, type HiveManager } from './hive';
 import type { HarnessConfig } from './config';
 import type { ControlRegistry } from './control';
 import type { CircuitBreaker } from './breaker';
+
+/** Claude Code tool names that EDIT code (write/shell) — gated by the desk's role, parity
+ *  with the native executor's write_file/edit_file/bash gate. */
+const EDIT_TOOL_NAMES = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'Bash']);
 
 interface HookPayload {
   hook_event_name?: string;
@@ -180,6 +184,25 @@ export class HookServer {
             hookEventName: 'PreToolUse',
             permissionDecision: 'deny',
             permissionDecisionReason: d.reason ?? 'Denied by operator.'
+          }
+        };
+      }
+    }
+
+    // Role edit-gate (parity with the native `canEditCode`): a Claude desk holding no
+    // worker/integrator role is read-only — deny code-edit tools here, since the Claude CLI
+    // tools otherwise bypass the native gate entirely. A desk not in the hive registry is
+    // left unrestricted (unknown desk). Mirrors agentTools.ts so both runtimes agree.
+    if (event === 'PreToolUse' && agentId && EDIT_TOOL_NAMES.has(p.tool_name ?? '')) {
+      const agent = this.hive.registry().agents[agentId];
+      if (agent && !roleCanEditCode(agent.roles)) {
+        console.log(`[edit-gate] denied ${p.tool_name} for ${agentId} roles=[${(agent.roles ?? []).join(',')}]`);
+        this.emit(agentId, event, p);
+        return {
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'deny',
+            permissionDecisionReason: 'This desk is read-only — it holds no worker/integrator role, so editing/bash is disabled. Delegate the change to a worker (the orchestrator does not implement).'
           }
         };
       }

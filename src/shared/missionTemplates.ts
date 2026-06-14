@@ -10,9 +10,10 @@
 export const TRIAGE_PROMPT =
   'Triage the board now. ' +
   '(1) For every UNASSIGNED card in TODO: pick the best AVAILABLE worker via hive_list_agents and assign it (hive_update_task assignee) + set a sensible priority; if no suitable worker exists, say exactly which desk to spawn. ' +
-  '(2) Leave ALREADY-ASSIGNED / in-progress cards with their current worker — the work lives on that worker\'s branch; for a stalled assigned card (including one sent back to "doing"), re-engage its owner with a message, do NOT reassign it. ' +
-  '(3) Scan blocked / review / integrate for stalls and nudge the owner, the project\'s reviewer, or its integrator. ' +
-  '(4) Keep tasks.json accurate. ' +
+  '(2) Any implementation card assigned to YOU (the god): reassign it to a worker — you orchestrate, you do not code. ' +
+  '(3) Leave ALREADY-ASSIGNED / in-progress cards with their current worker — the work lives on that worker\'s branch; for a stalled assigned card (including one sent back to "doing"), re-engage its owner with a message, do NOT reassign it. ' +
+  '(4) Scan blocked / review / integrate for stalls and nudge the owner, the project\'s reviewer, or its integrator. ' +
+  '(5) Keep tasks.json accurate. ' +
   'Do NOT implement anything yourself — your job is to delegate.';
 
 /** A recurring schedule "starter" — the editable fields the SCHEDULES create form

@@ -13,7 +13,7 @@ import {
   addWorktree, removeWorktree, listWorktrees, planWorktree, type GitWorktree,
   previewMerge, mergeBranch, agentBranchFor
 } from './git';
-import { HiveManager, type AgentMeta, type HiveMessage, type HiveTask, type AgentRole } from './hive';
+import { HiveManager, roleCanEditCode, type AgentMeta, type HiveMessage, type HiveTask, type AgentRole } from './hive';
 import { HookServer } from './hooks';
 import { CircuitBreaker, type BreakerInput } from './breaker';
 import type { UsageProvider } from './usage';
@@ -343,8 +343,7 @@ const agentToolDeps: AgentToolDeps = {
   canEditCode: (id) => {
     const a = hive.registry().agents[id];
     if (!a) return true; // unknown desk → don't over-restrict
-    const roles = a.roles ?? [];
-    return roles.includes('worker') || roles.includes('integrator');
+    return roleCanEditCode(a.roles);
   },
   // Extra READ roots: every desk may READ any registered project repo + any worktree (to
   // compare versions or read a peer's branch — the god/reviewer especially need this), while
@@ -400,7 +399,10 @@ const agentToolDeps: AgentToolDeps = {
 // holding the `integrator` role (it does by default, but the operator can reassign it to a
 // dedicated integrator desk): with the role the god reviews+merges+signs-off; without it,
 // the god delegates integration to whichever desk holds the role.
-function nativeGodPrompt(godIntegrates: boolean, godReviews: boolean): string {
+function nativeGodPrompt(godRoles: AgentRole[]): string {
+  const godIntegrates = godRoles.includes('integrator');
+  const godReviews = godRoles.includes('reviewer');
+  const godCanEdit = roleCanEditCode(godRoles); // holds worker or integrator
   return [
     'You are the GOD / ORCHESTRATOR of this hive of agents (you are "Michael"). Your job is to ORCHESTRATE, not implement: keep awareness of the whole team and delegate the work.',
     '- KNOW THE TEAM: before delegating, call hive_list_agents to see who exists, who is running, and each desk\'s roles — assign to the best AVAILABLE desk, never blind.',
@@ -414,8 +416,10 @@ function nativeGodPrompt(godIntegrates: boolean, godReviews: boolean): string {
       ? '- INTEGRATE approved work (you hold the integrator role): each worker commits its slice on its own worktree branch (hive_list_agents shows each desk\'s repo + branch). On an "integrate" card, RUN the test suite as the merge gate, hive_integrate (no apply) to inspect the commits/diff, then hive_integrate apply:true to merge into the repo\'s base — then mark the card "done". A reported conflict (or red tests) means resolve it yourself (you may edit only to resolve the conflict) or send it back to the author. You own sign-off (done/reopen).'
       : '- INTEGRATION is delegated: prefer a desk holding "integrator" (auto-pinged on "integrate"). But if NO integrator desk exists you are the standing fallback — the system pings YOU, so merge it yourself: run the tests, hive_integrate (preview → apply), then mark "done".',
     '- READ TO ORCHESTRATE: you CAN read any project repo + worktree (read_file/list_dir/grep with the repo/branch paths from hive_list_agents) — use that to decompose work and review branches. Your own working directory is just a neutral home base, not where the projects live.',
-    '- DO NOT IMPLEMENT: building feature code is the WORKERS\' job — always delegate it. You have code-EDITING tools (write_file/edit_file/bash) ONLY while you hold a `worker` or `integrator` role; if the operator leaves both off you are a pure orchestrator with NO edit tools and MUST delegate everything. Even when you hold `integrator`, edit ONLY to merge / resolve conflicts — never to build a feature slice yourself.',
-    '- STAY WITH THE OWNER: a card stays with its original worker through review and send-back — the code lives on that worker\'s `agent/<id>` worktree branch, so only that worker can naturally continue it. Only reassign a card if its worker is genuinely gone, and then hand the branch over explicitly.',
+    godCanEdit
+      ? '- DO NOT IMPLEMENT: building feature code is the WORKERS\' job — always delegate it. You hold an editing role, but use write_file/edit_file/bash ONLY to merge / resolve conflicts — never to build a feature slice yourself.'
+      : '- YOU CANNOT EDIT CODE: you hold no worker/integrator role, so write_file / edit_file / bash / hive_integrate are DISABLED for you and will be DENIED ("read-only"). Do NOT attempt them. If a card needs implementation, reassign it to a worker (hive_update_task assignee) or — if none exists — tell the operator which desk to spawn, then move on. If any edit/bash call is denied as "read-only", STOP retrying it immediately and delegate; never loop on a denied tool.',
+    '- A DEV CARD IS NOT YOURS TO CODE: if a card assigned to you needs implementation, reassign it to a worker — you own orchestration, not the coding. A card stays with its assigned worker through review and send-back (the code lives on that worker\'s `agent/<id>` worktree branch); only reassign a worker\'s card if that worker is genuinely gone, and then hand the branch over explicitly.',
     '- IF NO WORKER DESKS ARE ALIVE to take the work, do NOT attempt it yourself — tell the operator exactly which team/desks to spawn, then orchestrate once they are up.',
     '- COORDINATE: answer agents\' questions so the team runs autonomously; read a peer\'s memory with hive_read_memory when you need context; record durable decisions with write_memory.',
     'The human operator is watching this transcript and can message you directly — surface anything genuinely critical to them.'
@@ -456,8 +460,17 @@ const nativeRuntime = new NativeRuntime({
     if (control.shouldHalt(id)) return { content: 'halted by operator', success: false };
     const decision = control.toolDecision(id, req.toolName);
     if (decision.deny) return { content: decision.reason ?? 'denied by operator', success: false };
+    // The attempt is recorded BEFORE execution, so a desk hammering an identical denied tool
+    // still feeds the breaker's loop guard.
     breaker.recordToolUse(id, req.toolName, req.toolInput);
-    return executeAgentTool(agentToolDeps, id, req);
+    const result = await executeAgentTool(agentToolDeps, id, req);
+    // Visibility (#edit-gate): make a read-only role denial observable in the main log, so
+    // "is the god actually writing?" is a fact, not a guess.
+    if (!result.success && (req.toolName === 'write_file' || req.toolName === 'edit_file' || req.toolName === 'bash')
+        && /read-only/.test(result.content)) {
+      console.log(`[edit-gate] denied ${req.toolName} for ${id} roles=[${(hive.registry().agents[id]?.roles ?? []).join(',')}]`);
+    }
+    return result;
   },
   onWorkerExit: (id) => { archiveAgent(id); syncKeepAwake(); },
   usageFor: (id) => usageProvider.getAgentUsage(id),
@@ -472,7 +485,7 @@ const nativeRuntime = new NativeRuntime({
     const agent = hive.registry().agents[id];
     const roles = agent?.roles ?? [];
     if (agent?.isGod) {
-      env.NATIVE_AGENT_GOD_PROMPT = nativeGodPrompt(roles.includes('integrator'), roles.includes('reviewer'));
+      env.NATIVE_AGENT_GOD_PROMPT = nativeGodPrompt(roles);
     } else {
       // A non-god desk can hold reviewer and/or integrator on top of (or instead of) worker;
       // inject each role's preamble so its responsibilities are spelled out.
@@ -1394,7 +1407,7 @@ ipcMain.handle('hive:setRoles', (_evt, id: unknown, roles: unknown) => {
   if (typeof id !== 'string') return { ok: false, error: 'invalid id' };
   if (!hive.enabled()) return { ok: false, error: 'hive disabled (no harnessHome)' };
   const valid = Array.isArray(roles)
-    ? roles.filter((r): r is AgentRole => r === 'worker' || r === 'integrator')
+    ? roles.filter((r): r is AgentRole => r === 'worker' || r === 'reviewer' || r === 'integrator')
     : [];
   hive.setRoles(id, valid);
   return { ok: true };

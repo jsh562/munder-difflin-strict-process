@@ -30,12 +30,13 @@ import { COMMAND_GROUPS } from '../shared/claudeCommands';
 // The mailbox + task-ledger vocabulary is owned by @jsh562/agent-core (so the extracted
 // coding toolkit is host-agnostic); re-exported below so existing `import { HiveMessage }
 // from '../hive'` consumers across the app are unchanged.
-import { reconcileBlocked } from '@jsh562/agent-core';
+import { reconcileBlocked, roleCanEditCode } from '@jsh562/agent-core';
 import type { MessageAct, HiveMessage, HiveTask, AgentRole } from '@jsh562/agent-core';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 export type { MessageAct, HiveMessage, HiveTask, AgentRole };
+export { roleCanEditCode };
 
 export interface AgentMeta {
   id: string;
