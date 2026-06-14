@@ -293,6 +293,7 @@ const nativeEventBridge = createNativeEventBridge({
 const agentToolDeps: AgentToolDeps = {
   enabled: () => hive.enabled(),
   memory: (id) => hive.memory(id),
+  inbox: (id) => hive.inbox(id),
   send: (partial, from) => hive.send(partial, from),
   tasks: () => hive.tasks(),
   writeTasks: (tasks) => hive.writeTasks(tasks),

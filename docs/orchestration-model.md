@@ -24,6 +24,7 @@ Cast: **God** (`Michael`, the orchestrator — a singleton) and **workers** (Dee
 ## 3. Delegation & escalation
 
 - The god delegates with **`hive_send_message`** — the actual dispatch into a worker's inbox. (The Tasks tab's "assign" button just pre-fills a message *to the god*; all human dispatch routes through the god.) A worker is woken by the inbox-wake loop and its end-of-turn drain delivers the content.
+- **Inbox is a command, not a file.** New messages are auto-inlined into a desk's next turn by the drain (surfaced exactly once via its `cursor.json`); a desk re-reads on demand with **`hive_read_inbox`**. Desks should NOT `list_dir`/`read_file` the raw `inbox/` (the drain no longer points there). Memory is likewise command-driven: **`hive_read_memory`** / **`write_memory`**.
 - **`hive_list_agents`** gives the god a host-mediated roster (`id, name, role, archived, running, repo, branch`) so it picks the best **available** desk instead of delegating blind. The god's loop: read roster + board, **decompose** a request into slices, create one **task card per slice** assigned to a desk, `hive_send_message` each. It can split one task across desks, assign different tasks to different desks, and re-route when a desk is blocked.
 - **Escalation (worker → god).** A worker raises a blocker, ambiguity, conflict, or sign-off request by `hive_send_message {to:'god', act:'request'|'query'}`; it routes to the god's inbox and wakes it. This is the right channel — the god owns decisions/conflicts; workers don't guess or block silently.
 

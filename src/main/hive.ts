@@ -438,7 +438,7 @@ export class HiveManager {
     const reason = [
       `You have ${fresh.length} new hive message(s) in your inbox. Address them before finishing:`,
       lines,
-      `Open the files in ${dir}/inbox/ for full detail, act on each, then move handled ones to inbox/.done/. Reply via your outbox if a message requires it.`
+      `Act on each; reply with hive_send_message if one needs a response. Re-read your inbox anytime with hive_read_inbox. (These won't be shown again — no need to open inbox files.)`
     ].join('\n');
     return { block: true, reason };
   }
