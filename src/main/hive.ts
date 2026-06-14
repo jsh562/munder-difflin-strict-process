@@ -526,11 +526,14 @@ export class HiveManager {
     };
   }
 
-  /** Atomically deliver a message into a recipient agent's inbox. */
-  private deliver(msg: HiveMessage, toId: string): void {
+  /** Atomically deliver a message into a recipient agent's inbox. Returns false when the
+   *  recipient has no inbox (unknown / never-spawned / force-deleted id) so the caller can
+   *  dead-letter rather than silently swallow it. */
+  private deliver(msg: HiveMessage, toId: string): boolean {
     const inbox = join(this.agentDir(toId), 'inbox');
-    if (!existsSync(inbox)) return; // unknown recipient — dropped (logged by caller)
+    if (!existsSync(inbox)) return false; // unknown recipient — caller dead-letters
     this.atomicWriteJson(join(inbox, `${msg.id}.json`), msg);
+    return true;
   }
 
   /** Inject a message directly (used by the orchestrator / UI / tests). */
@@ -550,10 +553,16 @@ export class HiveManager {
     }
     const reg = this.registry();
     const godId = reg.godId ?? 'god';
+    const godExists = !!reg.godId && existsSync(join(this.agentDir(godId), 'inbox'));
     // The hive has no separate human-approval queue — approvals are native to
     // each agent's Claude Code session (and approvable remotely). A message aimed
     // at "human" is handled by the god/orchestrator, the human's proxy here.
     const resolveTo = (to: string): string => (to === 'human' || to === 'god' ? godId : to);
+    // Surface a 'god'/'human' message that can't resolve (no god spawned) instead of
+    // silently dropping it.
+    if ((msg.to === 'god' || msg.to === 'human') && !godExists) {
+      this.appendLog({ kind: 'drop', reason: 'no-god', from: msg.from, to: msg.to, id: msg.id });
+    }
     const targets = msg.to === 'broadcast'
       // The roster for fan-out is the ACTIVE registry: skip the send-only prep
       // assistant and any archived agent (closed tab) so mail never piles into a
@@ -577,7 +586,21 @@ export class HiveManager {
         }, godId);
         continue;
       }
-      this.deliver(msg, t);
+      // If the target has no inbox (unknown / never-spawned / force-deleted id), the message
+      // would silently vanish. Dead-letter a notice to the god so it can reassign/restore —
+      // loop-safe: written straight to the god's inbox, never back through routeMessage, and
+      // skipped when the dead target IS the god.
+      if (!this.deliver(msg, t)) {
+        this.appendLog({ kind: 'drop', reason: 'undeliverable', from: msg.from, to: t, id: msg.id });
+        if (godExists && t !== godId) {
+          this.deliver(this.normalize({
+            to: godId,
+            act: 'inform',
+            subject: `Undeliverable: ${msg.to}`,
+            body: `Couldn't deliver ${msg.from}'s message "${msg.subject}" to "${t}" — no such desk/inbox. Reassign its work to a live desk or restore it.`
+          }, 'system'), godId);
+        }
+      }
     }
     this.appendLog({ kind: 'message', from: msg.from, to: msg.to, act: msg.act, subject: msg.subject, id: msg.id });
     this.emitMessage(msg, targets);
@@ -705,10 +728,13 @@ export class HiveManager {
           `Task "${t.title}" (${t.id}) is unblocked — its blocker(s) are done. You can resume it.`);
       }
       if (t.status === 'review') {
-        for (const to of this.roleHoldersForTask('reviewer', t)) {
+        const reviewers = this.roleHoldersForTask('reviewer', t);
+        for (const to of reviewers) {
           ping(to, 'request', `Review: ${t.title}`,
             `Task "${t.title}" (${t.id}) is ready for REVIEW. Read its branch (read-only), comment via hive_update_task note; approve by setting it to 'integrate', or send it back with status 'doing' and what to fix.`);
         }
+        // No reviewer AND no god fallback ⇒ the card would sit unwatched — make it visible.
+        if (reviewers.length === 0) this.appendLog({ kind: 'drop', reason: 'no-handler', to: 'reviewer', id: t.id });
       }
       if (t.status === 'integrate') {
         // ONE integrator only (parallel hive_integrate would double-merge).
@@ -716,6 +742,8 @@ export class HiveManager {
         if (to) {
           ping(to, 'request', `Integrate: ${t.title}`,
             `Task "${t.title}" (${t.id}) is approved and ready to INTEGRATE. Find its repo + branch via hive_list_agents, run the test suite as the merge gate, then hive_integrate (preview → apply), resolve any conflict or send it back, then mark it 'done'.`);
+        } else {
+          this.appendLog({ kind: 'drop', reason: 'no-handler', to: 'integrator', id: t.id });
         }
       }
       if (t.status === 'doing' && (wasStatus === 'review' || wasStatus === 'integrate') && t.assignee) {
