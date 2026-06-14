@@ -8,7 +8,7 @@ import { buildSpawnCommand, type HarnessConfig } from '@/store/config';
 import { displayStatus } from '@/lib/agentStatus';
 import { scheduleDeskRestart } from '@/lib/restartDesk';
 import { restartSigOf, deskStaleKeys } from '@/lib/restartSig';
-import { groupAgents, roleCounts, agentsInRole, type AgentGroup } from '@/lib/agentGroups';
+import { groupAgents, effectiveRoles, type AgentGroup } from '@/lib/agentGroups';
 
 export interface AgentStripProps {
   /** Needed to rebuild a spawn command when a restorable agent predates the
@@ -16,11 +16,19 @@ export interface AgentStripProps {
   config?: HarnessConfig | null;
 }
 
-/** Column order for the role grid; planner/qc only appear in SDDP mode. */
-const ROLE_ORDER: AgentRole[] = ['worker', 'reviewer', 'integrator', 'planner', 'qc'];
+/** A matrix column. `god`/`assistant` are IDENTITY columns (always shown so a roleless god or the
+ *  prep assistant is still visible); the rest are capability ROLE columns, in workflow order. */
+type Col =
+  | { kind: 'god'; label: string; bg: string }
+  | { kind: 'assistant'; label: string; bg: string }
+  | { kind: 'role'; role: AgentRole; label: string; bg: string };
 
-/** An open matrix cell → the flyout listing its desks. `role: null` = the Σ (all desks in the row). */
-interface OpenCell { group: AgentGroup; role: AgentRole | null; rect: DOMRect; }
+/** Capability roles in WORKFLOW order (planner→…→integrate); planner/qc only in SDDP mode. */
+const SDDP_ROLE_FLOW: AgentRole[] = ['planner', 'worker', 'reviewer', 'qc', 'integrator'];
+const STD_ROLE_FLOW: AgentRole[] = ['worker', 'reviewer', 'integrator'];
+
+/** An open matrix cell → the flyout listing its desks. `col: 'all'` = the row label (all desks). */
+interface OpenCell { group: AgentGroup; col: Col | 'all'; rect: DOMRect; }
 
 export function AgentStrip({ config }: AgentStripProps) {
   const agents = useStore(s => s.agents);
@@ -38,7 +46,6 @@ export function AgentStrip({ config }: AgentStripProps) {
   const [restoring, setRestoring] = useState(false);
   const [open, setOpen] = useState<OpenCell | null>(null);
 
-  // Close the desk flyout on Escape.
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(null); };
@@ -47,8 +54,7 @@ export function AgentStrip({ config }: AgentStripProps) {
   }, [open]);
 
   /** Respawn every worker from the previous session with its ORIGINAL agent id,
-   *  cwd, model and command — the hive workspace (memory.md, inbox, registry
-   *  entry) reattaches by itself, no memory transplant needed. */
+   *  cwd, model and command — the hive workspace reattaches by itself. */
   const restoreTeam = async () => {
     if (restoring) return;
     setRestoring(true);
@@ -60,22 +66,14 @@ export function AgentStrip({ config }: AgentStripProps) {
         const [exe, ...args] = command.split(/\s+/);
         const ptyId = a.ptyId ?? `pty-${a.id}`;
         const res = await window.cth.spawnPty({
-          id: ptyId,
-          cwd: a.cwd,
-          command: exe,
-          args,
-          cols: 100,
-          rows: 30,
+          id: ptyId, cwd: a.cwd, command: exe, args, cols: 100, rows: 30,
           isolate: !!a.worktreePath,
           hive: { id: a.id, name: a.name, cwd: a.cwd, role: a.description }
         });
         if (res.ok) {
           useStore.getState().addAgent({
             ...a, ptyId, archived: false, status: 'idle', action: 'starting up',
-            carrying: undefined, currentStation: 'desk',
-            // Freshly spawned under the CURRENT config — drop the old snapshot so addAgent
-            // re-stamps spawnSig from the live mirror (don't carry a stale "needs restart").
-            spawnSig: undefined, recentTextTs: Date.now()
+            carrying: undefined, currentStation: 'desk', spawnSig: undefined, recentTextTs: Date.now()
           });
         } else {
           console.error('[restore] spawn failed for', a.id, res.error);
@@ -89,21 +87,33 @@ export function AgentStrip({ config }: AgentStripProps) {
   };
 
   const groups = groupAgents(agents);
-  const roleCols = ROLE_ORDER.filter((r) => sddpMode || (r !== 'planner' && r !== 'qc'));
-  // grid: project label | one column per role | Σ total.
-  const gridCols = `minmax(64px, max-content) repeat(${roleCols.length}, 30px) 34px`;
+  const roleFlow = sddpMode ? SDDP_ROLE_FLOW : STD_ROLE_FLOW;
+  // Columns in WORKFLOW order: god → (planner →) worker → reviewer → (qc →) integrator → assistant.
+  const cols: Col[] = [
+    { kind: 'god', label: 'god', bg: 'var(--cth-lemon)' },
+    ...roleFlow.map((r): Col => ({ kind: 'role', role: r, label: ROLE_META[r].abbr, bg: ROLE_META[r].on })),
+    { kind: 'assistant', label: 'ast', bg: 'var(--cth-cream-200)' }
+  ];
+  const gridCols = `minmax(60px, max-content) repeat(${cols.length}, 30px)`;
 
-  const openFlyout = (group: AgentGroup, role: AgentRole | null, e: React.MouseEvent) =>
-    setOpen({ group, role, rect: e.currentTarget.getBoundingClientRect() });
+  // god/assistant get their own (identity) columns; role columns exclude them (no double-count).
+  const agentsFor = (g: AgentGroup, c: Col | 'all'): Agent[] =>
+    c === 'all' ? g.agents
+    : c.kind === 'god' ? g.agents.filter((a) => a.isGod)
+    : c.kind === 'assistant' ? g.agents.filter((a) => a.isAssistant)
+    : g.agents.filter((a) => !a.isGod && !a.isAssistant && effectiveRoles(a).includes(c.role));
 
-  /** A clickable count cell. Dim "·" when zero (not clickable). */
-  const cell = (group: AgentGroup, role: AgentRole | null, count: number) => {
+  const colLabel = (c: Col | 'all') => c === 'all' ? 'all' : c.kind === 'role' ? c.role : c.kind;
+
+  const cell = (g: AgentGroup, c: Col) => {
+    const count = agentsFor(g, c).length;
     if (count === 0) return <span style={{ color: 'var(--cth-ink-300)', fontSize: 11 }}>·</span>;
-    const isOpen = open?.group.key === group.key && open?.role === role;
+    const isOpen = open?.group.key === g.key && open?.col !== 'all' && open?.col.kind === c.kind &&
+      (c.kind !== 'role' || (open.col.kind === 'role' && open.col.role === c.role));
     return (
       <button
-        onClick={(e) => openFlyout(group, role, e)}
-        title={`${count} ${role ?? 'desk(s)'} in ${group.label} — click to list`}
+        onClick={(e) => setOpen({ group: g, col: c, rect: e.currentTarget.getBoundingClientRect() })}
+        title={`${count} ${colLabel(c)} in ${g.label} — click to list`}
         style={{
           width: '100%', height: 20, border: 'none', cursor: 'pointer',
           background: isOpen ? 'var(--cth-lemon)' : 'var(--cth-paper-100)',
@@ -114,7 +124,7 @@ export function AgentStrip({ config }: AgentStripProps) {
     );
   };
 
-  const flyoutAgents = open ? (open.role ? agentsInRole(open.group.agents, open.role) : open.group.agents) : [];
+  const flyoutAgents = open ? agentsFor(open.group, open.col) : [];
 
   return (
     <div style={{
@@ -122,38 +132,35 @@ export function AgentStrip({ config }: AgentStripProps) {
       borderTop: '2px solid var(--cth-ink-900)', background: 'var(--cth-cream-200)',
       height: 144, minHeight: 144, alignItems: 'stretch'
     }}>
-      {/* Project × role count matrix — compact overview; agents revealed on click (flyout). */}
+      {/* Project × role count matrix — compact overview; desks revealed on click (flyout). */}
       <div style={{ overflowY: 'auto', overflowX: 'hidden', flexShrink: 0 }}>
         <div style={{ display: 'grid', gridTemplateColumns: gridCols, gap: 3, alignItems: 'center' }}>
-          {/* Header row: blank corner, role chips, Σ. */}
+          {/* Header row: corner label, then each column chip (god + workflow roles + assistant). */}
           <span style={{ fontFamily: 'var(--cth-font-display)', fontSize: 8, color: 'var(--cth-ink-500)' }}>PROJECT</span>
-          {roleCols.map((r) => (
-            <span key={r} title={r} style={{
+          {cols.map((c, i) => (
+            <span key={i} title={c.kind === 'god' ? 'god / orchestrator' : c.kind === 'assistant' ? 'prep assistant' : c.role} style={{
               justifySelf: 'stretch', textAlign: 'center', padding: '1px 0', height: 16,
-              background: ROLE_META[r].on, boxShadow: 'inset 0 0 0 1px var(--cth-ink-900)',
-              fontFamily: 'var(--cth-font-ui)', fontSize: 10, lineHeight: '14px', color: 'var(--cth-ink-900)'
-            }}>{ROLE_META[r].abbr}</span>
+              background: c.bg, boxShadow: 'inset 0 0 0 1px var(--cth-ink-900)',
+              fontFamily: 'var(--cth-font-ui)', fontSize: c.kind === 'role' ? 10 : 9, lineHeight: '14px', color: 'var(--cth-ink-900)'
+            }}>{c.label}</span>
           ))}
-          <span title="all desks" style={{ textAlign: 'center', fontFamily: 'var(--cth-font-display)', fontSize: 8, color: 'var(--cth-ink-500)' }}>Σ</span>
 
-          {/* One row per group: label, per-role counts, Σ total. */}
-          {groups.map((g) => {
-            const counts = roleCounts(g.agents);
-            return [
-              <span key={`${g.key}-label`} title={g.label} style={{
+          {/* One row per group: a clickable label (→ all desks) + a count per column. */}
+          {groups.map((g) => [
+            <button
+              key={`${g.key}-label`}
+              onClick={(e) => setOpen({ group: g, col: 'all', rect: e.currentTarget.getBoundingClientRect() })}
+              title={`${g.agents.length} desk(s) in ${g.label} — click to list all`}
+              style={{
+                border: 'none', background: 'transparent', cursor: 'pointer', textAlign: 'left', padding: '0 4px 0 0',
                 fontFamily: 'var(--cth-font-display)', fontSize: 9, color: 'var(--cth-ink-900)',
-                whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 160, paddingRight: 4
-              }}>{g.label}</span>,
-              ...roleCols.map((r) => (
-                <span key={`${g.key}-${r}`} style={{ justifySelf: 'stretch', textAlign: 'center' }}>
-                  {cell(g, r, counts[r] ?? 0)}
-                </span>
-              )),
-              <span key={`${g.key}-sum`} style={{ justifySelf: 'stretch', textAlign: 'center' }}>
-                {cell(g, null, g.agents.length)}
-              </span>
-            ];
-          })}
+                whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 160
+              }}
+            >{g.label}</button>,
+            ...cols.map((c, i) => (
+              <span key={`${g.key}-${i}`} style={{ justifySelf: 'stretch', textAlign: 'center' }}>{cell(g, c)}</span>
+            ))
+          ])}
         </div>
       </div>
 
@@ -188,7 +195,7 @@ export function AgentStrip({ config }: AgentStripProps) {
             padding: 6, display: 'flex', flexDirection: 'column', gap: 3
           }}>
             <div style={{ fontFamily: 'var(--cth-font-display)', fontSize: 8, color: 'var(--cth-ink-500)', padding: '0 2px 2px' }}>
-              {open.group.label} · {open.role ?? 'all'} ({flyoutAgents.length})
+              {open.group.label} · {colLabel(open.col)} ({flyoutAgents.length})
             </div>
             {flyoutAgents.map((a) => {
               const warm = a.id in liveness ? liveness[a.id] : undefined;
@@ -213,12 +220,9 @@ export function AgentStrip({ config }: AgentStripProps) {
                   )}
                   <span style={{ flex: 1, minWidth: 0, fontSize: 12, color: 'var(--cth-ink-900)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{a.name}</span>
                   {stale && (
-                    <span
-                      role="button" tabIndex={-1}
-                      title="Settings changed since spawn — click to restart"
+                    <span role="button" tabIndex={-1} title="Settings changed since spawn — click to restart"
                       onClick={(e) => { e.stopPropagation(); scheduleDeskRestart(a.id); }}
-                      style={{ fontSize: 10, color: 'var(--cth-coral)', cursor: 'pointer', flexShrink: 0 }}
-                    >⟳</span>
+                      style={{ fontSize: 10, color: 'var(--cth-coral)', cursor: 'pointer', flexShrink: 0 }}>⟳</span>
                   )}
                   <PixelBadge status={displayStatus(a, !!paused[a.id], godDesired)} />
                 </button>

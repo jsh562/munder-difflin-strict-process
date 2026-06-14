@@ -101,12 +101,14 @@ if (parentPort) {
       }
     : stubExecuteTool;
 
-  // E006 {FR-009} — advertise the full coding toolkit to the model ON THE NATIVE PATH
-  // so it can actually USE filesystem/search/shell/memory + mailbox/tasks (the
-  // execution seam above is already wired; MAIN governs + sandboxes each call). The
-  // stub fallback keeps prior behavior (no catalog), so existing stub tests are
-  // unchanged. The catalog names match `executeAgentTool` exactly (conformance test).
-  const tools: ToolSpec[] | undefined = isNative ? [...AGENT_TOOL_CATALOG] : undefined;
+  // E006 {FR-009} — advertise the coding toolkit to the model ON THE NATIVE PATH so it can
+  // actually USE filesystem/search/shell/memory + mailbox/tasks (the execution seam above is
+  // already wired; MAIN governs + sandboxes each call). Per-desk gating: MAIN passes
+  // NATIVE_AGENT_DENY_TOOLS (tools this desk's roles can't use — e.g. hive_integrate for a
+  // non-integrator, write/edit/bash for a read-only desk) so the model never sees (or attempts)
+  // a tool the gate would deny. The stub fallback keeps prior behavior (no catalog).
+  const denyTools = new Set((process.env.NATIVE_AGENT_DENY_TOOLS ?? '').split(',').map((s) => s.trim()).filter(Boolean));
+  const tools: ToolSpec[] | undefined = isNative ? AGENT_TOOL_CATALOG.filter((t) => !denyTools.has(t.name)) : undefined;
 
   const onCommand = async (cmd: WorkerCommand): Promise<void> => {
     switch (cmd.type) {

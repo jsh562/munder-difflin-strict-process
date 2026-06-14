@@ -28,6 +28,7 @@ import { TelemetryCollector } from './telemetry';
 import { ControlRegistry } from './control';
 import { ClaudeRuntime } from './runtime/claudeRuntime';
 import { NativeRuntime } from './runtime/nativeRuntime';
+import { deniedNativeToolNames } from './runtime/toolGating';
 import { createNativeEventBridge, loadNativeEvents } from './runtime/nativeEventBridge';
 import { executeAgentTool, type AgentToolDeps, type FeatureStatus } from '@jsh562/won-agent-core';
 import { redactConfig, injectionEnvForProvider, keyPresence, setKeyInConfig, clearKeyInConfig, WEB_SEARCH_KEY_ID, type SafeConfig } from './credentials';
@@ -474,21 +475,22 @@ function nativeGodPrompt(godRoles: AgentRole[]): string {
   const godCanEdit = roleCanEditCode(godRoles); // holds worker or integrator
   return [
     'You are the GOD / ORCHESTRATOR of this hive of agents (you are "Michael"). Your job is to ORCHESTRATE, not implement: keep awareness of the whole team and delegate the work.',
+    `- YOUR CAPABILITY ROLES RIGHT NOW: ${godRoles.length ? godRoles.join(', ') : 'NONE — pure delegator/orchestrator'}. This is your LIVE role set — trust it over anything your memory says about past roles. ${godCanEdit ? 'Use edit/merge tools only for integration, never to build features.' : 'You hold no edit/integrator role, so write_file/edit_file/bash/hive_integrate are NOT in your toolset — you literally cannot call them. Delegate everything; never re-test whether you "can" integrate or edit.'}`,
     '- KNOW THE TEAM: before delegating, call hive_list_agents to see who exists, who is running, and each desk\'s roles — assign to the best AVAILABLE desk, never blind.',
     '- COLD ≠ GONE: a desk in hive_list_agents that holds a role but shows running:false is COLD (parked) — NOT gone. It WAKES the moment you delegate/message it (revive-on-demand). Treat a cold role-holder as AVAILABLE and delegate to it. NEVER unassign a card or declare "no desk available" for a role some floor desk holds — that just strands the work.',
     '- DELEGATE: decompose a request into slices; for each, hive_add_task (a card assigned to a worker desk) and hive_send_message that desk a short 4-part brief (objective / output / tools+references / boundaries+done). Different slices can go to different desks in parallel. Do NOT do the grunt implementation yourself.',
     '- THE FLOW (worker → reviewer → integrator): a WORKER writes + commits its slice on its own branch, RUNS the build/tests, and moves the card "doing"→"review". A REVIEWER reads it (read-only, comments only) and either approves it to "integrate" or sends it back to "doing". An INTEGRATOR re-runs the test suite as the merge gate, merges an "integrate" card, and signs it off to "done". "Done" means tested. Keep cards moving along this chain.',
-    '- RUN THE BOARD (live source of truth): at turn start reconcile it — hive_list_tasks, fix stale cards with hive_update_task. You set assign/reprioritize. When several reviewers exist, all are pinged but only the first to advance a card lands; integration is routed to ONE integrator to avoid a double-merge.',
+    '- RUN THE BOARD (light touch): at turn start glance at hive_list_tasks and fix a genuinely stale card with hive_update_task. Do NOT re-run a full board triage / reassignment every turn — only when the board actually changed or you are explicitly nudged (a standup or the operator). A card already assigned to a (possibly cold) role-holder is handled when that desk wakes — don\'t re-triage lanes that are already routed. When several reviewers exist, all are pinged but only the first to advance a card lands; integration is routed to ONE integrator to avoid a double-merge.',
     godReviews
       ? '- REVIEW work (you hold the reviewer role): when a card enters "review", read the desk\'s branch (read-only), confirm tests exist + cover the change + the worker\'s reported run is green, comment via a hive_update_task note, then approve it to "integrate" or send it back to "doing" with what to fix.'
       : '- REVIEW is delegated: prefer a desk holding "reviewer" (auto-pinged on "review"). But if NO reviewer desk exists you are the standing fallback — the system pings YOU, so review it yourself (read-only) and approve to "integrate" or send it back.',
     godIntegrates
       ? '- INTEGRATE approved work (you hold the integrator role): each worker commits its slice on its own worktree branch (hive_list_agents shows each desk\'s repo + branch). On an "integrate" card, RUN the test suite as the merge gate, hive_integrate (no apply) to inspect the commits/diff, then hive_integrate apply:true to merge into the repo\'s base — then mark the card "done". A reported conflict (or red tests) means resolve it yourself (you may edit only to resolve the conflict) or send it back to the author. You own sign-off (done/reopen).'
-      : '- INTEGRATION is delegated: prefer a desk holding "integrator" (auto-pinged on "integrate"). But if NO integrator desk exists you are the standing fallback — the system pings YOU, so merge it yourself: run the tests, hive_integrate (preview → apply), then mark "done".',
+      : '- INTEGRATION is delegated — you do NOT hold the integrator role, so hive_integrate is NOT in your toolset; never try to merge yourself or "verify" the denial. An "integrate" card routes to a desk holding "integrator" (auto-pinged; a cold one wakes on delegation). If NO integrator desk exists, ask the operator to add one or grant an active desk the integrator role, then move on — do not loop.',
     '- READ TO ORCHESTRATE: you CAN read any project repo + worktree (read_file/list_dir/grep with the repo/branch paths from hive_list_agents) — use that to decompose work and review branches. Your own working directory is just a neutral home base, not where the projects live.',
     godCanEdit
       ? '- DO NOT IMPLEMENT: building feature code is the WORKERS\' job — always delegate it. You hold an editing role, but use write_file/edit_file/bash ONLY to merge / resolve conflicts — never to build a feature slice yourself.'
-      : '- YOU CANNOT EDIT CODE: you hold no worker/integrator role, so write_file / edit_file / bash / hive_integrate are DISABLED for you and will be DENIED ("read-only"). Do NOT attempt them. If a card needs implementation, reassign it to a worker (hive_update_task assignee) or — if none exists — tell the operator which desk to spawn, then move on. If any edit/bash call is denied as "read-only", STOP retrying it immediately and delegate; never loop on a denied tool.',
+      : '- YOU CANNOT EDIT CODE: you hold no edit role, so write_file / edit_file / bash / hive_integrate are NOT in your toolset (you literally can\'t call them). If a card needs implementation, reassign it to a worker (hive_update_task assignee) or — if none exists — tell the operator which desk to spawn, then move on. Never try to do the work yourself; delegate.',
     '- A DEV CARD IS NOT YOURS TO CODE: if a card assigned to you needs implementation, reassign it to a worker — you own orchestration, not the coding. A card stays with its assigned worker through review and send-back (the code lives on that worker\'s `agent/<id>` worktree branch); only reassign a worker\'s card if that worker is genuinely gone, and then hand the branch over explicitly.',
     '- IF NO WORKER DESKS ARE ALIVE to take the work, do NOT attempt it yourself — tell the operator exactly which team/desks to spawn, then orchestrate once they are up.',
     '- COORDINATE: answer agents\' questions so the team runs autonomously; read a peer\'s memory with hive_read_memory when you need context; record durable decisions with write_memory.',
@@ -526,9 +528,11 @@ const SDDP_LIFECYCLE = [
   'The `specs/` folder is the SHARED feature workspace in the project\'s base repo — write/read it with the normal relative path `specs/<feature>/...` and it is shared across every desk regardless of your own worktree (so the planner\'s spec/plan/tasks and the qc desk\'s .qc-passed are visible to all). Implement CODE on your own branch; put feature ARTIFACTS in `specs/`.'
 ].join('\n');
 
-function nativeSddpGodPrompt(): string {
+function nativeSddpGodPrompt(godRoles: AgentRole[]): string {
+  const godCanEdit = roleCanEditCode(godRoles);
   return [
     'You are the GOD / ORCHESTRATOR in SPEC-DRIVEN mode (you are "Michael"). Drive each feature through the lifecycle and ENFORCE the gates — assign each phase to the desk that holds the right role; never let work jump ahead:',
+    `- YOUR CAPABILITY ROLES RIGHT NOW: ${godRoles.length ? godRoles.join(', ') : 'NONE — pure delegator/orchestrator'}. Trust this LIVE role set over your memory. ${godCanEdit ? '' : 'You hold no edit/integrator role, so write_file/edit_file/bash/hive_integrate are NOT in your toolset — you cannot call them; delegate every phase, and never re-test whether you can integrate/edit.'}`,
     SDDP_LIFECYCLE,
     '- Specify→Clarify→Plan→Tasks: assign to a PLANNER desk (it authors spec.md, resolves clarifications, plan.md, tasks.md). Answer its clarification questions.',
     '- SPEC/PLAN gate: have a REVIEWER read spec.md/plan.md/tasks.md (read-only) and approve, or send back to the planner.',
@@ -537,6 +541,7 @@ function nativeSddpGodPrompt(): string {
     '- QC: a QC desk runs tests/lint/security + verifies stories vs spec → it sets .qc-passed, or files bug tasks back to workers.',
     '- Integrate: an INTEGRATOR merges only AFTER .qc-passed, then signs off (done).',
     '- You ORCHESTRATE + GATE; you do not author or implement. Use hive_feature_status to see each feature\'s phase. Run features as a PIPELINE (one in Plan while another is in QC) and parallelize Implement across workers.',
+    '- LIGHT TOUCH: don\'t re-run a full board triage / reassignment every turn — only when a feature\'s phase actually advanced or you are explicitly nudged. A phase already routed to a (cold) role-holder is handled when it wakes; don\'t re-triage it.',
     '- COLD ≠ GONE: a desk in hive_list_agents holding a role but showing running:false is COLD (parked), not gone — it WAKES when you delegate/message it. Treat a cold planner/reviewer/qc/integrator as AVAILABLE and route the phase to it; NEVER stall a feature or unassign for lack of a role-holder that exists on the floor.',
     'The human operator is watching this transcript and can message you — surface anything genuinely critical.'
   ].join('\n');
@@ -637,7 +642,7 @@ const nativeRuntime = new NativeRuntime({
     // instead of the standard role prompts (a desk is either standard or SDDP, never mixed).
     const sddp = readConfig().sddpMode === true;
     if (agent?.isGod) {
-      env.NATIVE_AGENT_GOD_PROMPT = sddp ? nativeSddpGodPrompt() : nativeGodPrompt(roles);
+      env.NATIVE_AGENT_GOD_PROMPT = sddp ? nativeSddpGodPrompt(roles) : nativeGodPrompt(roles);
     } else if (sddp) {
       // One SDDP preamble assembled from the roles the desk holds (planner/worker/
       // reviewer/qc/integrator). agentWorker prepends it to the system prompt.
@@ -648,6 +653,11 @@ const nativeRuntime = new NativeRuntime({
       if (roles.includes('reviewer')) env.NATIVE_AGENT_REVIEWER_PROMPT = NATIVE_AGENT_REVIEWER_PROMPT;
       if (roles.includes('integrator')) env.NATIVE_AGENT_INTEGRATOR_PROMPT = NATIVE_AGENT_INTEGRATOR_PROMPT;
     }
+    // Advertise only the tools this desk can actually use: drop the code-editing tools for a
+    // read-only desk and hive_integrate for a non-integrator, so the model never SEES (and never
+    // attempts) a tool the execution gate would deny — no "called a denied tool, re-verify" loops.
+    const deny = deniedNativeToolNames(roles);
+    if (deny.length) env.NATIVE_AGENT_DENY_TOOLS = deny.join(',');
     return env;
   },
   // E007 T011/T017 {FR-008/011} — forward each native worker's usage + tool spans
