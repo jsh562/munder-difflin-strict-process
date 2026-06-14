@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useStore, selectedAgent } from '@/store/store';
 import { restartSigOf, deskStaleKeys } from '@/lib/restartSig';
+import { FleetControls } from '@/components/FleetControls';
 import { startMockLoop, stopMockLoop } from '@/store/mockEvents';
 import type { HarnessConfig } from '@/store/config';
 import { OfficeFloor } from '@/scene/office/OfficeFloor';
@@ -157,6 +158,10 @@ export function App() {
         }}>
           v0.1 · {config.autoMode ? 'auto mode on' : 'auto mode off'}
         </span>
+        {/* Right cluster: fleet-wide pause/stop controls, then the settings gear. */}
+        <div className="cth-titlebar-nodrag" style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
+          <FleetControls />
+        </div>
         <button
           className="cth-titlebar-nodrag cth-settings-btn"
           onClick={() => setSettingsOpen(true)}
@@ -166,7 +171,6 @@ export function App() {
           aria-label="Settings"
           style={{
             position: 'relative',
-            marginLeft: 'auto',
             display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
             width: 28, height: 28, padding: 0,
             background: 'var(--cth-paper-100)',
