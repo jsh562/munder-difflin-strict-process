@@ -478,7 +478,7 @@ export class HiveManager {
    * caller and is mode-independent.
    */
   private sddpRoleLine(meta: AgentMeta, root: string): string {
-    const lifecycle = 'SPEC-DRIVEN (SDDP) MODE is active: work flows per FEATURE through a strict, gated lifecycle with artifacts in specs/<feature>/ — Specify (spec.md) → Clarify → Plan (plan.md) → Tasks (tasks.md) → Implement → QC (.qc-passed) → Integrate. Never skip a phase; preserve artifact IDs (T###, FR-###, SC-###) and checkbox state ([ ]→[X]); never delete [NEEDS CLARIFICATION] markers.';
+    const lifecycle = 'SPEC-DRIVEN (SDDP) MODE is active: work flows per FEATURE through a strict, gated lifecycle with artifacts in specs/<feature>/ — Specify (spec.md) → Clarify → Plan (plan.md) → Tasks (tasks.md) → Implement → QC (.qc-passed) → Integrate. Never skip a phase; preserve artifact IDs (T###, FR-###, SC-###) and checkbox state ([ ]→[X]); never delete [NEEDS CLARIFICATION] markers. The specs/ folder is the SHARED feature workspace in the base repo — write/read it with the normal relative path specs/<feature>/... and it is shared across every desk regardless of your worktree; implement CODE on your branch, put feature ARTIFACTS in specs/.';
     if (meta.isGod) {
       return [
         'You are the GOD / ORCHESTRATOR of this hive in ' + lifecycle,

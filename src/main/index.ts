@@ -496,7 +496,8 @@ const NATIVE_AGENT_INTEGRATOR_PROMPT = [
 const SDDP_LIFECYCLE = [
   'SPEC-DRIVEN (SDDP) MODE is active. Work flows per FEATURE through a strict, gated lifecycle, with artifacts kept in `specs/<feature>/`:',
   'Specify (spec.md) → Clarify → Plan (plan.md) → Tasks (tasks.md) → Implement → QC (.qc-passed) → Integrate.',
-  'Never skip a phase: each phase reads the prior artifact and writes the next. Preserve artifact IDs (T###, FR-###, SC-###) and checkbox state (`[ ]`→`[X]` only); never delete `[NEEDS CLARIFICATION]` markers. Check a feature\'s current phase + the next unmet gate with hive_feature_status.'
+  'Never skip a phase: each phase reads the prior artifact and writes the next. Preserve artifact IDs (T###, FR-###, SC-###) and checkbox state (`[ ]`→`[X]` only); never delete `[NEEDS CLARIFICATION]` markers. Check a feature\'s current phase + the next unmet gate with hive_feature_status.',
+  'The `specs/` folder is the SHARED feature workspace in the project\'s base repo — write/read it with the normal relative path `specs/<feature>/...` and it is shared across every desk regardless of your own worktree (so the planner\'s spec/plan/tasks and the qc desk\'s .qc-passed are visible to all). Implement CODE on your own branch; put feature ARTIFACTS in `specs/`.'
 ].join('\n');
 
 function nativeSddpGodPrompt(): string {
