@@ -65,6 +65,18 @@ export interface HiveTask {
   createdAt: string;
 }
 
+/** SDDP: a feature's on-disk marker state (mirrors FeatureStatus in agent-core). The
+ *  renderer derives the phase + next gate from these via the shared featurePhase() helper. */
+export interface FeatureStatus {
+  feature: string;
+  hasSpec: boolean;
+  hasClarifications: boolean;
+  hasPlan: boolean;
+  hasTasks: boolean;
+  completed: boolean;
+  qcPassed: boolean;
+}
+
 /** A message the router just delivered, with its resolved recipient ids. Drives
  *  the envelope-handoff animation on the office floor. `needsHuman` is set when
  *  the sender aimed at "human" (now routed to the god proxy) — cosmetic tint
@@ -438,6 +450,9 @@ const api = {
   hiveRegistry: (): Promise<HiveRegistry> => ipcRenderer.invoke('hive:registry'),
   hiveBoard: (): Promise<string> => ipcRenderer.invoke('hive:board'),
   hiveTasks: (): Promise<unknown> => ipcRenderer.invoke('hive:tasks'),
+  // SDDP: a feature's on-disk phase markers under <repo>/specs/<feature>/ (null when absent).
+  hiveFeatureStatus: (repo: string | null, feature: string): Promise<FeatureStatus | null> =>
+    ipcRenderer.invoke('hive:featureStatus', repo, feature),
   hiveLog: (n?: number): Promise<unknown[]> => ipcRenderer.invoke('hive:log', n ?? 200),
   hiveMemory: (id: string): Promise<string> => ipcRenderer.invoke('hive:memory', id),
   hiveInbox: (id: string): Promise<HiveMessage[]> => ipcRenderer.invoke('hive:inbox', id),

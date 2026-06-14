@@ -1505,6 +1505,13 @@ ipcMain.handle('git:aheadBehind', (_evt, cwd: unknown) => {
 ipcMain.handle('hive:registry', () => hive.registry());
 ipcMain.handle('hive:board', () => hive.board());
 ipcMain.handle('hive:tasks', () => hive.tasks());
+// SDDP: a feature's on-disk phase (markers under <repo>/specs/<feature>/), for the kanban
+// feature-phase banner. Read-only; null when no repo/feature dir. `feature` is sanitized to a
+// single path segment inside scanFeatureStatus.
+ipcMain.handle('hive:featureStatus', (_evt, repo: unknown, feature: unknown) => {
+  if (typeof feature !== 'string' || !feature.trim()) return null;
+  return scanFeatureStatus(typeof repo === 'string' ? repo : null, feature);
+});
 ipcMain.handle('hive:log', (_evt, n: unknown) => hive.logTail(typeof n === 'number' ? n : 200));
 ipcMain.handle('hive:memory', (_evt, id: unknown) => (typeof id === 'string' ? hive.memory(id) : ''));
 ipcMain.handle('hive:inbox', (_evt, id: unknown) => (typeof id === 'string' ? hive.inbox(id) : []));

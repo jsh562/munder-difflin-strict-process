@@ -74,6 +74,33 @@ Integration itself never hand-edits a repo (except to settle a conflict) — it 
 - **Testing** lives in the pipeline, not a role: the **worker** runs the build/tests before `review` ("done" = tested), the **reviewer** verifies tests exist + cover + are green (read-only — it can't re-run), and the **integrator** re-runs the full suite as the **merge gate** before `apply`. A dedicated `tester` role can be added later if independent test authoring is wanted.
 - Worktrees persist (§1) and a desk **reattaches** to its existing worktree on restart (so a role-toggle auto-restart never drops it into the shared tree); a workspace change to a different repo isolates at a repo-discriminated path, leaving the old worktree registered in its old repo. Dedicated reviewer + integrator agents are first-class (assign the role).
 
+## 6. Spec-driven mode (SDDP) — an optional, gated lifecycle
+
+A **per-floor toggle** (Settings → "Spec-driven mode (SDDP)") swaps the freeform decompose→code→review→merge flow for the **Spec-Driven Development** lifecycle. When **off**, everything in §1–§5 is unchanged (byte-for-byte). When **on**, the floor runs work **per feature** through a strict, gated lifecycle with artifacts in `specs/<feature>/`:
+
+```
+Specify (spec.md) → Clarify → Plan (plan.md) → Tasks (tasks.md) → Implement → QC (.qc-passed) → Integrate
+```
+
+**Why it's ported as prompts + tools, not "run SDDP":** the `/sddp-*` skills and `sddp-*` sub-agents are **Claude Code CLI** features (slash-commands + the Task tool). A **native** (DeepSeek/Minimax) desk runs the app's own loop + in-house toolkit — no slash, no Task tool — so it can't invoke them. The SDDP *methodology* (phases, the `specs/<feature>/` artifacts, the task grammar, the `.completed`/`.qc-passed` gates) is delivered to every desk as **role prompts**, and the lifecycle is **machine-enforced** by host tools so a forgetful model still can't skip a phase. A **Claude** desk *additionally* gets a note that it MAY run the real `/sddp-*` skills (hybrid bonus).
+
+**Two new roles** (shown only in SDDP mode, alongside worker/reviewer/integrator):
+- **`planner`** — authors a feature's `spec.md` → clarifications → `plan.md` → `tasks.md` (Specify→Clarify→Plan→Tasks). Does not implement.
+- **`qc`** — runs the automated QC phase: build/tests/lint/security + verifies each user story / `SC-###` against the code, writes `qc-report.md`, then creates the `.qc-passed` marker or files `[BUG]` tasks back to workers.
+
+Both can write (planner writes artifacts; qc runs the suite via bash), so `canEditCode` = `worker || integrator || planner || qc`; their narrower scope is prompt-enforced (like the integrator's conflict-only edits).
+
+**Lifecycle → role mapping.** **god** drives the lifecycle and enforces the gates (assigns each phase to the right role-desk; orchestrates, never authors/implements) → **planner** writes the artifacts → **reviewer** owns two read-only gates (the **spec/plan** review, then the **code** review) → **worker** implements `tasks.md` → **qc** runs the QC phase → **integrator** merges only after `.qc-passed`. Multi-agent pays off by **parallelizing Implement** across workers and running a **feature pipeline** (one feature in Plan while another is in QC); a single feature's sequential spec→plan→tasks is *not* fanned out.
+
+**Machine-enforced gates (the key lever for native desks).** The host reads the feature's **real on-disk markers**, so the lifecycle is reliable regardless of model discipline:
+- **`hive_feature_status { feature }`** reports a feature's current phase + next unmet gate from `specs/<feature>/` (`spec.md`, `## Clarifications`, `plan.md`, `tasks.md`, `.completed`, `.qc-passed`). Desks read the truth instead of remembering it. The pure `featurePhase()` helper backs both this tool and the kanban banner.
+- **Hard gates in `hive_update_task`** (SDDP mode + a card carrying a `feature` only): no `doing` without `tasks.md`; no `integrate`/`done` without `.qc-passed`. Applies to **everyone** (god included — the markers are the single source of truth). **Fails open** when the host can resolve no status (no `specs/<feature>/` yet), so a missing scan never deadlocks the board — only a *known-missing* marker blocks the move.
+- A card carries an optional **`feature`** (its `specs/<feature>/` folder), stamped on `hive_add_task`/`hive_update_task` (or via the Add-Task form's feature field in SDDP mode). The host scans `<task.project>/specs/<feature>/`; `feature` is sanitized to a single path segment (no traversal).
+
+**Feature phase tracker (kanban).** In SDDP mode the Tasks tab keeps the six columns and adds a **banner per feature** above them: the phase ladder (Specify → … → Integrate) with the current phase highlighted and completed phases ticked, plus a "clarified" indicator and card count, polled from `hive:featureStatus`. A feature with no `specs/<feature>/` yet shows "not started".
+
+**Deferred:** `hive_import_tasks` (parse `tasks.md` into cards) + shipped spec/plan/tasks/qc templates; per-project/per-agent mode; a finer capability gate so planner/qc can't touch source at all.
+
 ---
 
 ## Implementation map
@@ -82,3 +109,4 @@ Integration itself never hand-edits a repo (except to settle a conflict) — it 
 - **Board + roster + integrate tool:** `packages/agent-core/src/toolkit/hiveTools.ts` (`hive_update_task` review/integrate rules + `note`→`HiveComment`, `hive_list_agents`, `RosterEntry`, `TASK_STATUSES`), `agentToolCatalog.ts` (`hive_integrate` spec + worker preamble flow incl. test-before-review), `agentTools.ts` (`integrate` dep + handler, `canEditCode`), `coordination/types.ts` (`review`/`integrate` statuses, `HiveComment`/`comments[]`), `src/renderer/src/components/TasksKanban.tsx` (review + integrate columns, comment render).
 - **Notifications (per-project):** `src/main/hive.ts` (`repoFor` resolver + `setRepoResolver`, `roleHoldersForTask`/`roleHolderForTask`, `notifyTaskTransitions`: `→review`→all reviewers, `→integrate`→ONE integrator, send-back embeds the newest comment, unblock→assignee, god fallback when no holder), `src/main/index.ts` (`setRepoResolver` wired from `worktreeOrigins`).
 - **Worktrees + integration host wiring:** `src/main/git.ts` (`listWorktrees`, `previewMerge`, `mergeBranch`, `agentBranchFor`), `src/main/index.ts` (`provisionWorktree` reattach-or-isolate + cross-repo hashed path, keep-on-exit, `git:listWorktrees`/`git:removeWorktree` IPC, `roster()`/`isGod()`/`integrate()` deps, god/reviewer/integrator prompts incl. test gate), `src/renderer/src/components/SettingsModal.tsx` (Worktrees panel).
+- **SDDP mode:** `packages/agent-core/src/coordination/types.ts` (`AgentRole` += `planner`/`qc`, `roleCanEditCode`, `HiveTask.feature`, `FeatureStatus` + pure `featurePhase`), `toolkit/hiveTools.ts` (`hive_feature_status` tool, `HiveToolDeps.sddpMode`/`featureStatus`, SDDP hard gates + `feature` stamping in `hive_update_task`/`hive_add_task`), `src/main/config.ts` (`sddpMode` flag), `src/main/index.ts` (`scanFeatureStatus`, `sddpMode()`/`featureStatus()` deps, native SDDP prompts via `workerEnv`→`NATIVE_AGENT_SDDP_PROMPT`, `hive:featureStatus` IPC, `sddp` flag → `ensureAgent`), `src/main/hive.ts` (`injectedPrompt` SDDP variants via `sddpRoleLine`), `src/main/runtime/worker/agentWorker.ts` (prepend SDDP preamble), `src/preload/index.ts` (`HiveTask.feature`, `FeatureStatus`, `hiveFeatureStatus`), `src/renderer/src/store/store.ts` (`sddpMode` + `setSddpMode`), `App.tsx`/`SettingsModal.tsx` (mode toggle + load sync), `AgentRoleControl.tsx`/`AddAgentModal.tsx` (mode-scoped planner/qc chips + checkboxes), `TasksKanban.tsx` (feature phase banner + Add-Task feature field).

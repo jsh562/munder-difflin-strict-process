@@ -29,11 +29,39 @@ export interface HiveTask {
   comments?: HiveComment[];
   /** Project repo the card belongs to (stamped on assign) — for off-project detection. */
   project?: string;
+  /** SDDP: the feature folder this card belongs to (its specs/<feature>/ dir). */
+  feature?: string;
   priority: number;
   createdAt: string;
 }
 
 type Status = HiveTask['status'];
+
+/** SDDP: a feature's on-disk marker state (mirrors FeatureStatus in agent-core/preload). */
+interface FeatureStatus {
+  feature: string;
+  hasSpec: boolean;
+  hasClarifications: boolean;
+  hasPlan: boolean;
+  hasTasks: boolean;
+  completed: boolean;
+  qcPassed: boolean;
+}
+
+/** The SDDP lifecycle phases, in order — the kanban's feature phase tracker. */
+const SDDP_PHASES = ['Specify', 'Clarify', 'Plan', 'Tasks', 'Implement', 'QC', 'Integrate'] as const;
+type FeaturePhase = (typeof SDDP_PHASES)[number];
+
+/** Current phase from the on-disk markers (mirrors agent-core's featurePhase derivation).
+ *  Clarify is folded into the Plan window; `hasClarifications` is shown separately. */
+function featurePhase(s: FeatureStatus): FeaturePhase {
+  if (s.qcPassed) return 'Integrate';
+  if (s.completed) return 'QC';
+  if (s.hasTasks) return 'Implement';
+  if (s.hasPlan) return 'Tasks';
+  if (s.hasSpec) return 'Plan';
+  return 'Specify';
+}
 
 const COLUMNS: { key: Status; label: string; accent: string }[] = [
   { key: 'todo',      label: 'TODO',      accent: 'var(--cth-sky)' },
@@ -92,6 +120,7 @@ function parseTasks(raw: unknown): HiveTask[] {
             .filter((c) => c.text)
         : undefined,
       project: typeof t.project === 'string' ? t.project : undefined,
+      feature: typeof t.feature === 'string' ? t.feature : undefined,
       priority: typeof t.priority === 'number' ? t.priority : 3,
       createdAt: typeof t.createdAt === 'string' ? t.createdAt : new Date().toISOString()
     }));
@@ -105,7 +134,10 @@ function parseTasks(raw: unknown): HiveTask[] {
 export function TasksKanban({ onAssign }: { onAssign: (prefill: string) => void }) {
   const agents = useStore((s) => s.agents);
   const archivedAgents = useStore((s) => s.archivedAgents);
+  const sddpMode = useStore((s) => s.sddpMode);
   const [tasks, setTasks] = useState<HiveTask[]>([]);
+  // SDDP: per-feature on-disk phase (keyed by feature folder), for the phase tracker banner.
+  const [featureStatuses, setFeatureStatuses] = useState<Record<string, FeatureStatus | null>>({});
   const [adding, setAdding] = useState(false);
   // Transient confirmation after dispatching the god a board triage.
   const [triageMsg, setTriageMsg] = useState<string | null>(null);
@@ -123,8 +155,23 @@ export function TasksKanban({ onAssign }: { onAssign: (prefill: string) => void 
   }, []);
 
   const refresh = useCallback(async () => {
-    try { setTasks(parseTasks(await window.cth.hiveTasks())); } catch { /* keep last good */ }
-  }, []);
+    let list: HiveTask[];
+    try { list = parseTasks(await window.cth.hiveTasks()); } catch { return; /* keep last good */ }
+    setTasks(list);
+    // SDDP: refresh each distinct feature's on-disk phase (the feature's repo = its cards'
+    // stamped project). Skipped entirely in standard mode so the board is unchanged.
+    if (!sddpMode) return;
+    const feats = new Map<string, string | null>();
+    for (const t of list) if (t.feature && !feats.has(t.feature)) feats.set(t.feature, t.project ?? null);
+    if (feats.size === 0) { setFeatureStatuses({}); return; }
+    try {
+      const entries = await Promise.all(
+        [...feats].map(async ([f, repo]) =>
+          [f, await window.cth.hiveFeatureStatus(repo, f).catch(() => null)] as const)
+      );
+      setFeatureStatuses(Object.fromEntries(entries));
+    } catch { /* keep last good */ }
+  }, [sddpMode]);
 
   useEffect(() => {
     refresh();
@@ -252,10 +299,34 @@ export function TasksKanban({ onAssign }: { onAssign: (prefill: string) => void 
         <AddTaskForm
           agents={agents}
           existing={tasks}
+          sddpMode={sddpMode}
           onCancel={() => setAdding(false)}
           onCreate={addTask}
         />
       )}
+
+      {/* SDDP feature phase tracker — one banner per feature on the board, showing its
+          lifecycle phase derived from the real specs/<feature>/ markers. Only in SDDP mode. */}
+      {sddpMode && (() => {
+        const feats: string[] = [];
+        for (const t of tasks) if (t.feature && !feats.includes(t.feature)) feats.push(t.feature);
+        if (feats.length === 0) return null;
+        return (
+          <div style={{
+            display: 'flex', flexDirection: 'column', gap: 5, padding: '7px 10px', flexShrink: 0,
+            borderBottom: '1px solid var(--cth-ink-300)', background: 'var(--cth-cream-100)'
+          }}>
+            {feats.map((f) => (
+              <FeatureBanner
+                key={f}
+                feature={f}
+                status={featureStatuses[f] ?? null}
+                cardCount={tasks.filter((t) => t.feature === f).length}
+              />
+            ))}
+          </div>
+        );
+      })()}
 
       {/* Columns */}
       <div style={{
@@ -470,6 +541,47 @@ function TaskCard({ task, assigneeName, nameFor, orphanReason, flashing, blocker
   );
 }
 
+// ─── SDDP feature phase banner ─────────────────────────────────────────────────
+
+/** One feature's lifecycle tracker: the phase ladder (Specify → … → Integrate) with the
+ *  current phase highlighted and completed phases ticked, derived from the on-disk markers.
+ *  `status` null ⇒ the feature dir hasn't been created yet ("not started"). */
+function FeatureBanner({ feature, status, cardCount }: {
+  feature: string;
+  status: FeatureStatus | null;
+  cardCount: number;
+}) {
+  const phase = status ? featurePhase(status) : null;
+  const reachedIdx = phase ? SDDP_PHASES.indexOf(phase) : -1;
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+      <span
+        title={status ? `phase: ${phase}` : 'no specs/<feature>/ found yet — run Specify'}
+        style={{ fontFamily: 'var(--cth-font-display)', fontSize: 9, color: 'var(--cth-ink-900)' }}
+      >▸ {feature}</span>
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3, flexWrap: 'wrap' }}>
+        {SDDP_PHASES.map((p, i) => {
+          const done = reachedIdx >= 0 && i < reachedIdx;
+          const current = i === reachedIdx;
+          return (
+            <span key={p} style={{
+              padding: '1px 6px 0', fontFamily: 'var(--cth-font-ui)', fontSize: 11,
+              background: current ? 'var(--cth-lemon)' : done ? 'var(--cth-mint)' : 'var(--cth-cream-200)',
+              boxShadow: `inset 0 0 0 1px ${current ? 'var(--cth-ink-900)' : 'var(--cth-ink-300)'}`,
+              color: current || done ? 'var(--cth-ink-900)' : 'var(--cth-ink-500)'
+            }}>{done ? '✓ ' : current ? '▶ ' : ''}{p}</span>
+          );
+        })}
+      </span>
+      {status?.hasClarifications && (
+        <span title="spec.md has a ## Clarifications section" style={{ fontSize: 11, color: 'var(--cth-ink-500)' }}>clarified</span>
+      )}
+      <span style={{ fontSize: 11, color: 'var(--cth-ink-500)' }}>{cardCount} card{cardCount === 1 ? '' : 's'}</span>
+      {!status && <span style={{ fontSize: 11, color: 'var(--cth-ink-300)' }}>not started</span>}
+    </div>
+  );
+}
+
 function PriorityDots({ level }: { level: number }) {
   // 1 = lowest, 5 = highest. Warmer fill as priority climbs.
   const color = level >= 4 ? 'var(--cth-coral)' : level === 3 ? 'var(--cth-lemon)' : 'var(--cth-mint)';
@@ -488,9 +600,10 @@ function PriorityDots({ level }: { level: number }) {
 
 // ─── Add-task form ─────────────────────────────────────────────────────────--
 
-function AddTaskForm({ agents, existing, onCancel, onCreate }: {
+function AddTaskForm({ agents, existing, sddpMode, onCancel, onCreate }: {
   agents: { id: string; name: string; isGod?: boolean }[];
   existing: HiveTask[];
+  sddpMode: boolean;
   onCancel: () => void;
   onCreate: (t: HiveTask) => void;
 }) {
@@ -499,6 +612,7 @@ function AddTaskForm({ agents, existing, onCancel, onCreate }: {
   const [assignee, setAssignee] = useState('');
   const [priority, setPriority] = useState(3);
   const [deps, setDeps] = useState<string[]>([]);
+  const [feature, setFeature] = useState('');
 
   const submit = () => {
     if (!title.trim()) return;
@@ -509,6 +623,7 @@ function AddTaskForm({ agents, existing, onCancel, onCreate }: {
       assignee: assignee || undefined,
       status: 'todo',
       dependsOn: deps,
+      feature: sddpMode && feature.trim() ? feature.trim() : undefined,
       priority,
       createdAt: new Date().toISOString()
     });
@@ -548,6 +663,18 @@ function AddTaskForm({ agents, existing, onCancel, onCreate }: {
           <select value={String(priority)} onChange={(e) => setPriority(Number(e.target.value))} style={selectStyle}>
             {[1, 2, 3, 4, 5].map((p) => (<option key={p} value={p}>{p}</option>))}
           </select>
+          {sddpMode && (
+            <>
+              <label style={labelStyle}>feature</label>
+              <input
+                value={feature}
+                onChange={(e) => setFeature(e.target.value)}
+                placeholder="00001-feature-name"
+                style={{ ...selectStyle, width: 150 }}
+                title="SDDP: the specs/<feature>/ folder this card belongs to (gates its lifecycle)"
+              />
+            </>
+          )}
         </div>
 
         {existing.length > 0 && (
