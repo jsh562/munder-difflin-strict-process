@@ -1,13 +1,14 @@
 import { useStore, type Agent, type AgentRole } from '@/store/store';
 import { scheduleDeskRestart } from '@/lib/restartDesk';
 
-/** Per-role hover blurb + the chip's "on" tint. */
-const ROLE_META: Record<AgentRole, { tip: string; on: string }> = {
-  worker: { tip: 'Worker: writes the code — takes delegated implementation', on: 'var(--cth-sky)' },
-  reviewer: { tip: "Reviewer: reads a 'review' card and COMMENTS only (read-only — cannot edit code); approves to 'integrate' or sends it back", on: 'var(--cth-lilac)' },
-  integrator: { tip: "Integrator: merges other desks' branches (hive_integrate) + signs tasks off; may edit only to resolve a conflict", on: 'var(--cth-peach)' },
-  planner: { tip: 'Planner (SDDP): authors the spec / plan / tasks artifacts for a feature (Specify→Clarify→Plan→Tasks)', on: 'var(--cth-mint)' },
-  qc: { tip: 'QC (SDDP): runs the automated QC phase — tests / lint / security + verifies stories vs spec; files bug tasks or signs .qc-passed', on: 'var(--cth-coral)' }
+/** Per-role hover blurb, the chip's "on" tint, and a short label for count chips. Exported as the
+ *  single source of role colors/labels (reused by the grouped agent strip's per-role count chips). */
+export const ROLE_META: Record<AgentRole, { tip: string; on: string; abbr: string }> = {
+  worker: { tip: 'Worker: writes the code — takes delegated implementation', on: 'var(--cth-sky)', abbr: 'W' },
+  reviewer: { tip: "Reviewer: reads a 'review' card and COMMENTS only (read-only — cannot edit code); approves to 'integrate' or sends it back", on: 'var(--cth-lilac)', abbr: 'R' },
+  integrator: { tip: "Integrator: merges other desks' branches (hive_integrate) + signs tasks off; may edit only to resolve a conflict", on: 'var(--cth-peach)', abbr: 'I' },
+  planner: { tip: 'Planner (SDDP): authors the spec / plan / tasks artifacts for a feature (Specify→Clarify→Plan→Tasks)', on: 'var(--cth-mint)', abbr: 'P' },
+  qc: { tip: 'QC (SDDP): runs the automated QC phase — tests / lint / security + verifies stories vs spec; files bug tasks or signs .qc-passed', on: 'var(--cth-coral)', abbr: 'Q' }
 };
 /** Standard roles always shown; planner/qc only when the floor is in SDDP mode. */
 const STANDARD_ROLES: AgentRole[] = ['worker', 'reviewer', 'integrator'];

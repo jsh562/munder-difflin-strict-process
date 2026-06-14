@@ -2,16 +2,29 @@ import { useState } from 'react';
 import { AgentCard } from './AgentCard';
 import { PixelButton } from './PixelButton';
 import { Icon } from './Icon';
-import { useStore, type Agent } from '@/store/store';
+import { ROLE_META } from './AgentRoleControl';
+import { useStore, type Agent, type AgentRole } from '@/store/store';
 import { buildSpawnCommand, type HarnessConfig } from '@/store/config';
 import { displayStatus } from '@/lib/agentStatus';
 import { scheduleDeskRestart } from '@/lib/restartDesk';
 import { restartSigOf, deskStaleKeys, RESTART_SIG_LABELS } from '@/lib/restartSig';
+import { groupAgents, roleCounts } from '@/lib/agentGroups';
 
 export interface AgentStripProps {
   /** Needed to rebuild a spawn command when a restorable agent predates the
    *  persisted `command` field. Optional so the strip renders without config. */
   config?: HarnessConfig | null;
+}
+
+/** Stable order for the per-role count chips in a cluster header. */
+const ROLE_ORDER: AgentRole[] = ['worker', 'reviewer', 'integrator', 'planner', 'qc'];
+const LS_COLLAPSED = 'cth.collapsedAgentGroups';
+
+function loadCollapsed(): Set<string> {
+  try {
+    const raw = window.localStorage.getItem(LS_COLLAPSED);
+    return new Set(raw ? (JSON.parse(raw) as string[]) : []);
+  } catch { return new Set(); }
 }
 
 export function AgentStrip({ config }: AgentStripProps) {
@@ -31,6 +44,17 @@ export function AgentStrip({ config }: AgentStripProps) {
     terminalTheme: useStore(s => s.terminalTheme)
   });
   const [restoring, setRestoring] = useState(false);
+  // Per-project collapse state (persisted) — the "without crowding" lever: fold projects you're
+  // not watching down to a one-line header + counts.
+  const [collapsed, setCollapsed] = useState<Set<string>>(loadCollapsed);
+  const toggleCollapsed = (key: string) => {
+    setCollapsed((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key); else next.add(key);
+      try { window.localStorage.setItem(LS_COLLAPSED, JSON.stringify([...next])); } catch { /* noop */ }
+      return next;
+    });
+  };
 
   /** Respawn every worker from the previous session with its ORIGINAL agent id,
    *  cwd, model and command — the hive workspace (memory.md, inbox, registry
@@ -84,73 +108,116 @@ export function AgentStrip({ config }: AgentStripProps) {
     }
   };
 
+  const renderCard = (a: Agent) => {
+    const staleKeys = a.isAssistant ? [] : deskStaleKeys(a.spawnSig, liveSig);
+    return (
+      <AgentCard
+        key={a.id}
+        name={a.name}
+        character={a.character}
+        accent={a.accent}
+        status={displayStatus(a, !!paused[a.id], godDesired)}
+        project={a.project}
+        action={a.action}
+        progress={a.progress}
+        contextTokens={a.contextTokens}
+        contextLimit={a.contextLimit}
+        selected={a.id === selectedId}
+        isGod={a.isGod}
+        isAssistant={a.isAssistant}
+        needsRestart={staleKeys.length > 0}
+        needsRestartReason={staleKeys.length > 0
+          ? `Changed since this desk spawned: ${staleKeys.map((k) => RESTART_SIG_LABELS[k]).join(', ')} — click to restart and apply`
+          : undefined}
+        onRestart={() => scheduleDeskRestart(a.id)}
+        warm={a.id in liveness ? liveness[a.id] : undefined}
+        onClick={() => select(a.id)}
+      />
+    );
+  };
+
+  const groups = groupAgents(agents);
+
   return (
     <div style={{
       display: 'flex',
-      gap: 12,
-      padding: '12px 16px',
+      gap: 14,
+      padding: '8px 16px',
       overflowX: 'auto',
       overflowY: 'hidden',
       borderTop: '2px solid var(--cth-ink-900)',
       background: 'var(--cth-cream-200)',
-      height: 124,
-      minHeight: 124,
-      alignItems: 'center'
+      height: 144,
+      minHeight: 144,
+      alignItems: 'stretch'
     }}>
-      {[...agents.filter(a => a.isGod), ...agents.filter(a => !a.isGod)].map(a => {
-        const staleKeys = a.isAssistant ? [] : deskStaleKeys(a.spawnSig, liveSig);
+      {groups.map((g) => {
+        const isCollapsed = collapsed.has(g.key);
+        const counts = roleCounts(g.agents);
         return (
-          <AgentCard
-            key={a.id}
-            name={a.name}
-            character={a.character}
-            accent={a.accent}
-            status={displayStatus(a, !!paused[a.id], godDesired)}
-            project={a.project}
-            action={a.action}
-            progress={a.progress}
-            contextTokens={a.contextTokens}
-            contextLimit={a.contextLimit}
-            selected={a.id === selectedId}
-            isGod={a.isGod}
-            isAssistant={a.isAssistant}
-            needsRestart={staleKeys.length > 0}
-            needsRestartReason={staleKeys.length > 0
-              ? `Changed since this desk spawned: ${staleKeys.map((k) => RESTART_SIG_LABELS[k]).join(', ')} — click to restart and apply`
-              : undefined}
-            onRestart={() => scheduleDeskRestart(a.id)}
-            warm={a.id in liveness ? liveness[a.id] : undefined}
-            onClick={() => select(a.id)}
-          />
+          <div key={g.key} style={{ display: 'flex', flexDirection: 'column', gap: 6, flexShrink: 0 }}>
+            {/* Cluster header: project name + per-role count chips + collapse toggle. The counts
+                are the at-a-glance "how many agents per role per project". */}
+            <button
+              onClick={() => toggleCollapsed(g.key)}
+              title={isCollapsed ? 'Expand — show desks' : 'Collapse — hide desks'}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 6, padding: '2px 6px',
+                background: 'transparent', border: 'none', cursor: 'pointer', textAlign: 'left',
+                boxShadow: 'inset 0 -1px 0 var(--cth-ink-300)'
+              }}
+            >
+              <span style={{ fontSize: 9, color: 'var(--cth-ink-500)', flexShrink: 0, width: 8 }}>{isCollapsed ? '▸' : '▾'}</span>
+              <span style={{
+                fontFamily: 'var(--cth-font-display)', fontSize: 9, color: 'var(--cth-ink-900)',
+                whiteSpace: 'nowrap', maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis'
+              }}>{g.label}</span>
+              <span style={{ fontSize: 10, color: 'var(--cth-ink-500)' }}>({g.agents.length})</span>
+              {/* Per-role count chips (only roles actually held; adapts to standard vs SDDP). */}
+              <span style={{ display: 'inline-flex', gap: 3, alignItems: 'center' }}>
+                {ROLE_ORDER.filter((r) => (counts[r] ?? 0) > 0).map((r) => (
+                  <span
+                    key={r}
+                    title={`${counts[r]} ${r}`}
+                    style={{
+                      display: 'inline-flex', alignItems: 'center', padding: '0 4px', height: 14,
+                      background: ROLE_META[r].on, boxShadow: 'inset 0 0 0 1px var(--cth-ink-900)',
+                      fontFamily: 'var(--cth-font-ui)', fontSize: 10, lineHeight: '14px', color: 'var(--cth-ink-900)'
+                    }}
+                  >{ROLE_META[r].abbr}{counts[r]}</span>
+                ))}
+              </span>
+            </button>
+
+            {/* Desks for this cluster (hidden when collapsed). */}
+            {!isCollapsed && (
+              <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+                {g.agents.map(renderCard)}
+              </div>
+            )}
+          </div>
         );
       })}
-      {restorableAgents.length > 0 && (
-        <span
-          style={{ alignSelf: 'center', flexShrink: 0 }}
-          title={`Respawn from last session: ${restorableAgents.map((a: Agent) => a.name).join(', ')} — same ids, memory and inboxes reattach automatically`}
-        >
-          <PixelButton
-            variant="primary"
-            size="lg"
-            onClick={restoreTeam}
-            disabled={restoring}
+
+      {/* Trailing controls — restore the previous session's team + add a new desk. */}
+      <div style={{ display: 'flex', gap: 12, alignItems: 'center', alignSelf: 'center', flexShrink: 0 }}>
+        {restorableAgents.length > 0 && (
+          <span
+            title={`Respawn from last session: ${restorableAgents.map((a: Agent) => a.name).join(', ')} — same ids, memory and inboxes reattach automatically`}
           >
-            <span style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
-              <Icon name="play" /> {restoring ? 'restoring…' : `restore team (${restorableAgents.length})`}
-            </span>
-          </PixelButton>
-        </span>
-      )}
-      <PixelButton
-        variant="secondary"
-        size="lg"
-        style={{ alignSelf: 'center' }}
-        onClick={() => setAddAgentOpen(true)}
-      >
-        <span style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
-          <Icon name="plus" /> add agent
-        </span>
-      </PixelButton>
+            <PixelButton variant="primary" size="lg" onClick={restoreTeam} disabled={restoring}>
+              <span style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
+                <Icon name="play" /> {restoring ? 'restoring…' : `restore team (${restorableAgents.length})`}
+              </span>
+            </PixelButton>
+          </span>
+        )}
+        <PixelButton variant="secondary" size="lg" onClick={() => setAddAgentOpen(true)}>
+          <span style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
+            <Icon name="plus" /> add agent
+          </span>
+        </PixelButton>
+      </div>
     </div>
   );
 }
