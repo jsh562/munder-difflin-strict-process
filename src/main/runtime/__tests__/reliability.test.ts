@@ -7,7 +7,7 @@ import {
   parseRetryAfterMs,
   withReliability,
   ReliabilityError
-} from '@jsh562/agent-core';
+} from '@jsh562/won-agent-core';
 
 describe('T002 — classifyError (exhaustive, disjoint)', () => {
   it('classifies the ADR-0009 retryable status allowlist as retryable', () => {

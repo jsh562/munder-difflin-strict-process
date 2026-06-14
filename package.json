@@ -18,7 +18,7 @@
     "postinstall": "electron-rebuild -f && node tools/ensure-pty-perms.cjs",
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json",
     "typecheck:web": "tsc --noEmit -p tsconfig.web.json",
-    "typecheck:pkg": "tsc --noEmit -p packages/agent-core/tsconfig.json",
+    "typecheck:pkg": "tsc --noEmit -p packages/won-agent-core/tsconfig.json",
     "typecheck": "npm run typecheck:node && npm run typecheck:web && npm run typecheck:pkg",
     "test": "vitest",
     "test:run": "vitest run",
@@ -29,7 +29,7 @@
     "dist:linux": "npm run build && electron-builder --linux"
   },
   "dependencies": {
-    "@jsh562/agent-core": "github:jsh562/agent-core",
+    "@jsh562/won-agent-core": "github:jsh562/won-agent-core",
     "@codemirror/lang-css": "^6.3.1",
     "@codemirror/lang-html": "^6.4.11",
     "@codemirror/lang-javascript": "^6.2.5",

@@ -23,7 +23,7 @@ import {
   NATIVE_PROVIDER_MODEL_ENV,
   AGENT_TOOL_CATALOG,
   NATIVE_AGENT_PREAMBLE
-} from '@jsh562/agent-core';
+} from '@jsh562/won-agent-core';
 import type { ToolSpec, ToolUseRequest } from '../../../shared/providerCall';
 import type { WorkerCommand, WorkerMessage } from '../../../shared/workerProtocol';
 

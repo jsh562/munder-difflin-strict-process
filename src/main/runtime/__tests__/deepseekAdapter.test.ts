@@ -8,8 +8,8 @@ import {
   makeDeepseekAdapter,
   type FetchLike,
   type FetchResponseLike
-} from '@jsh562/agent-core';
-import type { ByteStream } from '@jsh562/agent-core';
+} from '@jsh562/won-agent-core';
+import type { ByteStream } from '@jsh562/won-agent-core';
 import type { AgentEvent } from '../../../shared/agentEvent';
 import type { ProviderRequest } from '../../../shared/providerCall';
 

@@ -19,7 +19,7 @@
       "@/*": ["src/renderer/src/*"],
       "@brand/*": ["docs/*"],
       "@shared/*": ["src/shared/*"],
-      "@jsh562/agent-core": ["packages/agent-core/src/index.ts"]
+      "@jsh562/won-agent-core": ["packages/won-agent-core/src/index.ts"]
     }
   },
   "include": ["src/renderer/**/*", "src/preload/index.d.ts", "src/shared/**/*"],

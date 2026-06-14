@@ -31,7 +31,7 @@ export interface BlockReason {
   }>;
 }
 
-/** Capability roles (mirror of the agent-core `AgentRole`; declared locally so the store
+/** Capability roles (mirror of the won-agent-core `AgentRole`; declared locally so the store
  *  doesn't reach into the package). worker = writes code; reviewer = reads + COMMENTS only
  *  (read-only); integrator = merges (hive_integrate) + signs tasks off. */
 export type AgentRole = 'worker' | 'reviewer' | 'integrator' | 'planner' | 'qc';

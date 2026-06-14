@@ -4,7 +4,7 @@
  * The package's `executeAgentTool` is host-agnostic and never touches the network —
  * it calls the injected `searchWeb(query, opts)`. This module is that injection: it
  * owns the PROVIDER, the request, and the formatting. Keeping it here (not in
- * `@jsh562/agent-core`) preserves the package boundary.
+ * `@jsh562/won-agent-core`) preserves the package boundary.
  *
  * Provider = **DuckDuckGo's HTML endpoint** — completely FREE and KEYLESS. The cost of
  * keyless is that it's unofficial: it can rate-limit, occasionally return nothing, and

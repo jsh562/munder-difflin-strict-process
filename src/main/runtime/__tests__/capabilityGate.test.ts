@@ -2,7 +2,7 @@
  *  strip the field, never throw, bounded payload (no request content). Electron-free,
  *  emit injected (HINT-001 / HINT-004 / AD-005). */
 import { describe, it, expect } from 'vitest';
-import { makeCapabilityGate } from '@jsh562/agent-core';
+import { makeCapabilityGate } from '@jsh562/won-agent-core';
 import { EMPTY_CAPABILITY_DESCRIPTOR, type CapabilityDescriptor } from '../../../shared/providerRuntime';
 import type { AgentEvent, NotificationEvent } from '../../../shared/agentEvent';
 

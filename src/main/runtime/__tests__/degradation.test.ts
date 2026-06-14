@@ -13,9 +13,9 @@
  *  path (deepseek, caching supported / images+MCP+web-search gated). Electron-free,
  *  `fetch` injected (HINT-001); no live network. */
 import { describe, it, expect } from 'vitest';
-import { makeDeepseekAdapter, type FetchLike, type FetchResponseLike } from '@jsh562/agent-core';
-import { makeMinimaxAdapter } from '@jsh562/agent-core';
-import type { ByteStream } from '@jsh562/agent-core';
+import { makeDeepseekAdapter, type FetchLike, type FetchResponseLike } from '@jsh562/won-agent-core';
+import { makeMinimaxAdapter } from '@jsh562/won-agent-core';
+import type { ByteStream } from '@jsh562/won-agent-core';
 import type { AgentEvent, NotificationEvent } from '../../../shared/agentEvent';
 import type { ProviderCall, ProviderRequest } from '../../../shared/providerCall';
 

@@ -29,7 +29,7 @@ import { ControlRegistry } from './control';
 import { ClaudeRuntime } from './runtime/claudeRuntime';
 import { NativeRuntime } from './runtime/nativeRuntime';
 import { createNativeEventBridge, loadNativeEvents } from './runtime/nativeEventBridge';
-import { executeAgentTool, type AgentToolDeps, type FeatureStatus } from '@jsh562/agent-core';
+import { executeAgentTool, type AgentToolDeps, type FeatureStatus } from '@jsh562/won-agent-core';
 import { redactConfig, injectionEnvForProvider, keyPresence, setKeyInConfig, clearKeyInConfig, WEB_SEARCH_KEY_ID, type SafeConfig } from './credentials';
 import { searchWebDuckDuckGo } from './webSearch';
 import { resolveBashEnv, describeBashEnv } from './bashShell';

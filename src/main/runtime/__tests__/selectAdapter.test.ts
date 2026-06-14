@@ -3,14 +3,14 @@
  *  an unknown/absent id (caller falls back to the stub). Electron-free, fetch injected
  *  (HINT-001); no live network. */
 import { describe, it, expect } from 'vitest';
-import { selectAdapter, type EnvLike } from '@jsh562/agent-core';
+import { selectAdapter, type EnvLike } from '@jsh562/won-agent-core';
 import {
   NATIVE_PROVIDER_API_KEY_ENV,
   NATIVE_PROVIDER_ID_ENV,
   NATIVE_PROVIDER_MODEL_ENV
-} from '@jsh562/agent-core';
-import type { FetchLike, FetchResponseLike } from '@jsh562/agent-core';
-import type { ByteStream } from '@jsh562/agent-core';
+} from '@jsh562/won-agent-core';
+import type { FetchLike, FetchResponseLike } from '@jsh562/won-agent-core';
+import type { ByteStream } from '@jsh562/won-agent-core';
 import { lookupModelInfo } from '../../../shared/providerRegistry';
 
 /** A ByteStream yielding the given chunks then done. */

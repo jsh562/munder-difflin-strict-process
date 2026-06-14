@@ -65,7 +65,7 @@ export interface HiveTask {
   createdAt: string;
 }
 
-/** SDDP: a feature's on-disk marker state (mirrors FeatureStatus in agent-core). The
+/** SDDP: a feature's on-disk marker state (mirrors FeatureStatus in won-agent-core). The
  *  renderer derives the phase + next gate from these via the shared featurePhase() helper. */
 export interface FeatureStatus {
   feature: string;

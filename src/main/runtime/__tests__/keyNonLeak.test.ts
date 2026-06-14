@@ -15,13 +15,13 @@ import {
   makeDeepseekAdapter,
   type FetchLike as DsFetch,
   type FetchResponseLike as DsResponse
-} from '@jsh562/agent-core';
+} from '@jsh562/won-agent-core';
 import {
   makeMinimaxAdapter,
   type FetchLike as MmFetch,
   type FetchResponseLike as MmResponse
-} from '@jsh562/agent-core';
-import type { ByteStream } from '@jsh562/agent-core';
+} from '@jsh562/won-agent-core';
+import type { ByteStream } from '@jsh562/won-agent-core';
 import type { AgentEvent } from '../../../shared/agentEvent';
 import type { ProviderCall, ProviderRequest, ProviderTurn } from '../../../shared/providerCall';
 

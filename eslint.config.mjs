@@ -50,21 +50,21 @@ export default tseslint.config(
     }
   },
   {
-    // Architecture boundary (extraction guard): @jsh562/agent-core must stay
+    // Architecture boundary (extraction guard): @jsh562/won-agent-core must stay
     // host-agnostic — no electron, no node-pty, and NO import back into the host app
     // (src/**). It MAY use Node builtins (it's a Node library: fs/child_process/etc.).
     // This is the static counterpart to the runtime boundary.test.ts guard; together
     // they keep the package independently publishable.
-    files: ['packages/agent-core/src/**/*.ts'],
+    files: ['packages/won-agent-core/src/**/*.ts'],
     rules: {
       'no-restricted-imports': ['error', {
         paths: [
-          { name: 'electron', message: 'agent-core must stay host-agnostic — no electron.' },
-          { name: 'node-pty', message: 'agent-core must stay host-agnostic — no node-pty.' }
+          { name: 'electron', message: 'won-agent-core must stay host-agnostic — no electron.' },
+          { name: 'node-pty', message: 'won-agent-core must stay host-agnostic — no node-pty.' }
         ],
         patterns: [
-          { group: ['electron/*'], message: 'agent-core must stay host-agnostic — no electron.' },
-          { group: ['**/src/main/**', '**/src/renderer/**', '**/src/preload/**', '**/src/shared/**'], message: 'agent-core must not import the host app (src/**) — invert the dependency via an injected seam.' }
+          { group: ['electron/*'], message: 'won-agent-core must stay host-agnostic — no electron.' },
+          { group: ['**/src/main/**', '**/src/renderer/**', '**/src/preload/**', '**/src/shared/**'], message: 'won-agent-core must not import the host app (src/**) — invert the dependency via an injected seam.' }
         ]
       }]
     }
