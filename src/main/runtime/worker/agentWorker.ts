@@ -59,11 +59,14 @@ if (parentPort) {
   // stable per machine/desk ⇒ no prompt-cache bust. Order: base toolkit preamble → god
   // role (if any) → shell note.
   const godPrompt = (process.env.NATIVE_AGENT_GOD_PROMPT ?? '').trim();
+  const reviewerPrompt = (process.env.NATIVE_AGENT_REVIEWER_PROMPT ?? '').trim();
   const integratorPrompt = (process.env.NATIVE_AGENT_INTEGRATOR_PROMPT ?? '').trim();
   const envNote = (process.env.NATIVE_AGENT_ENV_NOTE ?? '').trim();
-  // Order: base toolkit preamble → role prompt (god orchestrator OR dedicated integrator;
-  // only one is set per desk) → shell note.
-  const nativePreamble = [NATIVE_AGENT_PREAMBLE, godPrompt, integratorPrompt, envNote].filter(Boolean).join('\n\n');
+  // Order: base toolkit preamble → role prompt(s) (god orchestrator; or a non-god desk's
+  // reviewer and/or integrator preamble — a desk can hold both) → shell note.
+  const nativePreamble = [NATIVE_AGENT_PREAMBLE, godPrompt, reviewerPrompt, integratorPrompt, envNote]
+    .filter(Boolean)
+    .join('\n\n');
 
   const requestDrain = (): Promise<{ block: boolean; reason?: string }> => {
     const turnId = ++turnSeq;

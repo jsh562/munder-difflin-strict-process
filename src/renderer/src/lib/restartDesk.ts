@@ -54,3 +54,24 @@ export async function restartDesk(
     }
   });
 }
+
+// Debounce timers, one per desk, so a flurry of role toggles coalesces into a SINGLE
+// respawn instead of thrashing the desk on every click.
+const restartTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+/**
+ * Schedule a debounced desk restart for `agentId` (default ~1.2s). A role change applies
+ * its CAPABILITY gate live (the registry is the source of truth), but the role's PROMPT only
+ * re-injects on (re)spawn — so after toggling roles we auto-restart the desk to pick the
+ * prompt up, with no manual step. Reads the LATEST agent record at fire time (after the store
+ * write has settled), so rapid toggles all fold into one respawn carrying the final role set.
+ */
+export function scheduleDeskRestart(agentId: string, delayMs = 1200): void {
+  const existing = restartTimers.get(agentId);
+  if (existing) clearTimeout(existing);
+  restartTimers.set(agentId, setTimeout(() => {
+    restartTimers.delete(agentId);
+    const agent = useStore.getState().agents.find((a) => a.id === agentId);
+    if (agent) void restartDesk(agent).catch(() => { /* best-effort — desk may be down */ });
+  }, delayMs));
+}

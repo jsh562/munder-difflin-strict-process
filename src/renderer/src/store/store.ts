@@ -31,9 +31,9 @@ export interface BlockReason {
 }
 
 /** Capability roles (mirror of the agent-core `AgentRole`; declared locally so the store
- *  doesn't reach into the package). worker = does implementation; integrator = reviews +
- *  merges (hive_integrate) + signs tasks off. */
-export type AgentRole = 'worker' | 'integrator';
+ *  doesn't reach into the package). worker = writes code; reviewer = reads + COMMENTS only
+ *  (read-only); integrator = merges (hive_integrate) + signs tasks off. */
+export type AgentRole = 'worker' | 'reviewer' | 'integrator';
 
 export interface Agent {
   id: string;
@@ -77,9 +77,9 @@ export interface Agent {
    *  shown on the floor as a card above the seated avatar */
   lastPrompt?: string;
   /** Capability roles layered on the agent (separate from the god/assistant identity):
-   *  `worker` = eligible for delegated implementation; `integrator` = may review+merge
-   *  (hive_integrate) + sign tasks off. The god holds `integrator` by default; it's
-   *  reassignable to a dedicated desk. Persisted; the registry is the source of truth. */
+   *  `worker` = writes code; `reviewer` = reads + comments only (read-only); `integrator`
+   *  = merges (hive_integrate) + signs tasks off. The god holds `integrator` + `reviewer`
+   *  by default; both are reassignable. Persisted; the registry is the source of truth. */
   roles?: AgentRole[];
   /** the orchestrator ("god") agent — seated in Michael's room, runs the floor */
   isGod?: boolean;

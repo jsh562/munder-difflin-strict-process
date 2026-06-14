@@ -14,7 +14,7 @@ export interface HiveTask {
   title: string;
   description?: string;
   assignee?: string;
-  status: 'todo' | 'doing' | 'blocked' | 'review' | 'done';
+  status: 'todo' | 'doing' | 'blocked' | 'review' | 'integrate' | 'done';
   dependsOn: string[];
   /** Task id(s) this card is waiting on while `blocked` (shown as "blocked by"). */
   blockedBy?: string[];
@@ -25,13 +25,15 @@ export interface HiveTask {
 type Status = HiveTask['status'];
 
 const COLUMNS: { key: Status; label: string; accent: string }[] = [
-  { key: 'todo',    label: 'TODO',    accent: 'var(--cth-sky)' },
-  { key: 'doing',   label: 'DOING',   accent: 'var(--cth-lemon)' },
-  { key: 'blocked', label: 'BLOCKED', accent: 'var(--cth-coral)' },
-  // The worker→god hand-off lane: a worker moves a finished card here; the god verifies
-  // and advances it to DONE (or reopens it).
-  { key: 'review',  label: 'REVIEW',  accent: 'var(--cth-lilac)' },
-  { key: 'done',    label: 'DONE',    accent: 'var(--cth-mint)' }
+  { key: 'todo',      label: 'TODO',      accent: 'var(--cth-sky)' },
+  { key: 'doing',     label: 'DOING',     accent: 'var(--cth-lemon)' },
+  { key: 'blocked',   label: 'BLOCKED',   accent: 'var(--cth-coral)' },
+  // The worker→reviewer hand-off lane: a worker moves a finished card here; a reviewer
+  // reads it (read-only) and either approves it to INTEGRATE or sends it back to DOING.
+  { key: 'review',    label: 'REVIEW',    accent: 'var(--cth-lilac)' },
+  // The reviewer→integrator lane: an integrator merges the branch and signs it off to DONE.
+  { key: 'integrate', label: 'INTEGRATE', accent: 'var(--cth-peach)' },
+  { key: 'done',      label: 'DONE',      accent: 'var(--cth-mint)' }
 ];
 
 const POLL_MS = 5000;
@@ -64,7 +66,7 @@ function parseTasks(raw: unknown): HiveTask[] {
       title: typeof t.title === 'string' ? t.title : '(untitled)',
       description: typeof t.description === 'string' ? t.description : undefined,
       assignee: typeof t.assignee === 'string' ? t.assignee : undefined,
-      status: (['todo', 'doing', 'blocked', 'review', 'done'] as const).includes(t.status as Status)
+      status: (['todo', 'doing', 'blocked', 'review', 'integrate', 'done'] as const).includes(t.status as Status)
         ? (t.status as Status) : 'todo',
       dependsOn: Array.isArray(t.dependsOn) ? t.dependsOn.filter((d): d is string => typeof d === 'string') : [],
       blockedBy: Array.isArray(t.blockedBy) ? t.blockedBy.filter((d): d is string => typeof d === 'string') : undefined,

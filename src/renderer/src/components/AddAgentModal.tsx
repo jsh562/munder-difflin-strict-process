@@ -72,9 +72,10 @@ export function AddAgentModal({ onClose, config }: AddAgentModalProps) {
   };
   const [goal, setGoal] = useState('');
   const [isolate, setIsolate] = useState(false);
-  // Capability roles. Worker (does implementation) on by default; Integrator (reviews +
-  // merges others' branches) off — tick it to make a dedicated integration desk.
+  // Capability roles. Worker (writes code) on by default; Reviewer (read-only comments)
+  // and Integrator (merges others' branches) off — tick them for dedicated desks.
   const [roleWorker, setRoleWorker] = useState(true);
+  const [roleReviewer, setRoleReviewer] = useState(false);
   const [roleIntegrator, setRoleIntegrator] = useState(false);
   const [error, setError] = useState<string | undefined>();
   const [busy, setBusy] = useState(false);
@@ -95,7 +96,11 @@ export function AddAgentModal({ onClose, config }: AddAgentModalProps) {
     setBusy(true);
     const id = uniqueId(name);
     const ptyId = `pty-${id}`;
-    const roles: AgentRole[] = [...(roleWorker ? ['worker' as const] : []), ...(roleIntegrator ? ['integrator' as const] : [])];
+    const roles: AgentRole[] = [
+      ...(roleWorker ? ['worker' as const] : []),
+      ...(roleReviewer ? ['reviewer' as const] : []),
+      ...(roleIntegrator ? ['integrator' as const] : [])
+    ];
     // The command field contains `claude --permission-mode bypassPermissions`
     // for auto mode. Split into argv-style for node-pty.
     const [exe, ...args] = command.trim().split(/\s+/);
@@ -306,11 +311,15 @@ export function AddAgentModal({ onClose, config }: AddAgentModalProps) {
 
             <Row label="Roles">
               <div style={{ display: 'flex', gap: 16, alignItems: 'center', flexWrap: 'wrap' }}>
-                <label style={{ display: 'flex', gap: 6, alignItems: 'center', cursor: 'pointer' }}>
+                <label style={{ display: 'flex', gap: 6, alignItems: 'center', cursor: 'pointer' }} title="Writes the code — eligible for delegated implementation.">
                   <input type="checkbox" checked={roleWorker} onChange={(e) => setRoleWorker(e.target.checked)} style={{ width: 16, height: 16, cursor: 'pointer' }} />
                   <span style={{ fontFamily: 'var(--cth-font-ui)', fontSize: 14, color: 'var(--cth-ink-900)' }}>Worker</span>
                 </label>
-                <label style={{ display: 'flex', gap: 6, alignItems: 'center', cursor: 'pointer' }} title="Reviews + merges other desks' branches (hive_integrate) and signs tasks off. Tick + untick Worker for a dedicated integration desk.">
+                <label style={{ display: 'flex', gap: 6, alignItems: 'center', cursor: 'pointer' }} title="Reviews 'review' cards — read-only: comments only, cannot edit code. Approves to 'integrate' or sends back.">
+                  <input type="checkbox" checked={roleReviewer} onChange={(e) => setRoleReviewer(e.target.checked)} style={{ width: 16, height: 16, cursor: 'pointer' }} />
+                  <span style={{ fontFamily: 'var(--cth-font-ui)', fontSize: 14, color: 'var(--cth-ink-900)' }}>Reviewer</span>
+                </label>
+                <label style={{ display: 'flex', gap: 6, alignItems: 'center', cursor: 'pointer' }} title="Merges other desks' branches (hive_integrate) and signs tasks off. Tick + untick Worker for a dedicated integration desk.">
                   <input type="checkbox" checked={roleIntegrator} onChange={(e) => setRoleIntegrator(e.target.checked)} style={{ width: 16, height: 16, cursor: 'pointer' }} />
                   <span style={{ fontFamily: 'var(--cth-font-ui)', fontSize: 14, color: 'var(--cth-ink-900)' }}>Integrator</span>
                 </label>

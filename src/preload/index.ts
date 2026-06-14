@@ -8,8 +8,8 @@ export interface HiveAgentMeta {
   name: string;
   role?: string;
   capabilities?: string[];
-  /** Capability roles (worker / integrator). Optional at spawn — defaulted host-side. */
-  roles?: ('worker' | 'integrator')[];
+  /** Capability roles (worker / reviewer / integrator). Optional at spawn — defaulted host-side. */
+  roles?: ('worker' | 'reviewer' | 'integrator')[];
   cwd: string;
   isGod?: boolean;
   isAssistant?: boolean;
@@ -43,7 +43,7 @@ export interface HiveTask {
   title: string;
   description?: string;
   assignee?: string;
-  status: 'todo' | 'doing' | 'blocked' | 'review' | 'done';
+  status: 'todo' | 'doing' | 'blocked' | 'review' | 'integrate' | 'done';
   dependsOn: string[];
   /** Task id(s) currently blocking this card (set when status='blocked'). */
   blockedBy?: string[];
@@ -644,9 +644,9 @@ const api = {
    *  archives it automatically via pty:kill; this is the explicit primitive. */
   hiveSetArchived: (id: string, archived: boolean): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('hive:setArchived', id, archived),
-  /** Set an agent's capability roles (worker / integrator). Durable in the registry; the
-   *  integration gate applies immediately, the role's prompt on the agent's next respawn. */
-  hiveSetRoles: (id: string, roles: ('worker' | 'integrator')[]): Promise<{ ok: boolean; error?: string }> =>
+  /** Set an agent's capability roles (worker / reviewer / integrator). Durable in the
+   *  registry; the capability gate applies immediately, the role's prompt on next respawn. */
+  hiveSetRoles: (id: string, roles: ('worker' | 'reviewer' | 'integrator')[]): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('hive:setRoles', id, roles),
 
   // ─── Slack integration (Slack message → Michael's queue) ─────────────────────

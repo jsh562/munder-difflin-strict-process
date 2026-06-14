@@ -30,40 +30,47 @@ Cast: **God** (`Michael`, the orchestrator — a singleton) and **workers** (Dee
 ## 4. The task board (`tasks.json` → Tasks tab)
 
 Messages move work; the board records it — a living, single-source-of-truth with a role protocol:
-- Statuses: `todo | doing | blocked | review | done`.
+- Statuses: `todo | doing | blocked | review | integrate | done`.
 - **`hive_update_task`** `{ id, status?, assignee?, title?, priority?, note?, blockedBy? }`, **role-enforced**:
-  - **Worker** — may update only a card **assigned to itself**, and only to `doing` / `blocked` / `review`. It may **not** set `done` or reassign.
-  - **God** — may update **any** card to **any** status, including `done`/reopen, plus reassign and reprioritize.
+  - **Worker** — may update only a card **assigned to itself**, and only to `doing` / `blocked` / `review` (submit for review). It may **not** advance past `review`, set `done`, or reassign.
+  - **Reviewer** — on a card in `review` (even if not the assignee) may add a `note` and either **approve** it to `integrate` or **send it back** to `doing`. It may not merge or set `done`.
+  - **Integrator** — advances `integrate` cards, sets **`done`**/reopen.
+  - **God** — may update **any** card to **any** status, plus reassign and reprioritize.
 - **Blocked-by:** a `blocked` card carries **`blockedBy`** — the task id(s) it's waiting on (set when marking it blocked; auto-cleared on unblock). The board shows it as a coral **"⛔ blocked by ＜title＞"** chip that jumps to the blocker. Distinct from `dependsOn` (planning-time ordering). Non-task blocks use a free-text `note` + a message to god.
 - **Ownership lanes** (no write races — the hive is single-committer, the convention keeps lanes clean):
-  - **God owns** create, assign, and **sign-off**.
-  - **Workers own** progress on their own cards.
-- **Validation loop**: a worker finishes → sets its card **`review`** and pings the god → the **god verifies the deliverable** → sets **`done`** (or reopens to `doing`). No worker self-declares done; the god confirms.
+  - **God owns** create, assign, and (with the role) **sign-off**.
+  - **Workers own** progress on their own cards (up to `review`).
+  - **Reviewers own** the `review` gate; **integrators own** the `integrate`→`done` merge + sign-off.
+- **Validation loop**: a worker finishes its slice → sets its card **`review`** → the project's **reviewer** is auto-pinged, reads it (read-only) and either **approves** (→`integrate`) or **sends it back** (→`doing`) → on `integrate` the project's **integrator** is auto-pinged, merges the branch, and sets **`done`** (or sends it back). No worker self-declares done.
 
 ```
-todo ─(god assigns)─▶ doing ─(worker)─▶ review ─(integrator verifies+merges)─▶ done
-                        │                              │
-                        └─(worker: blocked + blockedBy)─▶ blocked  └─(integrator: reopen)─▶ doing
+todo ─(god assigns)─▶ doing ─(worker)─▶ review ─(reviewer approves)─▶ integrate ─(integrator merges)─▶ done
+                        │                  │                              │
+                        │                  └─(reviewer: back)─▶ doing     └─(integrator: back/reopen)─▶ doing
+                        └─(worker: blocked + blockedBy)─▶ blocked
 ```
-(the integrator is the god by default, or a dedicated desk holding the integrator role)
+(reviewer + integrator default to the god, or dedicated desks holding those roles; pings are matched per project)
 
-## 5. Roles & integration (who merges the work)
+## 5. Roles: who writes, who reviews, who merges
 
-Integration is a **role**, not a hard-coded god power. Each desk carries a small, extensible set of **capability roles** (separate from the god/assistant *identity*):
-- **`worker`** — eligible for delegated implementation (the god assigns slices here).
-- **`integrator`** — may review+merge another desk's branch (`hive_integrate`) and **sign tasks off** (`done`). The **god holds it by default**; it is **reassignable** — un-toggle it on the god and toggle it on a dedicated desk to make an integration agent, or keep both.
+Work moves through three **capability roles** (separate from the god/assistant *identity*) — each desk can hold any combination:
+- **`worker`** — writes the code. Eligible for delegated implementation; the god assigns slices here. **Can edit code** (write_file/edit_file/bash).
+- **`reviewer`** — reviews a `review` card and **comments only** — it is **read-only**: write_file/edit_file/bash are **denied** for a pure reviewer. It reads the branch, leaves a `hive_update_task` note, then **approves** (→`integrate`) or **sends back** (→`doing`). It never merges and never sets `done`.
+- **`integrator`** — merges an `integrate` card's branch (`hive_integrate`) and **signs tasks off** (`done`). May edit **only to resolve a merge conflict**. The **god holds `integrator` + `reviewer` by default**; both are **reassignable** — un-toggle on the god and toggle on a dedicated desk, or keep both.
 
-Assign roles in **Add-Agent** (Worker / Integrator checkboxes) or per-desk on the Command Center Floor roster. They persist in the registry; the **capability gate applies immediately** (read live), while the role's **prompt** re-injects on the desk's next (re)start. A desk can be a worker, an integrator, both, or neither.
+Assign roles in **Add-Agent** (Worker / Reviewer / Integrator checkboxes) or per-desk via the desk's **gear → Desk options** modal. They persist in the registry; the **capability gate applies immediately** (read live), and changing a role **auto-restarts that desk** (~1s, debounced) so its role prompt re-injects — no app restart. A desk can hold any mix of worker/reviewer/integrator, or none.
 
-Integration itself never hand-edits a repo — it uses one governed, registered-repo-scoped tool:
-- **`hive_integrate { repo, branch, apply? }`** (allowed only with the **integrator** role): `apply` omitted/false **previews** (commits + diffstat vs base); `apply:true` **merges** into the repo's base branch. A **conflict aborts cleanly** and is reported, so the integrator routes the work back to the author. Get each desk's `repo` + `branch` from `hive_list_agents`.
-- Flow: worker commits its slice + sets its card `review` → the **integrator** (the god by default, or a dedicated desk) `hive_integrate` (preview) → `apply:true` → `hive_update_task done`; conflicts go back to the worker. The god still **delegates** integration if it doesn't hold the role.
-- Worktrees persist (§1), so integration is never blocked by an exited worker. A dedicated integrator agent is now first-class (assign the role); more roles (reviewer/tester) can be added later.
+Integration itself never hand-edits a repo (except to settle a conflict) — it uses one governed, registered-repo-scoped tool:
+- **`hive_integrate { repo, branch, apply? }`** (allowed only with the **integrator** role): `apply` omitted/false **previews** (commits + diffstat vs base); `apply:true` **merges** into the repo's base branch. A **conflict aborts cleanly** and is reported, so the integrator either resolves it (conflict-only edits) or routes the work back to the author. Get each desk's `repo` + `branch` from `hive_list_agents`.
+- Flow: worker commits + sets card `review` → **reviewer** (auto-pinged) reads it and approves to `integrate` (or sends back) → **integrator** (auto-pinged) `hive_integrate` (preview) → `apply:true` → `hive_update_task done`; conflicts resolved or sent back. The god **delegates** review/integration for roles it doesn't hold.
+- **Per-project routing:** the `→review` and `→integrate` pings go to the role-holder(s) **for the task's project** (matched via the assignee's repo — an isolated desk matches its worktree's *origin* repo), falling back to any holder, then the god.
+- Worktrees persist (§1), so integration is never blocked by an exited worker. Dedicated reviewer + integrator agents are first-class (assign the role); more roles (e.g. tester) can be added later.
 
 ---
 
 ## Implementation map
-- **Roles:** `packages/agent-core/src/coordination/types.ts` (`AgentRole`), `hive.ts` (`roles` on AgentMeta/registry, `ensureAgent` defaults, `setRoles`), `hiveTools.ts` (`canIntegrate`, `RosterEntry.roles`, board sign-off rule), `agentTools.ts` (`hive_integrate` gate), `index.ts` (`canIntegrate` dep, role-conditional `nativeGodPrompt` + `NATIVE_AGENT_INTEGRATOR_PROMPT` via `workerEnv`, `hive:setRoles` IPC), `agentWorker.ts` (prepend integrator prompt), `store.ts` (`Agent.roles` + `setAgentRoles`), `AddAgentModal.tsx` (role checkboxes), `CommandCenterPanel.tsx` (`AgentRoleControl`).
+- **Roles:** `packages/agent-core/src/coordination/types.ts` (`AgentRole` = worker/reviewer/integrator), `hive.ts` (`roles` on AgentMeta/registry, `ensureAgent` god default `['integrator','reviewer']`, `setRoles`), `hiveTools.ts` (`canIntegrate`/`canReview`, `RosterEntry.roles`, board rules), `agentTools.ts` (`canEditCode` reviewer read-only gate + `hive_integrate` gate), `index.ts` (`canIntegrate`/`canReview`/`canEditCode` deps, role-conditional `nativeGodPrompt` + `NATIVE_AGENT_REVIEWER_PROMPT`/`NATIVE_AGENT_INTEGRATOR_PROMPT` via `workerEnv`, `hive:setRoles` IPC), `agentWorker.ts` (prepend reviewer/integrator prompts), `store.ts` (`Agent.roles` + `setAgentRoles`), `AddAgentModal.tsx` (role checkboxes), `DeskOptionsModal.tsx`/`AgentRoleControl.tsx` (gear modal + chips + auto-restart via `scheduleDeskRestart`).
 - **Status:** `src/renderer/src/hooks/useHive.ts` (status-from-events effect), `src/renderer/src/lib/agentStatus.ts` (`displayStatus`), `AgentStrip.tsx`/`AgentCard.tsx`, `CommandCenterPanel.tsx`, `NativeTranscriptView.tsx`.
-- **Board + roster + integrate tool:** `packages/agent-core/src/toolkit/hiveTools.ts` (`hive_update_task`, `hive_list_agents`, `RosterEntry`, role rules), `agentToolCatalog.ts` (`hive_integrate` spec + worker preamble), `agentTools.ts` (`integrate` dep + handler), `coordination/types.ts` (`review`), `src/renderer/src/components/TasksKanban.tsx` (review column).
+- **Board + roster + integrate tool:** `packages/agent-core/src/toolkit/hiveTools.ts` (`hive_update_task` review/integrate rules, `hive_list_agents`, `RosterEntry`, `TASK_STATUSES`), `agentToolCatalog.ts` (`hive_integrate` spec + worker preamble flow), `agentTools.ts` (`integrate` dep + handler, `canEditCode`), `coordination/types.ts` (`review`/`integrate` statuses), `src/renderer/src/components/TasksKanban.tsx` (review + integrate columns).
+- **Notifications (per-project):** `src/main/hive.ts` (`repoFor` resolver + `setRepoResolver`, `roleHoldersForTask`, `notifyTaskTransitions`: `→review`→reviewers, `→integrate`→integrator, send-back/unblock→assignee), `src/main/index.ts` (`setRepoResolver` wired from `worktreeOrigins`).
 - **Worktrees + integration host wiring:** `src/main/git.ts` (`listWorktrees`, `previewMerge`, `mergeBranch`, `agentBranchFor`), `src/main/index.ts` (auto-isolate, keep-on-exit, `git:listWorktrees`/`git:removeWorktree` IPC, `roster()`/`isGod()`/`integrate()` deps, god prompt), `src/renderer/src/components/SettingsModal.tsx` (Worktrees panel).

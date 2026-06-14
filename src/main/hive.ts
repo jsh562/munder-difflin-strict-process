@@ -128,6 +128,12 @@ export class HiveManager {
 
   private routerTimer: NodeJS.Timeout | null = null;
 
+  /** Resolve a desk's PROJECT repo (its origin repo for an isolated desk, else its cwd) so
+   *  task notifications can match reviewers/integrators "for that project". Defaults to the
+   *  registry cwd; the main process injects a worktree-origin-aware resolver. */
+  private repoFor: (id: string) => string | null = (id) => this.registry().agents[id]?.cwd ?? null;
+  setRepoResolver(fn: (id: string) => string | null): void { this.repoFor = fn; }
+
   /** The embedded OTLP collector's loopback URL, set by the main process once the
    *  collector is bound (telemetry.ts). null = telemetry off → no OTel env is
    *  injected at spawn (the transcript reconciler remains the cost source). */
@@ -249,7 +255,7 @@ export class HiveManager {
     const prev = reg.agents[meta.id];
     // Capability roles: an explicit spawn value wins; else PRESERVE what's in the registry
     // (so a role the operator set survives a respawn); else default by identity.
-    const defaultRoles: AgentRole[] = meta.isGod ? ['integrator'] : meta.isAssistant ? [] : ['worker'];
+    const defaultRoles: AgentRole[] = meta.isGod ? ['integrator', 'reviewer'] : meta.isAssistant ? [] : ['worker'];
     reg.agents[meta.id] = {
       ...meta,
       capabilities: meta.capabilities ?? [],
@@ -651,34 +657,52 @@ export class HiveManager {
     return Array.isArray(t?.tasks) ? t!.tasks : [];
   }
 
-  /** Pick who should integrate a card: a dedicated (non-god) integrator desk if one
-   *  exists, else the god. Excludes the card's own assignee. */
-  private integratorFor(assignee?: string): string | null {
+  /** Desks holding `role` "for the task's project": prefer those whose repo matches the
+   *  task's project (the assignee's repo); else any non-archived holder; else the god. The
+   *  card's own assignee is always excluded. Returns desk ids (may be several). */
+  private roleHoldersForTask(role: AgentRole, task: HiveTask): string[] {
     const reg = this.registry();
-    const dedicated = Object.values(reg.agents).find(
-      (a) => !a.archived && !a.isGod && a.id !== assignee && (a.roles ?? []).includes('integrator')
+    const holders = Object.values(reg.agents).filter(
+      (a) => !a.archived && a.id !== task.assignee && (a.roles ?? []).includes(role)
     );
-    return dedicated?.id ?? reg.godId ?? null;
+    const project = task.assignee ? this.repoFor(task.assignee) : null;
+    const sameProject = project ? holders.filter((a) => this.repoFor(a.id) === project) : [];
+    const chosen = sameProject.length ? sameProject : holders;
+    if (chosen.length) return chosen.map((a) => a.id);
+    return reg.godId && reg.godId !== task.assignee ? [reg.godId] : [];
   }
 
-  /** Fire best-effort notifications on task transitions (diff prev→next): a card that was
-   *  auto-unblocked (blocked→todo) pings its assignee to resume; a card that newly entered
-   *  `review` pings the integrator to merge + sign off. From 'system' so it's never the
-   *  recipient itself (the router drops self-sends). */
+  /** Fire best-effort notifications on task transitions (diff prev→next), from 'system'
+   *  (so the router never drops a self-send): auto-unblocked or sent-back → assignee;
+   *  entered `review` → the project's reviewer(s); entered `integrate` → the integrator. */
   private notifyTaskTransitions(prev: HiveTask[], next: HiveTask[]): void {
     const before = new Map(prev.map((t) => [t.id, t]));
+    const ping = (to: string, act: HiveMessage['act'], subject: string, body: string) =>
+      this.send({ to, act, subject, body }, 'system');
     for (const t of next) {
       const was = before.get(t.id);
-      if (was?.status === 'blocked' && t.status === 'todo' && t.assignee) {
-        this.send({ to: t.assignee, act: 'inform', subject: `Unblocked: ${t.title}`,
-          body: `Task "${t.title}" (${t.id}) is unblocked — its blocker(s) are done. You can resume it.` }, 'system');
+      const wasStatus = was?.status;
+      if (wasStatus === t.status) continue; // only act on a status change
+
+      if (wasStatus === 'blocked' && t.status === 'todo' && t.assignee) {
+        ping(t.assignee, 'inform', `Unblocked: ${t.title}`,
+          `Task "${t.title}" (${t.id}) is unblocked — its blocker(s) are done. You can resume it.`);
       }
-      if (t.status === 'review' && was?.status !== 'review') {
-        const to = this.integratorFor(t.assignee);
-        if (to && to !== t.assignee) {
-          this.send({ to, act: 'request', subject: `Integrate: ${t.title}`,
-            body: `Task "${t.title}" (${t.id}) is in review and ready to integrate. Find its repo + branch via hive_list_agents, then hive_integrate (preview) → apply, and mark it done.` }, 'system');
+      if (t.status === 'review') {
+        for (const to of this.roleHoldersForTask('reviewer', t)) {
+          ping(to, 'request', `Review: ${t.title}`,
+            `Task "${t.title}" (${t.id}) is ready for REVIEW. Read its branch (read-only), comment via hive_update_task note; approve by setting it to 'integrate', or send it back with status 'doing' and what to fix.`);
         }
+      }
+      if (t.status === 'integrate') {
+        for (const to of this.roleHoldersForTask('integrator', t)) {
+          ping(to, 'request', `Integrate: ${t.title}`,
+            `Task "${t.title}" (${t.id}) is approved and ready to INTEGRATE. Find its repo + branch via hive_list_agents, hive_integrate (preview → apply), resolve any conflict or send it back, then mark it 'done'.`);
+        }
+      }
+      if (t.status === 'doing' && (wasStatus === 'review' || wasStatus === 'integrate') && t.assignee) {
+        ping(t.assignee, 'inform', `Changes requested: ${t.title}`,
+          `Task "${t.title}" (${t.id}) was sent back to you (from ${wasStatus}). See the latest note on the card and address it.`);
       }
     }
   }

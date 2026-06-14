@@ -9,8 +9,7 @@ import { StructuredRunTab } from './StructuredRunTab';
 import { useNativeAgentEvents } from '@/hooks/useNativeAgentEvents';
 import { MessageQueueComposer } from './MessageQueueComposer';
 import { AssistantRoleNote } from './AssistantRoleNote';
-import { AgentRoleControl } from './AgentRoleControl';
-import { AgentWorkspaceControl } from './AgentWorkspaceControl';
+import { DeskOptionsModal } from './DeskOptionsModal';
 import { CommandCenterPanel } from './CommandCenterPanel';
 import { disposeTerminal } from './terminalPool';
 import { SidebarTabs } from './SidebarTabs';
@@ -65,6 +64,9 @@ function isNativeRuntimeDesk(agent: Agent, fleetDefaultModel?: string | null): b
 export function AgentDetailPanel({ agent }: AgentDetailPanelProps) {
   const [openTerminalState, setOpenTerminalState] = useState<'idle' | 'opening' | 'ok' | 'error'>('idle');
   const [openTerminalError, setOpenTerminalError] = useState<string | undefined>();
+  // The gear → Desk options modal (roles + workspace). Kept out of inline rows so the
+  // terminal stays full-height.
+  const [deskOptionsOpen, setDeskOptionsOpen] = useState(false);
   const archiveAgent = useStore(s => s.archiveAgent);
   const updateAgent = useStore(s => s.updateAgent);
   const setFullscreen = useStore(s => s.setFullscreen);
@@ -195,6 +197,12 @@ export function AgentDetailPanel({ agent }: AgentDetailPanelProps) {
             {openTerminalState === 'opening' ? '…' : openTerminalState === 'ok' ? 'ok' : openTerminalState === 'error' ? 'err' : ''}
           </span>
         </PixelButton>
+        {/* Desk options (roles + workspace) — in a modal so the terminal keeps full height. */}
+        {!agent.isAssistant && (
+          <PixelButton variant="secondary" size="sm" onClick={() => setDeskOptionsOpen(true)}>
+            <span title="Desk options — roles + workspace" style={{ display: 'inline-flex', alignItems: 'center' }}><Icon name="gear" /></span>
+          </PixelButton>
+        )}
         {(isReal || isNative) && (
           <PixelButton variant="destructive" size="sm" onClick={onKill}>
             <span title={isNative ? `Stop ${agent.name} (kill worker; revives on demand)` : `Close ${agent.name}`} style={{ display: 'inline-flex', alignItems: 'center' }}>
@@ -218,18 +226,8 @@ export function AgentDetailPanel({ agent }: AgentDetailPanelProps) {
           alone while paused). */}
       {(isReal || isNative) && <AgentControlStrip agentId={agent.id} />}
 
-      {/* Roles + workspace — edit this desk's capability roles and change its working
-          directory (a cwd change restarts it in the new folder). Workers only. */}
-      {!agent.isAssistant && (
-        <div style={{
-          display: 'flex', flexDirection: 'column', gap: 6,
-          padding: '6px 8px', background: 'var(--cth-paper-100)',
-          borderBottom: '1px solid var(--cth-ink-300)', flexShrink: 0
-        }}>
-          <AgentRoleControl agent={agent} />
-          <AgentWorkspaceControl agent={agent} />
-        </div>
-      )}
+      {/* Roles + workspace now live in the gear → Desk options modal (terminal stays full-height). */}
+      {deskOptionsOpen && <DeskOptionsModal agent={agent} onClose={() => setDeskOptionsOpen(false)} />}
 
       {/* Tabs */}
       <SidebarTabs current={sidebarTab} accent={agent.accent} onChange={setSidebarTab} />

@@ -186,6 +186,11 @@ const worktreePaths = new Map<string, string>();
  *  `git worktree remove` from the parent tree, not the worktree itself). */
 const worktreeOrigins = new Map<string, string>();
 
+// Tell the hive how to resolve a desk's *project repo* (used to match a task's
+// reviewer/integrator to the project it belongs to). An isolated desk's cwd is its
+// worktree, so prefer the worktree's ORIGIN repo; otherwise the desk's registry cwd.
+hive.setRepoResolver((id) => worktreeOrigins.get(`pty-${id}`) ?? hive.registry().agents[id]?.cwd ?? null);
+
 /**
  * Tear down everything tied to a PTY id: archive its hive agent, remove its
  * isolated git worktree, and drop the bookkeeping-map entries. Runs on BOTH an
@@ -291,6 +296,15 @@ const agentToolDeps: AgentToolDeps = {
   // Holds the `integrator` role? Gates hive_integrate + task sign-off. Read live from the
   // registry so toggling a role takes effect immediately (no respawn needed for the gate).
   canIntegrate: (id) => (hive.registry().agents[id]?.roles ?? []).includes('integrator'),
+  // Holds the `reviewer` role? Lets it approve/send-back a card in `review`.
+  canReview: (id) => (hive.registry().agents[id]?.roles ?? []).includes('reviewer'),
+  // May edit code? Worker/integrator + god/assistant yes; a PURE reviewer is read-only.
+  canEditCode: (id) => {
+    const a = hive.registry().agents[id];
+    if (!a) return true; // unknown desk → don't over-restrict
+    const roles = a.roles ?? [];
+    return a.isGod === true || a.isAssistant === true || roles.includes('worker') || roles.includes('integrator');
+  },
   // The god's integration seam (hive_integrate): review/merge a worker's branch into its
   // repo. Scoped to REGISTERED repos (+ live worktree origins) for safety; git runs in
   // main (single-committer). apply:false previews, true merges (conflicts abort + report).
@@ -337,17 +351,19 @@ const agentToolDeps: AgentToolDeps = {
 // holding the `integrator` role (it does by default, but the operator can reassign it to a
 // dedicated integrator desk): with the role the god reviews+merges+signs-off; without it,
 // the god delegates integration to whichever desk holds the role.
-function nativeGodPrompt(godIntegrates: boolean): string {
+function nativeGodPrompt(godIntegrates: boolean, godReviews: boolean): string {
   return [
     'You are the GOD / ORCHESTRATOR of this hive of agents (you are "Michael"). Your job is to ORCHESTRATE, not implement: keep awareness of the whole team and delegate the work.',
     '- KNOW THE TEAM: before delegating, call hive_list_agents to see who exists, who is running, and each desk\'s roles — assign to the best AVAILABLE desk, never blind.',
     '- DELEGATE: decompose a request into slices; for each, hive_add_task (a card assigned to a worker desk) and hive_send_message that desk a short 4-part brief (objective / output / tools+references / boundaries+done). Different slices can go to different desks in parallel. Do NOT do the grunt implementation yourself.',
+    '- THE FLOW (worker → reviewer → integrator): a WORKER writes + commits its slice on its own branch and moves the card "doing"→"review". A REVIEWER reads it (read-only, comments only) and either approves it to "integrate" or sends it back to "doing". An INTEGRATOR merges an "integrate" card and signs it off to "done". Keep cards moving along this chain.',
+    '- RUN THE BOARD (live source of truth): at turn start reconcile it — hive_list_tasks, fix stale cards with hive_update_task. You set assign/reprioritize.',
+    godReviews
+      ? '- REVIEW work (you hold the reviewer role): when a card enters "review", read the desk\'s branch (read-only), comment via a hive_update_task note, then approve it to "integrate" or send it back to "doing" with what to fix.'
+      : '- DELEGATE REVIEW: you do NOT hold the reviewer role. The desk(s) holding "reviewer" are auto-pinged on "review"; keep them fed and unblocked rather than reviewing yourself.',
     godIntegrates
-      ? '- RUN THE BOARD (live source of truth): at turn start reconcile it — hive_list_tasks, fix stale cards with hive_update_task. You OWN sign-off: when a worker moves its card to "review", verify it and hive_update_task it to "done" (or reopen to "doing"). You set done/reassign/reprioritize.'
-      : '- RUN THE BOARD (live source of truth): at turn start reconcile it — hive_list_tasks, fix stale cards with hive_update_task. You assign + reprioritize; the desk holding the INTEGRATOR role verifies "review" cards and signs them off to "done" — keep it fed and unblocked.',
-    godIntegrates
-      ? '- INTEGRATE finished work: each worker commits its slice on its own worktree branch (hive_list_agents shows each desk\'s repo + branch). On a "review" card, hive_integrate (no apply) to review the commits/diff, then hive_integrate apply:true to merge into the repo\'s base — then mark the card "done". A reported conflict means send it back to the author. You never hand-edit project files; integration is your high-leverage job.'
-      : '- DELEGATE INTEGRATION: you do NOT hold the integrator role. When a card reaches "review", find the desk whose roles include "integrator" via hive_list_agents and hive_send_message it the task id + its repo + branch to merge + sign off (the system also auto-pings that desk on "review", so this is a backstop). You never merge or hand-edit yourself.',
+      ? '- INTEGRATE approved work (you hold the integrator role): each worker commits its slice on its own worktree branch (hive_list_agents shows each desk\'s repo + branch). On an "integrate" card, hive_integrate (no apply) to inspect the commits/diff, then hive_integrate apply:true to merge into the repo\'s base — then mark the card "done". A reported conflict means resolve it yourself (you may edit only to resolve the conflict) or send it back to the author. You own sign-off (done/reopen).'
+      : '- DELEGATE INTEGRATION: you do NOT hold the integrator role. When a card reaches "integrate", find the desk whose roles include "integrator" via hive_list_agents and hive_send_message it the task id + its repo + branch to merge + sign off (the system also auto-pings that desk on "integrate", so this is a backstop). You never merge or hand-edit yourself.',
     '- YOU CANNOT TOUCH PROJECT FILES: your working directory is your own scratch workspace, NOT any project repo — your tools are sandboxed to it, so you literally cannot read or edit project code. Each project lives in a worker desk\'s own repo, so ALL implementation MUST be delegated; trying to do it yourself will just fail.',
     '- IF NO WORKER DESKS ARE ALIVE to take the work, do NOT attempt it yourself — tell the operator exactly which team/desks to spawn, then orchestrate once they are up.',
     '- COORDINATE: answer agents\' questions so the team runs autonomously; read a peer\'s memory with hive_read_memory when you need context; record durable decisions with write_memory.',
@@ -355,12 +371,22 @@ function nativeGodPrompt(godIntegrates: boolean): string {
   ].join('\n');
 }
 
+// Injected into a desk that holds the `reviewer` role. A reviewer is READ-ONLY: it cannot
+// edit code or run bash (the toolkit denies write_file/edit_file/bash for a pure reviewer) —
+// it comments and routes the card.
+const NATIVE_AGENT_REVIEWER_PROMPT = [
+  'You also hold the REVIEWER role: you REVIEW other desks\' finished work — you READ and COMMENT, you do NOT change code (write_file/edit_file/bash are blocked for you).',
+  '- You are PINGED automatically when a card enters "review"; you should ALSO, on each wake, scan hive_list_tasks for cards in "review" and review them — don\'t wait to be asked.',
+  '- hive_list_agents shows each desk\'s repo + worktree branch. Read the branch\'s diff/files (read_file/list_dir/grep — read-only), then leave a hive_update_task note (and hive_send_message the author for anything substantive).',
+  '- APPROVE: when it\'s good, hive_update_task the card to "integrate" (an integrator will merge it). REQUEST CHANGES: send it back with status "doing" and a clear note of exactly what to fix. You never merge and never mark "done".'
+].join('\n');
+
 // Injected into a NON-god desk that holds the `integrator` role (a dedicated integrator).
 const NATIVE_AGENT_INTEGRATOR_PROMPT = [
-  'You also hold the INTEGRATOR role: you review + merge other desks\' finished work (you do not re-implement it).',
-  '- You are PINGED automatically when a card enters "review"; you should ALSO, on each wake, scan hive_list_tasks for any cards in "review" and integrate them — don\'t wait to be asked.',
-  '- hive_list_agents shows each desk\'s repo + worktree branch. For a "review" card, use hive_integrate (no apply) to review the commits + diff, then hive_integrate apply:true to merge that branch into the repo\'s base branch, then hive_update_task it to "done".',
-  '- A reported merge conflict aborts cleanly — send the card back to its author (hive_send_message) to rebase/resolve; never force it.'
+  'You also hold the INTEGRATOR role: you MERGE other desks\' approved work and sign it off (you do not re-implement it).',
+  '- You are PINGED automatically when a card enters "integrate"; you should ALSO, on each wake, scan hive_list_tasks for any cards in "integrate" and merge them — don\'t wait to be asked.',
+  '- hive_list_agents shows each desk\'s repo + worktree branch. For an "integrate" card, use hive_integrate (no apply) to inspect the commits + diff, then hive_integrate apply:true to merge that branch into the repo\'s base branch, then hive_update_task it to "done".',
+  '- A reported merge conflict aborts cleanly — resolve it yourself (you may edit ONLY to settle the conflict) or send the card back to its author (hive_send_message, status "doing") to rebase/resolve; never force it.'
 ].join('\n');
 
 // E003 — native (non-Claude) agents run in isolated utilityProcess workers,
@@ -394,8 +420,14 @@ const nativeRuntime = new NativeRuntime({
     const env: Record<string, string> = { NATIVE_AGENT_ENV_NOTE: describeBashEnv() };
     const agent = hive.registry().agents[id];
     const roles = agent?.roles ?? [];
-    if (agent?.isGod) env.NATIVE_AGENT_GOD_PROMPT = nativeGodPrompt(roles.includes('integrator'));
-    else if (roles.includes('integrator')) env.NATIVE_AGENT_INTEGRATOR_PROMPT = NATIVE_AGENT_INTEGRATOR_PROMPT;
+    if (agent?.isGod) {
+      env.NATIVE_AGENT_GOD_PROMPT = nativeGodPrompt(roles.includes('integrator'), roles.includes('reviewer'));
+    } else {
+      // A non-god desk can hold reviewer and/or integrator on top of (or instead of) worker;
+      // inject each role's preamble so its responsibilities are spelled out.
+      if (roles.includes('reviewer')) env.NATIVE_AGENT_REVIEWER_PROMPT = NATIVE_AGENT_REVIEWER_PROMPT;
+      if (roles.includes('integrator')) env.NATIVE_AGENT_INTEGRATOR_PROMPT = NATIVE_AGENT_INTEGRATOR_PROMPT;
+    }
     return env;
   },
   // E007 T011/T017 {FR-008/011} — forward each native worker's usage + tool spans
