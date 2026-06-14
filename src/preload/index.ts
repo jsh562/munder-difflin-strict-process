@@ -56,6 +56,8 @@ export interface HiveTask {
   blockedBy?: string[];
   /** Attributed feedback thread (newest last). */
   comments?: HiveComment[];
+  /** Project repo the card belongs to (stamped on assign) — for off-project detection. */
+  project?: string;
   priority: number;
   createdAt: string;
 }

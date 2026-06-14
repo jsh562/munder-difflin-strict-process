@@ -4,7 +4,7 @@ import { PixelButton } from './PixelButton';
 import { PixelBadge } from './PixelBadge';
 import { Icon } from './Icon';
 import { useStore } from '@/store/store';
-import { TRIAGE_PROMPT } from '@shared/missionTemplates';
+import { TRIAGE_PROMPT, ORPHAN_TRIAGE_PROMPT } from '@shared/missionTemplates';
 
 /** A card on the task kanban. Mirrors HiveTask in the main/preload process —
  *  re-declared locally so the renderer doesn't reach into the preload package
@@ -27,6 +27,8 @@ export interface HiveTask {
   blockedBy?: string[];
   /** Attributed feedback thread (newest last). */
   comments?: HiveComment[];
+  /** Project repo the card belongs to (stamped on assign) — for off-project detection. */
+  project?: string;
   priority: number;
   createdAt: string;
 }
@@ -89,6 +91,7 @@ function parseTasks(raw: unknown): HiveTask[] {
             }))
             .filter((c) => c.text)
         : undefined,
+      project: typeof t.project === 'string' ? t.project : undefined,
       priority: typeof t.priority === 'number' ? t.priority : 3,
       createdAt: typeof t.createdAt === 'string' ? t.createdAt : new Date().toISOString()
     }));
@@ -101,6 +104,7 @@ function parseTasks(raw: unknown): HiveTask[] {
  */
 export function TasksKanban({ onAssign }: { onAssign: (prefill: string) => void }) {
   const agents = useStore((s) => s.agents);
+  const archivedAgents = useStore((s) => s.archivedAgents);
   const [tasks, setTasks] = useState<HiveTask[]>([]);
   const [adding, setAdding] = useState(false);
   // Transient confirmation after dispatching the god a board triage.
@@ -157,20 +161,35 @@ export function TasksKanban({ onAssign }: { onAssign: (prefill: string) => void 
   const nameFor = (id?: string): string | undefined =>
     id ? (agents.find((a) => a.id === id)?.name ?? id) : undefined;
 
-  // One-click: ask the god (Michael) to triage the board — assign/prioritize the TODO
-  // backlog + flag stalls — via the same dispatch-to-god path the Floor tab uses.
-  const triage = useCallback(async () => {
+  // Dispatch a prompt to the god (Michael) via the same path the Floor tab uses, with a
+  // transient confirmation. Shared by both triage buttons.
+  const dispatchGod = useCallback(async (subject: string, body: string) => {
     try {
-      const r = await window.cth.hiveSend(
-        { to: 'god', act: 'request', subject: 'Triage board', body: TRIAGE_PROMPT },
-        'human'
-      );
+      const r = await window.cth.hiveSend({ to: 'god', act: 'request', subject, body }, 'human');
       setTriageMsg(r.ok ? 'sent to Michael' : `failed: ${r.error ?? '?'}`);
     } catch {
       setTriageMsg('failed');
     }
     setTimeout(() => setTriageMsg(null), 4000);
   }, []);
+  const triage = useCallback(() => dispatchGod('Triage board', TRIAGE_PROMPT), [dispatchGod]);
+  const fixAssignments = useCallback(() => dispatchGod('Fix assignments', ORPHAN_TRIAGE_PROMPT), [dispatchGod]);
+
+  // Why a card's assignee no longer fits (drives the coral orphan chip): inactive (archived
+  // or gone), lacking an edit role for a lane it must work, or moved off the card's project.
+  // Null = fine / unassigned / done. The "fix assignments" button asks the god to reconcile.
+  const normRepo = (p: string) => p.replace(/[\\/]+$/, '').replace(/\\/g, '/').toLowerCase();
+  const orphanReason = useCallback((t: HiveTask): string | null => {
+    if (!t.assignee || t.status === 'done') return null;
+    const active = agents.find((a) => a.id === t.assignee);
+    if (!active) return archivedAgents.some((a) => a.id === t.assignee) ? 'assignee inactive' : 'assignee gone';
+    if (t.status === 'todo' || t.status === 'doing' || t.status === 'blocked') {
+      const roles = active.roles ?? (active.isGod ? ['integrator', 'reviewer'] : ['worker']);
+      if (!roles.includes('worker') && !roles.includes('integrator')) return 'no edit role';
+    }
+    if (t.project && normRepo(active.cwd) !== normRepo(t.project)) return 'off-project';
+    return null;
+  }, [agents, archivedAgents]);
 
   return (
     <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', background: 'var(--cth-paper-200)' }}>
@@ -185,12 +204,31 @@ export function TasksKanban({ onAssign }: { onAssign: (prefill: string) => void 
         {triageMsg && (
           <span style={{ fontFamily: 'var(--cth-font-ui)', fontSize: 11, color: 'var(--cth-ink-500)' }}>{triageMsg}</span>
         )}
+        {/* Ask Michael to reconcile MISASSIGNED cards (inactive / no-edit-role / off-project
+            assignees) — reassign to a capable desk or unassign + flag. Count shown when > 0. */}
+        {(() => {
+          const orphans = tasks.filter((t) => orphanReason(t)).length;
+          return (
+            <PixelButton
+              variant="secondary"
+              size="sm"
+              onClick={fixAssignments}
+              style={{ marginLeft: 'auto' }}
+            >
+              <span
+                title="Ask Michael to fix misassigned cards: reassign to a capable desk, or unassign if the assignee is inactive / lacks the role / is off-project"
+                style={{ display: 'inline-flex', alignItems: 'center', gap: 4, color: orphans > 0 ? 'var(--cth-coral)' : undefined }}
+              >
+                <Icon name="bell" /> fix assignments{orphans > 0 ? ` (${orphans})` : ''}
+              </span>
+            </PixelButton>
+          );
+        })()}
         {/* Ask Michael to triage the backlog (assign + prioritize TODOs, flag stalls). */}
         <PixelButton
           variant="secondary"
           size="sm"
           onClick={triage}
-          style={{ marginLeft: 'auto' }}
         >
           <span
             title="Ask Michael to review the board: assign + prioritize TODO cards and flag stalls (he won't implement)"
@@ -248,6 +286,7 @@ export function TasksKanban({ onAssign }: { onAssign: (prefill: string) => void 
                     task={t}
                     assigneeName={nameFor(t.assignee)}
                     nameFor={nameFor}
+                    orphanReason={orphanReason(t)}
                     flashing={flashId === t.id}
                     blockers={(t.blockedBy ?? []).map((bid) => ({ id: bid, title: titleFor(bid) }))}
                     otherTasks={tasks.filter((x) => x.id !== t.id).map((x) => ({ id: x.id, title: x.title }))}
@@ -269,10 +308,11 @@ export function TasksKanban({ onAssign }: { onAssign: (prefill: string) => void 
 
 // ─── Card ────────────────────────────────────────────────────────────────────
 
-function TaskCard({ task, assigneeName, nameFor, flashing, blockers, otherTasks, registerRef, onMove, onAssign, onJump, onSetBlockedBy }: {
+function TaskCard({ task, assigneeName, nameFor, orphanReason, flashing, blockers, otherTasks, registerRef, onMove, onAssign, onJump, onSetBlockedBy }: {
   task: HiveTask;
   assigneeName?: string;
   nameFor: (id?: string) => string | undefined;
+  orphanReason: string | null;
   flashing?: boolean;
   blockers: { id: string; title: string }[];
   otherTasks: { id: string; title: string }[];
@@ -298,6 +338,19 @@ function TaskCard({ task, assigneeName, nameFor, flashing, blockers, otherTasks,
           lineHeight: '16px', color: 'var(--cth-ink-900)'
         }}>{task.title}</span>
       </div>
+
+      {/* Orphaned assignment: the assignee no longer fits (inactive / no edit role / off-project).
+          "fix assignments" asks the god to reassign or unassign these. */}
+      {orphanReason && (
+        <div
+          title="This card's assignee no longer fits — use 'fix assignments' to reassign or unassign it."
+          style={{
+            alignSelf: 'flex-start', padding: '1px 6px 0',
+            background: 'var(--cth-coral-light)', boxShadow: 'inset 0 0 0 1px var(--cth-coral)',
+            fontFamily: 'var(--cth-font-ui)', fontSize: 11, color: 'var(--cth-ink-900)'
+          }}
+        >⚠ {orphanReason}</div>
+      )}
 
       {/* Blocked-by: a coral chip per blocker; clicking jumps to that card. */}
       {blockers.length > 0 && (

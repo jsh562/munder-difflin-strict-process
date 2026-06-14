@@ -335,6 +335,8 @@ const agentToolDeps: AgentToolDeps = {
   canIntegrate: (id) => (hive.registry().agents[id]?.roles ?? []).includes('integrator'),
   // Holds the `reviewer` role? Lets it approve/send-back a card in `review`.
   canReview: (id) => (hive.registry().agents[id]?.roles ?? []).includes('reviewer'),
+  // A desk's project repo — stamps a task's `project` on assignment (off-project detection).
+  repoFor: (id) => repoForId(id),
   // May edit code (write_file/edit_file/bash)? Role-driven, NO god/assistant special-case:
   // the `worker` role (writes features + tests) and the `integrator` role (writes merge-fix
   // code) grant editing; a reviewer / no-edit-role / assistant desk is read-only. This is the
@@ -348,11 +350,19 @@ const agentToolDeps: AgentToolDeps = {
   // Extra READ roots: every desk may READ any registered project repo + any worktree (to
   // compare versions or read a peer's branch — the god/reviewer especially need this), while
   // WRITES stay confined to the desk's own cwd (resolveInsideCwd). Read wide, write narrow.
-  readRoots: () => Array.from(new Set<string>([
-    ...(readConfig().registeredRepos ?? []),
-    ...worktreeOrigins.values(),
-    ...worktreePaths.values()
-  ])),
+  readRoots: () => {
+    const home = readConfig().harnessHome;
+    return Array.from(new Set<string>([
+      ...(home ? [home] : []), // the hive home: every desk reads memory/inbox/board/tasks + peers'
+      ...(readConfig().registeredRepos ?? []),
+      ...worktreeOrigins.values(),
+      ...worktreePaths.values()
+    ]));
+  },
+  // A desk may WRITE its OWN hive agent dir (memory.md, inbox/.done, scratch) — ungated by
+  // canEditCode (memory is everyone's). Shared hive files (tasks.json/registry.json) sit in the
+  // hive ROOT, not under agents/<id>, so they stay tool-managed (single-committer).
+  agentDir: (id) => { const r = hive.root(); return r ? join(r, 'agents', id) : null; },
   // The god's integration seam (hive_integrate): review/merge a worker's branch into its
   // repo. Scoped to REGISTERED repos (+ live worktree origins) for safety; git runs in
   // main (single-committer). apply:false previews, true merges (conflicts abort + report).
