@@ -196,6 +196,9 @@ function repoForId(id: string): string | null {
   return worktreeOrigins.get(`pty-${id}`) ?? hive.registry().agents[id]?.cwd ?? null;
 }
 hive.setRepoResolver(repoForId);
+// SDDP: let the hive's planner/qc auto-routing read a feature's real on-disk phase
+// (`<repo>/specs/<feature>/` markers) so it knows when planning is done / QC has passed.
+hive.setFeatureStatusResolver((repo, feature) => scanFeatureStatus(repo, feature));
 
 /**
  * Reattach-or-isolate a worker desk's git worktree. The desk's worktree path is keyed by its

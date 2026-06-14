@@ -31,7 +31,7 @@ import { COMMAND_GROUPS } from '../shared/claudeCommands';
 // coding toolkit is host-agnostic); re-exported below so existing `import { HiveMessage }
 // from '../hive'` consumers across the app are unchanged.
 import { reconcileBlocked, roleCanEditCode } from '@jsh562/agent-core';
-import type { MessageAct, HiveMessage, HiveTask, AgentRole } from '@jsh562/agent-core';
+import type { MessageAct, HiveMessage, HiveTask, AgentRole, FeatureStatus } from '@jsh562/agent-core';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -134,6 +134,16 @@ export class HiveManager {
    *  registry cwd; the main process injects a worktree-origin-aware resolver. */
   private repoFor: (id: string) => string | null = (id) => this.registry().agents[id]?.cwd ?? null;
   setRepoResolver(fn: (id: string) => string | null): void { this.repoFor = fn; }
+
+  /** Resolve an SDDP feature's on-disk phase from `<repo>/specs/<feature>/`, injected by the
+   *  main process (scanFeatureStatus). Drives the planner/qc auto-routing (what's done). Default
+   *  returns null ⇒ no resolver ⇒ feature status unknown (planner ping still fires for an
+   *  un-started feature; qc ping fires unless we can confirm `.qc-passed`). */
+  private featureStatusFor: (repo: string | null, feature: string) => FeatureStatus | null = () => null;
+  setFeatureStatusResolver(fn: (repo: string | null, feature: string) => FeatureStatus | null): void { this.featureStatusFor = fn; }
+  /** SDDP planner-kickoff dedupe: feature keys (`project::feature`) already nudged to a planner
+   *  this session, so a feature lacking tasks.md is nudged ONCE (not on every board write). */
+  private nudgedPlannerFeatures = new Set<string>();
 
   /** The embedded OTLP collector's loopback URL, set by the main process once the
    *  collector is bound (telemetry.ts). null = telemetry off → no OTel env is
@@ -737,7 +747,7 @@ export class HiveManager {
    *  dedicated holder exists — the god (who holds integrator+reviewer by default and, as
    *  `isGod`, can advance any card regardless of role). The card's own assignee is always
    *  excluded. Returns desk ids, sorted by id so a single-pick is deterministic. */
-  private roleHoldersForTask(role: AgentRole, task: HiveTask): string[] {
+  private roleHoldersForTask(role: AgentRole, task: HiveTask, godFallback = true): string[] {
     const reg = this.registry();
     const holders = Object.values(reg.agents).filter(
       (a) => !a.archived && a.id !== task.assignee && (a.roles ?? []).includes(role)
@@ -746,7 +756,10 @@ export class HiveManager {
     const sameProject = project ? holders.filter((a) => this.repoFor(a.id) === project) : [];
     const chosen = sameProject.length ? sameProject : holders;
     if (chosen.length) return chosen.map((a) => a.id).sort();
-    // Zero dedicated holders for the project ⇒ the god is the standing fallback.
+    // Zero dedicated holders for the project ⇒ the god is the standing fallback — EXCEPT the SDDP
+    // planner/qc phases (godFallback=false), where the operator's rule is "no role-holder ⇒ nobody
+    // does it" (the god is a delegator that can't author specs or run QC).
+    if (!godFallback) return [];
     return reg.godId && reg.godId !== task.assignee ? [reg.godId] : [];
   }
 
@@ -783,13 +796,29 @@ export class HiveManager {
         if (reviewers.length === 0) this.appendLog({ kind: 'drop', reason: 'no-handler', to: 'reviewer', id: t.id });
       }
       if (t.status === 'integrate') {
-        // ONE integrator only (parallel hive_integrate would double-merge).
-        const to = this.roleHolderForTask('integrator', t);
-        if (to) {
-          ping(to, 'request', `Integrate: ${t.title}`,
-            `Task "${t.title}" (${t.id}) is approved and ready to INTEGRATE. Find its repo + branch via hive_list_agents, run the test suite as the merge gate, then hive_integrate (preview → apply), resolve any conflict or send it back, then mark it 'done'.`);
+        // SDDP: a feature card can't be merged until QC passes (.qc-passed). If it's missing,
+        // route to a QC desk to run the QC phase FIRST (no god fallback — no qc desk ⇒ nobody;
+        // the integrate gate keeps the card from merging until .qc-passed appears, and the
+        // integrator picks it up on its next scan once it does). Otherwise (no feature, or QC
+        // already passed) ping the integrator as usual.
+        const repo = t.project ?? (t.assignee ? this.repoFor(t.assignee) : null);
+        const fstat = t.feature ? this.featureStatusFor(repo, t.feature) : null;
+        if (t.feature && fstat && !fstat.qcPassed) {
+          const qcs = this.roleHoldersForTask('qc', t, false);
+          for (const to of qcs) {
+            ping(to, 'request', `QC: ${t.title}`,
+              `Feature "${t.feature}" (card ${t.id}) is implemented and awaiting QC before integrate. Run build/tests/lint + verify the stories/SC-### against the spec, write specs/${t.feature}/qc-report.md, then create the .qc-passed marker (or file bug tasks back to the worker).`);
+          }
+          if (qcs.length === 0) this.appendLog({ kind: 'drop', reason: 'no-handler', to: 'qc', id: t.id });
         } else {
-          this.appendLog({ kind: 'drop', reason: 'no-handler', to: 'integrator', id: t.id });
+          // ONE integrator only (parallel hive_integrate would double-merge).
+          const to = this.roleHolderForTask('integrator', t);
+          if (to) {
+            ping(to, 'request', `Integrate: ${t.title}`,
+              `Task "${t.title}" (${t.id}) is approved and ready to INTEGRATE. Find its repo + branch via hive_list_agents, run the test suite as the merge gate, then hive_integrate (preview → apply), resolve any conflict or send it back, then mark it 'done'.`);
+          } else {
+            this.appendLog({ kind: 'drop', reason: 'no-handler', to: 'integrator', id: t.id });
+          }
         }
       }
       if (t.status === 'doing' && (wasStatus === 'review' || wasStatus === 'integrate') && t.assignee) {
@@ -799,6 +828,31 @@ export class HiveManager {
         ping(t.assignee, 'inform', `Changes requested: ${t.title}`,
           `Task "${t.title}" (${t.id}) was sent back to you (from ${wasStatus}).${feedback}`);
       }
+    }
+
+    // SDDP PLANNER KICKOFF — separate from status transitions: a feature that has cards but no
+    // tasks.md still needs Specify→Plan→Tasks. Ping a planner ONCE per feature (deduped); no god
+    // fallback (no planner desk ⇒ nobody plans). Re-evaluated each write, so a planner added later
+    // gets pinged on the next board change (we only mark a feature nudged once we actually ping).
+    const featureCards = new Map<string, HiveTask>(); // key project::feature → a representative card
+    for (const t of next) {
+      if (!t.feature) continue;
+      const repo = t.project ?? (t.assignee ? this.repoFor(t.assignee) : null);
+      const key = `${repo ?? ''}::${t.feature}`;
+      if (!featureCards.has(key)) featureCards.set(key, t);
+    }
+    for (const [key, t] of featureCards) {
+      if (this.nudgedPlannerFeatures.has(key)) continue;
+      const repo = t.project ?? (t.assignee ? this.repoFor(t.assignee) : null);
+      const fstat = this.featureStatusFor(repo, t.feature!);
+      if (fstat?.hasTasks) { this.nudgedPlannerFeatures.add(key); continue; } // planning done — stop checking
+      const planners = this.roleHoldersForTask('planner', t, false);
+      if (planners.length === 0) continue; // no planner ⇒ nobody plans; retry on a later write
+      for (const to of planners) {
+        ping(to, 'request', `Plan feature: ${t.feature}`,
+          `Feature "${t.feature}" needs its spec → plan → tasks before implementation. Author specs/${t.feature}/spec.md (mark unknowns [NEEDS CLARIFICATION] and ask god/operator), then plan.md and tasks.md, in the SHARED base-repo specs/. Use hive_feature_status to track the phase.`);
+      }
+      this.nudgedPlannerFeatures.add(key);
     }
   }
 
