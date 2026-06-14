@@ -61,7 +61,11 @@ export class HookServer {
     /** E001 — additive sink that feeds the Claude ProviderRuntime adapter the raw
      *  hook payload, so it can emit the normalized AgentEvent stream. Does NOT
      *  change any existing IPC send or the Stop-drain autonomy below. */
-    private onHook?: (p: HookPayload) => void
+    private onHook?: (p: HookPayload) => void,
+    /** Authoritative "is this Claude desk mid-turn" sink (parity with native turn
+     *  events) — `true` on activity (prompt/tool), `false` on a GENUINE stop/halt.
+     *  Feeds main's `turnActive` set, the source of truth for the live status badge. */
+    private onTurn?: (agentId: string, active: boolean) => void
   ) {}
 
   start(): void {
@@ -138,6 +142,7 @@ export class HookServer {
     // drain below): stop the agent CLEANLY at this hook boundary rather than
     // killing the PTY. session_id is in the payload for a later --resume.
     if (agentId && this.control?.shouldHalt(agentId)) {
+      this.onTurn?.(agentId, false); // halting → no longer in a turn
       this.emit(agentId, event, p);
       return { continue: false, stopReason: 'Halted by the operator from the floor.' };
     }
@@ -145,6 +150,12 @@ export class HookServer {
     // Capture the Claude Code session id for idempotent --resume + cost dedup
     // (Lane A #6.6a). Cheap: recordSession writes only when it changes.
     if (agentId && p.session_id) this.hive.recordSession(agentId, p.session_id);
+
+    // Authoritative turn state: a prompt/tool event means a turn is in flight → mark working.
+    // A genuine Stop/Halt clears it below. Drives main's `turnActive` set (live status truth).
+    if (agentId && (event === 'PreToolUse' || event === 'PostToolUse' || event === 'UserPromptSubmit')) {
+      this.onTurn?.(agentId, true);
+    }
 
     // Feed the breaker its hook-derived loop signal: a tool that actually ran.
     // A repeated identical (name+input) PostToolUse is the runaway-loop tell.
@@ -154,17 +165,19 @@ export class HookServer {
 
     if ((event === 'Stop' || event === 'SubagentStop') && agentId) {
       // Loop guard: a previous Stop hook already blocked this turn → let it stop.
-      if (p.stop_hook_active) { this.emit(agentId, event, p); return {}; }
+      if (p.stop_hook_active) { this.onTurn?.(agentId, false); this.emit(agentId, event, p); return {}; }
       const drain = this.hive.drainForStop(agentId);
       if (drain.block) {
         // The agent is NOT idle — we're forcing it to keep working to process
         // its inbox. Tell the renderer that (blocked: true) so it doesn't flash
         // 'idle' on a Stop that never actually stops. Without this, an agent
         // re-engaged by a queued/dispatched message reads as idle while working.
+        this.onTurn?.(agentId, true); // re-engaged to drain inbox → still in a turn
         this.emit(agentId, event, p, true);
         return { decision: 'block', reason: drain.reason };
       }
       // A genuine stop with nothing queued → idle. Surface it as a desktop toast.
+      this.onTurn?.(agentId, false);
       this.notify(agentId ?? 'Agent', 'finished — idle');
       this.emit(agentId, event, p);
       return {};

@@ -4,6 +4,7 @@ import { buildSpawnCommand, ASSISTANT_MODEL, type HarnessConfig } from '@/store/
 import { deriveProviderId } from '@shared/assignment';
 import { isNativeRuntimeDesk } from '@/lib/runtimeKind';
 import { respawnNativeWorker } from '@/lib/nativeRespawn';
+import { reconcileTurnStatus } from '@/lib/agentStatus';
 
 const GOD_ID = 'god';
 const GOD_PTY = `pty-${GOD_ID}`;
@@ -455,6 +456,30 @@ export function useHive(config: HarnessConfig | null): void {
     );
     return () => offs.forEach((off) => off?.());
   }, [config?.onboardingComplete, nativeIds]);
+
+  // 2f) RECONCILE status against main's authoritative live state (the safety net for both
+  //     runtimes). The event paths above (#2 Claude hooks, #2e native AgentEvents) give instant
+  //     updates but a MISSED terminal event (crash / killed PTY / dropped turn-end) latches a desk
+  //     on "working". Main pushes per-desk { running, inTurn } on the fleet beat; here we correct
+  //     the working↔idle turn state: dead ⇒ idle, else working iff in a turn. We ONLY touch the
+  //     working/idle pair, never clobbering blocked/compacting/looping or the pause/stop overrides
+  //     (displayStatus layers those on top). Honors pause / stopped-god / breaker pins like #2e.
+  useEffect(() => {
+    return window.cth.onFleetState?.((state) => {
+      const { updateAgent, agents, paused, godDesired: desired } = useStore.getState();
+      for (const s of state) {
+        const a = agents.find((x) => x.id === s.id);
+        if (!a) continue;
+        if (paused[s.id]) continue;                              // operator paused — leave it
+        if (s.id === GOD_ID && desired === 'stopped') continue;  // stopped god stays down
+        const lvl = breakerLevel.current[s.id];
+        if (lvl === 'constrained' || lvl === 'stopped') continue; // breaker pins 'looping'
+        // Surgical: only correct a stuck working/idle; never overwrite other meaningful statuses.
+        const next = reconcileTurnStatus(a.status, s.running, s.inTurn);
+        if (next) updateAgent(s.id, { status: next, action: next });
+      }
+    });
+  }, []);
 
   // 2c) Context gauge backfill: poll each live agent's current context size
   //     (tokens) from its session transcript — only until the status line

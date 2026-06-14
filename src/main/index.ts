@@ -124,6 +124,14 @@ const breaker = new CircuitBreaker(() => {
 // heartbeat mission is disabled (it ships off).
 let fleetTimer: ReturnType<typeof setInterval> | null = null;
 let breakerBeatTimer: ReturnType<typeof setInterval> | null = null;
+// Authoritative "is this desk mid-turn" set — the single source of truth for the live status
+// badge, reconciled to the renderer via `fleet:state` so a missed turn-end can't latch a desk on
+// "working". Fed by BOTH runtimes: native AgentEvents (turn-start/turn-end/stop, at the ingest
+// seam below) and Claude hooks (activity → true, genuine Stop → false). Cleared on desk exit.
+const turnActive = new Set<string>();
+const markTurn = (agentId: string, active: boolean): void => {
+  if (active) turnActive.add(agentId); else turnActive.delete(agentId);
+};
 // Feed the breaker's api_error-storm trip from Oscar's OTel api_error spans —
 // Jim's one breaker input with no on-branch source (telemetry.onApiError seam).
 telemetry.onApiError((agentId) => breaker.recordError(agentId));
@@ -143,7 +151,9 @@ ptyManager.setDataObserver((id, data) => claudeRuntime.ingestPtyData(id, data));
 // hook returns) AND Jim's breaker (feed recordToolUse on each PostToolUse).
 const hookServer = new HookServer(
   hive, () => liveWebContents(), () => readConfig(), control, breaker,
-  (p) => claudeRuntime.ingestHook(p)
+  (p) => claudeRuntime.ingestHook(p),
+  // Claude turn-state → the authoritative turnActive set (parity with native turn events).
+  markTurn
 );
 const memory = new MemoryManager(
   () => readConfig().harnessHome,
@@ -196,6 +206,15 @@ function repoForId(id: string): string | null {
   return worktreeOrigins.get(`pty-${id}`) ?? hive.registry().agents[id]?.cwd ?? null;
 }
 hive.setRepoResolver(repoForId);
+// Is a desk actually RUNNING right now — a live native worker OR a live PTY mapped to it. The
+// single liveness predicate used by the fleet snapshot, the `archived` reconcile, and the hive's
+// "prefer a live role-holder" routing (so the god routes to an integrator that's actually up).
+function isAgentRunning(id: string): boolean {
+  if (nativeRuntime.runtimeFor(id) !== undefined) return true;
+  const livePtys = new Set(ptyManager.list().map((p) => p.id));
+  return [...ptyToAgent.entries()].some(([ptyId, aid]) => aid === id && livePtys.has(ptyId));
+}
+hive.setRunningResolver(isAgentRunning);
 // SDDP: let the hive's planner/qc auto-routing read a feature's real on-disk phase
 // (`<repo>/specs/<feature>/` markers) so it knows when planning is done / QC has passed.
 hive.setFeatureStatusResolver((repo, feature) => scanFeatureStatus(repo, feature));
@@ -262,6 +281,9 @@ function teardownPty(id: string): void {
     ptyToAgent.delete(id);
     // E005 — drop the derived-provider record alongside the agent (no leak).
     agentProviderIds.delete(agentId);
+    // A killed/crashed Claude PTY emits no graceful Stop hook, so clear its turn state here; the
+    // fleet:state reconcile (running:false ⇒ idle) then drops any stale "working" badge.
+    markTurn(agentId, false);
     archiveAgent(agentId);
   }
   // 2) An isolated agent's worktree is INTENTIONALLY KEPT on exit (it was force-removed
@@ -627,7 +649,14 @@ const nativeRuntime = new NativeRuntime({
   telemetry,
   // E008 T004/T005 {FR-016/037/043} — forward each native worker's AgentEvent
   // stream into the single-writer bridge (persist-then-forward over `agent:event`).
-  onAgentEvent: (event) => nativeEventBridge.ingest(event),
+  onAgentEvent: (event) => {
+    // Authoritative native turn state (parity with the Claude hook path): a turn opens on
+    // turn-start and closes on turn-end / stop (incl. the synthetic stop on kill/exit), so the
+    // live status badge can't latch on "working" after a missed final event.
+    if (event.kind === 'turn-start') markTurn(event.agentId, true);
+    else if (event.kind === 'turn-end' || event.kind === 'stop') markTurn(event.agentId, false);
+    nativeEventBridge.ingest(event);
+  },
   maxConcurrent: 15,
   maxOldSpaceMb: 512
 });
@@ -915,8 +944,31 @@ function writeFleetSnapshot(): void {
     const snap = telemetry.snapshot();
     const usageById = new Map(snap.usage.map((u) => [u.agentId, u]));
     const now = Date.now();
+    // Live runtime truth for each desk (a live native worker or PTY) — the single source of truth
+    // for status + archived (reconciled below). Computed once over the live PTY set per beat.
+    const livePtys = new Set(ptyManager.list().map((p) => p.id));
+    const isRunning = (id: string): boolean =>
+      nativeRuntime.runtimeFor(id) !== undefined ||
+      [...ptyToAgent.entries()].some(([ptyId, aid]) => aid === id && livePtys.has(ptyId));
+    // Reconcile drift: a desk that is actually RUNNING must never read as archived — otherwise the
+    // god's role routing (`roleHoldersForTask` filters `!archived`) can't see a live integrator/etc.
+    // Only fix the running⇒not-archived direction (archiving a dead desk stays an exit action), and
+    // only write when it actually changes (no commit churn).
+    for (const [id, a] of Object.entries(reg.agents)) {
+      if (a.archived && isRunning(id)) {
+        try { hive.setArchived(id, false); } catch (e) { console.error('[fleet] un-archive failed:', e); }
+      }
+    }
+    // Push the authoritative live state (running + in-a-turn) to the renderer so a stale "working"
+    // badge self-heals (the renderer reconciles status from this — see useHive `fleet:state`).
+    try {
+      const liveState = Object.keys(reg.agents)
+        .filter((id) => !reg.agents[id].archived || isRunning(id))
+        .map((id) => ({ id, running: isRunning(id), inTurn: turnActive.has(id) }));
+      liveWebContents()?.send('fleet:state', liveState);
+    } catch { /* window tore down */ }
     const agents = Object.entries(reg.agents)
-      .filter(([, a]) => !a.archived)
+      .filter(([id, a]) => !a.archived || isRunning(id))
       .map(([id, a]) => {
         const u = usageById.get(id);
         const spans = snap.spans[id] ?? [];

@@ -96,7 +96,14 @@ export class NativeRuntime {
       agentId,
       transportFactory: () => makeElectronWorkerTransport({ agentId, maxOldSpaceMb: this.deps.maxOldSpaceMb, env }),
       usageFallback: () => this.deps.usageFor?.(agentId) ?? null,
-      onExit: (id) => { this.workers.delete(id); this.deps.onWorkerExit(id); },
+      onExit: (id) => {
+        this.workers.delete(id);
+        // A NATURAL exit (crash / process end) emits no final AgentEvent either, so the
+        // renderer would latch the desk on "working" forever. Emit the same synthetic terminal
+        // `stop` kill() does, so a desk that dies on its own also clears immediately (parity).
+        this.emitStop(id, 'worker exited');
+        this.deps.onWorkerExit(id);
+      },
       onDrainRequest: async (id) => this.deps.drainForStop(id),
       onToolRequest: this.deps.executeToolFor
         ? async (id, req) => this.deps.executeToolFor!(id, req)
@@ -143,21 +150,29 @@ export class NativeRuntime {
     if (!worker) return { ok: false, error: 'no native runtime for agent' };
     worker.kill();
     this.workers.delete(agentId); // idempotent with onExit — don't wait on the exit event
-    // The worker dies mid-turn with NO final event (process.exit), so the folded
-    // transcript's open turn would stay 'pending' and blink "working…" forever. Emit a
-    // synthetic terminal `stop` through the SAME bridge sink the worker uses — the fold
-    // treats `stop` as a global terminal signal (settles open turns) and it's persisted,
-    // so the indicator clears immediately AND after a reload.
+    // The worker dies mid-turn with NO final event (process.exit), so emit a synthetic terminal
+    // `stop` immediately (don't wait on the async exit event). onExit will also emit one when the
+    // process actually ends — a harmless idempotent second terminal (status idle / turn cleared).
+    this.emitStop(agentId, 'stopped by operator');
+    return { ok: true };
+  }
+
+  /**
+   * Emit a synthetic terminal `stop` through the SAME bridge sink the worker uses. The fold
+   * treats `stop` as a global terminal signal (settles open turns) and it's persisted, so a
+   * desk's "working" indicator clears immediately AND after a reload. Used for BOTH operator
+   * kill and natural/crash exit (a native worker dies via process.exit with no final event).
+   */
+  private emitStop(agentId: string, reason: string): void {
     this.deps.onAgentEvent?.({
       v: AGENT_EVENT_VERSION,
       agentId,
       sessionId: null,
       ts: Date.now(),
       kind: 'stop',
-      reason: 'stopped by operator',
+      reason,
       stopActive: true
     });
-    return { ok: true };
   }
 
   killAll(): void {

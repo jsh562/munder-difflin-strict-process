@@ -141,6 +141,12 @@ export class HiveManager {
    *  un-started feature; qc ping fires unless we can confirm `.qc-passed`). */
   private featureStatusFor: (repo: string | null, feature: string) => FeatureStatus | null = () => null;
   setFeatureStatusResolver(fn: (repo: string | null, feature: string) => FeatureStatus | null): void { this.featureStatusFor = fn; }
+
+  /** Is a desk actually RUNNING right now (a live worker/PTY), injected by the main process?
+   *  Lets task routing prefer a LIVE role-holder over a dead/idle one. Default returns false (no
+   *  resolver ⇒ no preference; routing falls back to all eligible holders — today's behavior). */
+  private isRunning: (id: string) => boolean = () => false;
+  setRunningResolver(fn: (id: string) => boolean): void { this.isRunning = fn; }
   /** SDDP planner-kickoff dedupe: feature keys (`project::feature`) already nudged to a planner
    *  this session, so a feature lacking tasks.md is nudged ONCE (not on every board write). */
   private nudgedPlannerFeatures = new Set<string>();
@@ -755,7 +761,13 @@ export class HiveManager {
     const project = task.assignee ? this.repoFor(task.assignee) : null;
     const sameProject = project ? holders.filter((a) => this.repoFor(a.id) === project) : [];
     const chosen = sameProject.length ? sameProject : holders;
-    if (chosen.length) return chosen.map((a) => a.id).sort();
+    if (chosen.length) {
+      // Prefer LIVE holders so a card routes to a desk that's actually up — not a dead/idle one
+      // (the operator's "the integrator is there but the god can't find/use it" case). When none
+      // of the eligible holders are running, fall back to all of them (so the work still routes).
+      const running = chosen.filter((a) => this.isRunning(a.id));
+      return (running.length ? running : chosen).map((a) => a.id).sort();
+    }
     // Zero dedicated holders for the project ⇒ the god is the standing fallback — EXCEPT the SDDP
     // planner/qc phases (godFallback=false), where the operator's rule is "no role-holder ⇒ nobody
     // does it" (the god is a delegator that can't author specs or run QC).

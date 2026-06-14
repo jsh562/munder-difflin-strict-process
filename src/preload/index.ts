@@ -601,6 +601,15 @@ const api = {
   setBreakerState: (state: BreakerState): Promise<{ ok: boolean }> =>
     ipcRenderer.invoke('control:setBreakerState', state),
 
+  /** Subscribe to the authoritative live fleet state (per-desk running + in-a-turn), pushed on
+   *  the fleet-snapshot beat. The renderer reconciles each desk's status from it so a stale
+   *  "working" badge self-heals. Returns an unsubscribe fn. */
+  onFleetState: (cb: (state: { id: string; running: boolean; inTurn: boolean }[]) => void): (() => void) => {
+    const listener = (_e: IpcRendererEvent, payload: { id: string; running: boolean; inTurn: boolean }[]) => cb(payload);
+    ipcRenderer.on('fleet:state', listener);
+    return () => ipcRenderer.removeListener('fleet:state', listener);
+  },
+
   // ─── Operator control over agents (#7C.1–7C.3) ──────────────────────────────
   /** Pause/unpause an agent — paused → its tool calls are denied at PreToolUse. */
   controlPause: (agentId: string, on: boolean): Promise<AgentControlSnapshot | null> =>
