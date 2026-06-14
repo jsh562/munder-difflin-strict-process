@@ -211,7 +211,7 @@ export function OfficeFloor() {
         const bw = Math.min(boardZone.width, 4) * ts;
         const bh = 1.6 * ts;
         const bx = (boardZone.x + Math.max(0, (boardZone.width - 4) / 2)) * ts;
-        const by = boardZone.y * ts - bh * 0.2;
+        const by = boardZone.y * ts - (bh * 1.2);
         const board = new Container();
         board.position.set(bx, by);
         const g = new Graphics();
