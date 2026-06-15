@@ -30,7 +30,7 @@ import { COMMAND_GROUPS } from '../shared/claudeCommands';
 // The mailbox + task-ledger vocabulary is owned by @jsh562/won-agent-core (so the extracted
 // coding toolkit is host-agnostic); re-exported below so existing `import { HiveMessage }
 // from '../hive'` consumers across the app are unchanged.
-import { reconcileBlocked, roleCanEditCode, roleAuthorsCode, roleCanWriteFiles, canIntegrate, canReview, boardCapabilityLine } from '@jsh562/won-agent-core';
+import { reconcileBlocked, roleCanEditCode, roleAuthorsCode, roleCanWriteFiles, canIntegrate, canReview, boardCapabilityLine, advanceMilestones } from '@jsh562/won-agent-core';
 import type { MessageAct, HiveMessage, HiveTask, AgentRole, FeatureStatus } from '@jsh562/won-agent-core';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -141,6 +141,12 @@ export class HiveManager {
    *  un-started feature; qc ping fires unless we can confirm `.qc-passed`). */
   private featureStatusFor: (repo: string | null, feature: string) => FeatureStatus | null = () => null;
   setFeatureStatusResolver(fn: (repo: string | null, feature: string) => FeatureStatus | null): void { this.featureStatusFor = fn; }
+
+  /** Notify the host SDDP engine that a feature's board state changed, so it can drive the next
+   *  milestone's sub-agent (the host-driven pipeline). Injected by the main process; default no-op
+   *  (no engine / non-SDDP). Fire-and-forget from the write path — never blocks single-committer. */
+  private pipelineTrigger: (repo: string | null, feature: string) => void = () => {};
+  setPipelineTrigger(fn: (repo: string | null, feature: string) => void): void { this.pipelineTrigger = fn; }
 
   /** Is a desk actually RUNNING right now (a live worker/PTY), injected by the main process?
    *  Lets task routing prefer a LIVE role-holder over a dead/idle one. Default returns false (no
@@ -879,8 +885,11 @@ export class HiveManager {
       if (!featureCards.has(key)) featureCards.set(key, t);
     }
     for (const [key, t] of featureCards) {
-      if (this.nudgedPlannerFeatures.has(key)) continue;
       const repo = t.project ?? (t.assignee ? this.repoFor(t.assignee) : null);
+      // Host SDDP engine: on every board change, nudge it per feature so it can drive the next
+      // host-milestone's sub-agent. Fire-and-forget (it debounces + locks); never break the write.
+      try { this.pipelineTrigger(repo, t.feature!); } catch { /* best-effort */ }
+      if (this.nudgedPlannerFeatures.has(key)) continue;
       const fstat = this.featureStatusFor(repo, t.feature!);
       if (fstat?.hasTasks) { this.nudgedPlannerFeatures.add(key); continue; } // planning done — stop checking
       // ONE planner per feature — multiple would clobber the SAME shared base specs/<feature>/.
@@ -906,6 +915,22 @@ export class HiveManager {
     this.appendLog({ kind: 'tasks', count: next.length });
     this.commit(`hive: tasks (${next.length})`);
     try { this.notifyTaskTransitions(prev, next); } catch (e) { console.error('[hive] task notify failed:', e); }
+  }
+
+  /** Advance a feature EPIC card's milestone checklist (mark `key` done + activate the next),
+   *  used by the host SDDP engine after a step's gate artifact lands. Reuses the shared pure
+   *  `advanceMilestones` transition, then `writeTasks` (which re-notifies → re-triggers the engine
+   *  to chain to the next step). No-op if the card/milestone isn't found. The GATE is the engine's
+   *  responsibility (it only calls this once the artifact exists / the step is skippable). */
+  advanceMilestone(epicId: string, key: string): void {
+    const tasks = this.taskList();
+    const idx = tasks.findIndex((t) => t.id === epicId);
+    if (idx < 0 || !tasks[idx].milestones) return;
+    const advanced = advanceMilestones(tasks[idx].milestones!, key);
+    if (!advanced) return;
+    const next = [...tasks];
+    next[idx] = { ...next[idx], milestones: advanced };
+    this.writeTasks(next);
   }
   memory(id: string): string {
     const p = join(this.agentDir(id), 'memory.md');

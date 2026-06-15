@@ -35,6 +35,7 @@ import { createNativeEventBridge, loadNativeEvents } from './runtime/nativeEvent
 import { makeElectronWorkerTransport } from './runtime/electronWorkerTransport';
 import { runOneShotSubAgent, subAgentChildId, resolveSubAgentModel } from './runtime/subAgentRunner';
 import { nativeSddpGodPrompt, nativeSddpRolePrompt } from './sddpPrompts';
+import { SddpPipeline } from './sddpPipeline';
 import { executeAgentTool, subAgentSpec, SUB_AGENT_NAMES, type AgentToolDeps, type FeatureStatus } from '@jsh562/won-agent-core';
 import { redactConfig, injectionEnvForProvider, keyPresence, setKeyInConfig, clearKeyInConfig, WEB_SEARCH_KEY_ID, NATIVE_PROVIDER_MODEL_ENV, type SafeConfig } from './credentials';
 import { searchWebDuckDuckGo } from './webSearch';
@@ -824,6 +825,36 @@ const nativeRuntime = new NativeRuntime({
   maxConcurrent: 15,
   maxOldSpaceMb: 512
 });
+
+// Host-driven SDDP engine — when the floor is in SDDP mode, it DRIVES the sub-agents per phase
+// (the milestone checklist is the program; this is the interpreter). It runs each host-driven
+// milestone's specialist AS the feature epic's owner desk (inheriting its provider/model + holding
+// the feature card), gates on the real artifact, and advances — chaining via writeTasks. Wired to
+// the hive's board-change trigger below. All host concerns are the same deps the toolkit uses.
+const sddpPipeline = new SddpPipeline({
+  enabled: () => readConfig().sddpMode === true,
+  listTasks: () => {
+    const ledger = hive.tasks() as { tasks?: HiveTask[] } | undefined;
+    return Array.isArray(ledger?.tasks) ? ledger!.tasks : [];
+  },
+  repoForEpic: (epic) => epic.project ?? (epic.assignee ? repoForId(epic.assignee) : null),
+  // Usable owner = a SPAWNED native (non-Claude) desk with a recorded model — so the host can run
+  // the phase specialists as it (creds + model), and it holds the feature card (the epic itself).
+  ownerUsable: (id) => {
+    const provider = agentProviderIds.get(id);
+    return !!provider && provider !== 'anthropic' && !!agentModels.get(id);
+  },
+  featureArtifactExists: (repo, feature, relPath) => agentToolDeps.featureArtifactExists!(repo, feature, relPath),
+  spawnSubAgent: (callerId, name, input) => agentToolDeps.spawnSubAgent!(callerId, name, input),
+  advanceMilestone: (epicId, key) => hive.advanceMilestone(epicId, key),
+  escalate: (feature, message) => {
+    try { hive.send({ to: 'god', act: 'request', needs_human: true, subject: `SDDP pipeline — ${feature}`, body: message }, 'system'); }
+    catch (e) { console.error('[sddp-pipeline] escalate failed:', e); }
+  },
+  log: (m) => console.log(m)
+});
+// The hive fires this per feature on every board change (fire-and-forget); the engine debounces.
+hive.setPipelineTrigger((repo, feature) => sddpPipeline.schedule(repo, feature));
 
 /** Keep the system from suspending the harness while agents are running.
  *  Windows Modern Standby suspends desktop apps (and their child `claude`
