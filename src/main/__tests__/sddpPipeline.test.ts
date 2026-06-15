@@ -102,11 +102,24 @@ describe('SddpPipeline.advanceFeature', () => {
 
   it('leaves a DESK step alone (no spawn) — the notifier pings the desk', async () => {
     const h = mkPipeline();
-    h.setTasks([epicWith('plan')]);                      // plan has no sub-agent → desk-driven
+    h.setTasks([epicWith('spec')]);                      // spec is desk-driven (authored by a desk/human until P3)
     await h.pipeline.advanceFeature('S:/repo', '00001');
     expect(h.spawns).toHaveLength(0);
-    expect(milestone(h.getTasks()[0], 'plan').status).toBe('active');
+    expect(milestone(h.getTasks()[0], 'spec').status).toBe('active');
     expect(h.escalations).toHaveLength(0);
+  });
+
+  it('drives the plan step via plan-author (now host) and advances on plan.md', async () => {
+    const h = mkPipeline();
+    h.setTasks([epicWith('plan')]);
+    h.setOnSpawn((name) => { if (name === 'plan-author') h.artifacts.add('00001/plan.md'); });
+
+    await h.pipeline.advanceFeature('S:/repo', '00001');
+
+    expect(h.spawns.map((s) => s.name)).toEqual(['plan-author']);
+    expect(h.spawns[0].input).toMatch(/Requirement Coverage Map/); // the plan template rode in the input
+    expect(milestone(h.getTasks()[0], 'plan').status).toBe('done');
+    expect(milestone(h.getTasks()[0], 'checklist').status).toBe('active');
   });
 
   it('escalates (and does NOT spawn) when the epic has no usable native owner desk', async () => {
@@ -147,5 +160,13 @@ describe('buildStepInput', () => {
     expect(buildStepInput('data-model', '00001')).toMatch(/specs\/00001\/data-model\.md/);
     expect(buildStepInput('tasks', '00001')).toMatch(/specs\/00001\/tasks\.md/);
     expect(buildStepInput('contracts', '00001')).toMatch(/specs\/00001\/contracts\//);
+  });
+
+  it('prepends the step template for plan + tasks, but not for single-artifact steps', () => {
+    expect(buildStepInput('plan', '00001')).toMatch(/Author into THIS structure/);
+    expect(buildStepInput('plan', '00001')).toMatch(/Requirement Coverage Map/);
+    expect(buildStepInput('tasks', '00001')).toMatch(/Author into THIS structure/);
+    // data-model carries its format inline in the sub-agent prompt → no template appended
+    expect(buildStepInput('data-model', '00001')).not.toMatch(/Author into THIS structure/);
   });
 });

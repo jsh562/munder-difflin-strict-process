@@ -14,7 +14,7 @@
  * de-duped escalation when there's no usable owner desk or a step's artifact never lands. Never
  * throws into the caller (the hive write path is fire-and-forget into `schedule`).
  */
-import { milestoneDriver, type HiveTask } from '@jsh562/won-agent-core';
+import { milestoneDriver, templateForStep, type HiveTask } from '@jsh562/won-agent-core';
 
 export interface SddpPipelineDeps {
   /** Is the floor in SDDP mode? (read live) — the engine is inert when off. */
@@ -41,25 +41,38 @@ export interface SddpPipelineDeps {
 }
 
 /** Build the input handed to a host step's sub-agent — the deterministic `specs/<feature>/…` paths
- *  each specialist prompt expects. (P2 will also prepend the step's template content.) */
+ *  each specialist prompt expects, PLUS the step's structure template (when it has one — the engine
+ *  supplies templates as data rather than baking them into prompts). */
 export function buildStepInput(key: string, feature: string): string {
   const dir = `specs/${feature}`;
+  let task: string;
   switch (key) {
     case 'research':
-      return `Feature folder ${dir}/. Read ${dir}/spec.md. Research the open technical questions and write ${dir}/research.md.`;
+      task = `Feature folder ${dir}/. Read ${dir}/spec.md. Research the open technical questions and write ${dir}/research.md.`;
+      break;
     case 'data-model':
-      return `Feature folder ${dir}/. Read ${dir}/spec.md (and ${dir}/research.md if present). Design the data model and write ${dir}/data-model.md.`;
+      task = `Feature folder ${dir}/. Read ${dir}/spec.md (and ${dir}/research.md if present). Design the data model and write ${dir}/data-model.md.`;
+      break;
     case 'contracts':
-      return `Feature folder ${dir}/. Read ${dir}/spec.md and ${dir}/data-model.md if present. Generate the API contract under ${dir}/contracts/.`;
+      task = `Feature folder ${dir}/. Read ${dir}/spec.md and ${dir}/data-model.md if present. Generate the API contract under ${dir}/contracts/.`;
+      break;
     case 'adrs':
-      return `Feature folder ${dir}/. Read ${dir}/spec.md and the design so far. Record any significant architecture decisions under ${dir}/adrs/.`;
+      task = `Feature folder ${dir}/. Read ${dir}/spec.md and the design so far. Record any significant architecture decisions under ${dir}/adrs/.`;
+      break;
+    case 'plan':
+      task = `Feature folder ${dir}/. Read ${dir}/spec.md and the design artifacts (${dir}/data-model.md, ${dir}/contracts/, ${dir}/adrs/, ${dir}/research.md) as available. Assemble ${dir}/plan.md.`;
+      break;
     case 'checklist':
-      return `Feature folder ${dir}/. Read ${dir}/spec.md and ${dir}/plan.md. Generate a quality checklist under ${dir}/checklists/.`;
+      task = `Feature folder ${dir}/. Read ${dir}/spec.md and ${dir}/plan.md. Generate a quality checklist under ${dir}/checklists/.`;
+      break;
     case 'tasks':
-      return `Feature folder ${dir}/. Read ${dir}/spec.md and ${dir}/plan.md. Generate the implement task list and write ${dir}/tasks.md.`;
+      task = `Feature folder ${dir}/. Read ${dir}/spec.md and ${dir}/plan.md. Generate the implement task list and write ${dir}/tasks.md.`;
+      break;
     default:
-      return `Feature folder ${dir}/.`;
+      task = `Feature folder ${dir}/.`;
   }
+  const template = templateForStep(key);
+  return template ? `${task}\n\nAuthor into THIS structure (fill each section; replace inapplicable sections with "N/A — <reason>"):\n${template}` : task;
 }
 
 export class SddpPipeline {
