@@ -123,6 +123,42 @@ describe('runOneShotSubAgent', () => {
     expect(usage).toEqual([100]);
   });
 
+  it('aborts an in-flight run when the signal fires — kills the worker + resolves false', async () => {
+    const f = fakeTransport(() => { /* child never replies */ });
+    const ac = new AbortController();
+    const p = runOneShotSubAgent({
+      callerId: 'planner-1',
+      childId: 'sub:planner-1:abort:1',
+      input: 'go',
+      transportFactory: () => f.transport,
+      executeTool: async () => ({ content: '', success: true }),
+      signal: ac.signal,
+      timeoutMs: 5000
+    });
+    ac.abort();
+    const res = await p;
+    expect(res.success).toBe(false);
+    expect(res.content).toMatch(/aborted by operator/);
+    expect(f.killed()).toBe(true);
+  });
+
+  it('a pre-aborted signal resolves immediately without forking a worker', async () => {
+    const ac = new AbortController();
+    ac.abort();
+    let forked = false;
+    const res = await runOneShotSubAgent({
+      callerId: 'planner-1',
+      childId: 'sub:planner-1:abort:2',
+      input: 'go',
+      transportFactory: () => { forked = true; return fakeTransport(() => {}).transport; },
+      executeTool: async () => ({ content: '', success: true }),
+      signal: ac.signal
+    });
+    expect(res.success).toBe(false);
+    expect(res.content).toMatch(/aborted by operator/);
+    expect(forked).toBe(false);
+  });
+
   it('childIds are unique per spawn (no collision under the same caller+name)', () => {
     const a = subAgentChildId('planner-1', 'database-administrator');
     const b = subAgentChildId('planner-1', 'database-administrator');

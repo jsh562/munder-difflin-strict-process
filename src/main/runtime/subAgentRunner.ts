@@ -76,6 +76,9 @@ export interface OneShotSubAgentParams {
   onEvent?: (event: AgentEvent) => void;
   /** Wall-clock budget; defaults to DEFAULT_SUBAGENT_TIMEOUT_MS. */
   timeoutMs?: number;
+  /** Operator abort (e.g. the SDDP pipeline `stopped` a step): when it fires, the ephemeral worker
+   *  is killed mid-run and the call resolves `{ success:false, content:'(aborted by operator)' }`. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -106,17 +109,27 @@ function drive(params: OneShotSubAgentParams): Promise<{ content: string; succes
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
     let worker: NativeAgentWorker | null = null;
+    const signal = params.signal;
+    let onAbort: (() => void) | null = null;
 
     const collected = () => textParts.join('\n').trim();
     const finish = (content: string, success: boolean): void => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      if (onAbort && signal) signal.removeEventListener('abort', onAbort);
       // A completed loop leaves the utilityProcess IDLE (it waits for more commands), so kill it
       // explicitly to free the process. Idempotent with the worker's own exit handling.
       try { worker?.kill(); } catch { /* already gone */ }
       resolve({ content, success });
     };
+
+    // Operator abort → kill the worker mid-run + resolve as a clean failure.
+    if (signal?.aborted) { resolve({ content: '(aborted by operator)', success: false }); return; }
+    if (signal) {
+      onAbort = () => finish('(aborted by operator)', false);
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
 
     worker = new NativeAgentWorker({
       agentId: params.childId,

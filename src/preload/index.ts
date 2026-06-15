@@ -465,6 +465,9 @@ const api = {
   // SDDP: a feature's on-disk phase markers under <repo>/specs/<feature>/ (null when absent).
   hiveFeatureStatus: (repo: string | null, feature: string): Promise<FeatureStatus | null> =>
     ipcRenderer.invoke('hive:featureStatus', repo, feature),
+  // SDDP host engine's per-feature live step status (active step + running/waiting/paused/blocked).
+  pipelineStatus: (): Promise<Record<string, { step: string | null; state: string; message?: string }>> =>
+    ipcRenderer.invoke('pipeline:status'),
   hiveLog: (n?: number): Promise<unknown[]> => ipcRenderer.invoke('hive:log', n ?? 200),
   hiveMemory: (id: string): Promise<string> => ipcRenderer.invoke('hive:memory', id),
   hiveInbox: (id: string): Promise<HiveMessage[]> => ipcRenderer.invoke('hive:inbox', id),

@@ -16,6 +16,16 @@
  */
 import { milestoneDriver, templateForStep, type HiveTask, type FeatureMilestone } from '@jsh562/won-agent-core';
 
+/** What the engine is doing for a feature's active step (the per-step monitor surfaced to the UI). */
+export type StepState = 'running' | 'waiting' | 'paused' | 'stopped' | 'manual' | 'blocked' | 'done';
+export interface FeatureEngineStatus {
+  /** The active milestone key, or null when the pipeline is complete. */
+  step: string | null;
+  state: StepState;
+  /** Optional detail (e.g. the blocker/escalation reason). */
+  message?: string;
+}
+
 export interface SddpPipelineDeps {
   /** Is the floor in SDDP mode? (read live) — the engine is inert when off. */
   enabled(): boolean;
@@ -31,8 +41,9 @@ export interface SddpPipelineDeps {
   ownerUsable(ownerId: string): boolean;
   /** Does the step's gate artifact exist under `<repo>/specs/<feature>/`? */
   featureArtifactExists(repo: string | null, feature: string, relPath: string): boolean;
-  /** Run a sub-agent ONCE as `callerId` (the one-shot runtime). Returns its final text. */
-  spawnSubAgent(callerId: string, name: string, input: string): Promise<{ content: string; success: boolean }>;
+  /** Run a sub-agent ONCE as `callerId` (the one-shot runtime). Returns its final text. The optional
+   *  `signal` lets the engine ABORT an in-flight run (operator `stopped` a step). */
+  spawnSubAgent(callerId: string, name: string, input: string, signal?: AbortSignal): Promise<{ content: string; success: boolean }>;
   /** Advance the epic's milestone checklist (mark `key` done + activate next) via the hive. */
   advanceMilestone(epicId: string, key: string): void;
   /** Seed the implement cards for a feature from its `tasks.md` (parse → one feature-tagged card
@@ -44,6 +55,10 @@ export interface SddpPipelineDeps {
   /** Relay a human-gated step's prompt to the operator (e.g. Clarify questions) — `needs_human`.
    *  Distinct from `escalate` (which is for blockers). */
   askHuman(feature: string, questions: string): void;
+  /** Find a usable native desk holding `role` (planner/worker) to assign work to, or null. (P5b) */
+  findDeskForRole?(role: string): string | null;
+  /** Assign a card to a desk (writeTasks the assignee). (P5b — epic→planner, implement→workers.) */
+  assignCard?(cardId: string, deskId: string): void;
   /** Optional diagnostic log. */
   log?(message: string): void;
   /** Debounce window for `schedule` (ms); default 1500. */
@@ -97,8 +112,27 @@ export class SddpPipeline {
   private readonly inflight = new Set<string>();   // `${feature}::${key}` currently running
   private readonly escalated = new Set<string>();  // features already escalated (dedupe)
   private readonly asked = new Set<string>();      // human-gated steps already relayed to the operator
+  private readonly aborters = new Map<string, AbortController>(); // `${feature}::${key}` → abort handle
+  private readonly status = new Map<string, FeatureEngineStatus>(); // feature → engine status (monitor)
 
   constructor(private readonly deps: SddpPipelineDeps) {}
+
+  /** The engine's current status for a feature (for the UI monitor), or null if untracked. */
+  statusFor(feature: string): FeatureEngineStatus | null {
+    return this.status.get(feature) ?? null;
+  }
+  /** All per-feature engine statuses (for the `pipeline:status` IPC). */
+  statusAll(): Record<string, FeatureEngineStatus> {
+    return Object.fromEntries(this.status);
+  }
+  private setStatus(feature: string, step: string | null, state: StepState, message?: string): void {
+    this.status.set(feature, { step, state, ...(message ? { message } : {}) });
+  }
+  /** Abort an in-flight sub-agent run for a step (operator `stopped` it). */
+  private abortStep(feature: string, key: string): void {
+    const ac = this.aborters.get(`${feature}::${key}`);
+    if (ac) { try { ac.abort(); } catch { /* already gone */ } }
+  }
 
   /** Debounced entry the hive calls on every board change for a feature. */
   schedule(repo: string | null, feature: string): void {
@@ -121,21 +155,32 @@ export class SddpPipeline {
       const epic = this.deps.listTasks().find(
         (t) => t.feature === feature && Array.isArray(t.milestones) && t.milestones.length > 0
       );
-      if (!epic || !epic.milestones) return;
+      if (!epic || !epic.milestones) { this.status.delete(feature); return; }
       const r = this.deps.repoForEpic(epic);
 
-      const ownerId = epic.assignee;
-      if (!ownerId || !this.deps.ownerUsable(ownerId)) {
-        this.escalateOnce(feature, `SDDP pipeline can't run feature '${feature}': its epic card (${epic.id}) has no usable native owner desk. Assign it to a SPAWNED DeepSeek (non-Claude) desk with a model, so the host can run the phase specialists as it.`);
+      const active = epic.milestones.find((m) => m.status === 'active');
+      if (!active) { this.setStatus(feature, null, 'done'); return; } // pipeline complete
+
+      // PER-STEP OPERATOR CONTROL (read first — before any owner resolution / run). The operator
+      // sets this on the board pill (rides tasks.json). `paused`/`stopped`/`manual` short-circuit.
+      const control = active.control ?? 'auto';
+      if (control === 'paused') { this.setStatus(feature, active.key, 'paused'); return; }
+      if (control === 'stopped') { this.abortStep(feature, active.key); this.setStatus(feature, active.key, 'stopped'); return; }
+      if (control === 'manual') {
+        // Switched to manual: the engine doesn't run it — a desk/human authors the artifact; the
+        // engine just advances when it appears (like a tracked desk step).
+        this.setStatus(feature, active.key, 'manual');
+        if (active.gateArtifact && this.deps.featureArtifactExists(r, feature, active.gateArtifact)) {
+          this.deps.advanceMilestone(epic.id, active.key);
+        }
         return;
       }
 
-      const active = epic.milestones.find((m) => m.status === 'active');
-      if (!active) return;                                  // all done / none active
-
+      // — control === 'auto' —
       // HUMAN-GATED step (Clarify): a registry gate the operator can flip via `sddpAutopilot`.
       if (active.humanGated && active.subAgent) {
-        await this.runHumanGated(epic, active, ownerId);
+        const ownerId = this.resolveOwner(epic, feature, active.key);
+        if (ownerId) await this.runHumanGated(epic, active, ownerId);
         return;
       }
 
@@ -145,6 +190,10 @@ export class SddpPipeline {
         this.trackDistributed(epic, active, r);
         return;
       }
+
+      // HOST-DRIVEN author step — needs a usable owner desk to run the specialist as.
+      const ownerId = this.resolveOwner(epic, feature, active.key);
+      if (!ownerId) return;
 
       const lockKey = `${feature}::${active.key}`;
       if (this.inflight.has(lockKey)) return;               // already running this step
@@ -156,23 +205,48 @@ export class SddpPipeline {
       }
 
       this.inflight.add(lockKey);
+      const ac = new AbortController();
+      this.aborters.set(lockKey, ac);
+      this.setStatus(feature, active.key, 'running');
       try {
         const input = buildStepInput(active.key, feature, { request: epic.description ?? epic.title });
-        const res = await this.deps.spawnSubAgent(ownerId, active.subAgent, input);
+        const res = await this.deps.spawnSubAgent(ownerId, active.subAgent, input, ac.signal);
         if (this.deps.featureArtifactExists(r, feature, active.gateArtifact)) {
           this.escalated.delete(feature);                   // made progress — clear any stale escalation
           this.deps.advanceMilestone(epic.id, active.key);  // re-triggers the engine → chains to next step
+        } else if (ac.signal.aborted) {
+          this.setStatus(feature, active.key, 'stopped');   // operator aborted mid-run
         } else if (active.optional) {
           this.deps.advanceMilestone(epic.id, active.key);  // optional + nothing produced → N/A, skip on
         } else {
+          this.setStatus(feature, active.key, 'blocked', `${active.subAgent} produced no ${active.gateArtifact}`);
           this.escalateOnce(feature, `SDDP pipeline: ran '${active.subAgent}' for feature '${feature}' but specs/${feature}/${active.gateArtifact} did not appear.${res.success ? '' : ` Sub-agent error: ${res.content}`} Check the owner desk's provider/key, or produce that artifact manually.`);
         }
       } finally {
         this.inflight.delete(lockKey);
+        this.aborters.delete(lockKey);
       }
     } catch (e) {
       this.deps.log?.(`[sddp-pipeline] advanceFeature(${feature}) failed: ${e instanceof Error ? e.message : String(e)}`);
     }
+  }
+
+  /** Resolve a usable native owner desk to run the feature's specialists AS (the epic's assignee).
+   *  Returns null + escalates when there's none. (P5b extends this to AUTO-ASSIGN an available
+   *  planner desk before giving up.) */
+  private resolveOwner(epic: HiveTask, feature: string, stepKey: string): string | null {
+    const ownerId = epic.assignee;
+    if (ownerId && this.deps.ownerUsable(ownerId)) return ownerId;
+    // P5b: auto-assign an available planner desk here before escalating.
+    const planner = this.deps.findDeskForRole?.('planner') ?? null;
+    if (planner && this.deps.assignCard) {
+      this.deps.assignCard(epic.id, planner); // re-triggers the engine; next pass has a usable owner
+      this.setStatus(feature, stepKey, 'waiting', `assigned to ${planner}`);
+      return null;
+    }
+    this.setStatus(feature, stepKey, 'blocked', 'no usable native owner desk');
+    this.escalateOnce(feature, `SDDP pipeline can't run feature '${feature}': its epic card (${epic.id}) has no usable native owner desk. Assign it to a SPAWNED DeepSeek (non-Claude) desk with a model, so the host can run the phase specialists as it.`);
+    return null;
   }
 
   /** Run a HUMAN-GATED milestone (Clarify). Under autopilot: `spec-author` resolves the
@@ -197,12 +271,13 @@ export class SddpPipeline {
     }
 
     // Human-gated (default): relay the questions ONCE + wait for the operator to answer + advance.
-    if (this.asked.has(lockKey)) return;
+    if (this.asked.has(lockKey)) { this.setStatus(feature, active.key, 'waiting', 'awaiting clarification answers'); return; }
     this.inflight.add(lockKey);
     try {
       const res = await this.deps.spawnSubAgent(ownerId, active.subAgent!, buildStepInput(active.key, feature));
       this.asked.add(lockKey);
       this.deps.askHuman(feature, res.content);
+      this.setStatus(feature, active.key, 'waiting', 'awaiting clarification answers');
     } finally {
       this.inflight.delete(lockKey);
     }
@@ -231,6 +306,8 @@ export class SddpPipeline {
     if (markerPresent) {
       this.escalated.delete(feature);
       this.deps.advanceMilestone(epic.id, active.key);
+    } else {
+      this.setStatus(feature, active.key, 'waiting', active.key === 'implement' ? 'workers implementing' : 'awaiting QC');
     }
   }
 

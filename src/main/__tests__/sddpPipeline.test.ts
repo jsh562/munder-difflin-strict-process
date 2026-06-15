@@ -20,11 +20,12 @@ function epicWith(activeKey: string, assignee = 'dwight'): HiveTask {
 function mkPipeline() {
   let tasks: HiveTask[] = [];
   const artifacts = new Set<string>();           // `${feature}/${relPath}` present on "disk"
-  const spawns: { caller: string; name: string; input: string }[] = [];
+  const spawns: { caller: string; name: string; input: string; signal?: AbortSignal }[] = [];
   const escalations: { feature: string; message: string }[] = [];
   const asks: { feature: string; questions: string }[] = [];
   const seeds: string[] = [];                     // epic ids the engine asked to seed cards for
-  const state = { enabled: true, ownerUsable: true, autopilot: false, seedCount: 2 };
+  const assigns: { cardId: string; deskId: string }[] = [];
+  const state = { enabled: true, ownerUsable: true, autopilot: false, seedCount: 2, plannerDesk: null as string | null };
   let onSpawn: (name: string) => void = () => {}; // simulate what a sub-agent writes
   let gate: Promise<void> | null = null;          // optional latch to hold a spawn open (lock test)
 
@@ -35,12 +36,14 @@ function mkPipeline() {
     repoForEpic: () => 'S:/repo',
     ownerUsable: () => state.ownerUsable,
     featureArtifactExists: (_r, feature, rel) => artifacts.has(`${feature}/${rel}`),
-    spawnSubAgent: async (caller, name, input) => {
-      spawns.push({ caller, name, input });
+    spawnSubAgent: async (caller, name, input, signal) => {
+      spawns.push({ caller, name, input, signal });
       if (gate) await gate;
       onSpawn(name);
       return { content: 'ok', success: true };
     },
+    findDeskForRole: (role) => (role === 'planner' ? state.plannerDesk : null),
+    assignCard: (cardId, deskId) => { assigns.push({ cardId, deskId }); },
     advanceMilestone: (epicId, key) => {
       const i = tasks.findIndex((t) => t.id === epicId);
       if (i < 0 || !tasks[i].milestones) return;
@@ -60,7 +63,7 @@ function mkPipeline() {
   };
   const pipeline = new SddpPipeline(deps);
   return {
-    pipeline, artifacts, spawns, escalations, asks, seeds, state,
+    pipeline, artifacts, spawns, escalations, asks, seeds, assigns, state,
     setTasks: (t: HiveTask[]) => { tasks = t; },
     getTasks: () => tasks,
     setOnSpawn: (fn: (name: string) => void) => { onSpawn = fn; },
@@ -69,6 +72,8 @@ function mkPipeline() {
 }
 
 const milestone = (t: HiveTask, key: string) => t.milestones!.find((m) => m.key === key)!;
+const withControl = (epic: HiveTask, key: string, control: NonNullable<FeatureMilestone['control']>): HiveTask =>
+  ({ ...epic, milestones: epic.milestones!.map((m) => (m.key === key ? { ...m, control } : m)) });
 
 describe('SddpPipeline.advanceFeature', () => {
   it('runs the active host step\'s sub-agent, then advances after the gate artifact lands + activates the next', async () => {
@@ -252,6 +257,67 @@ describe('SddpPipeline.advanceFeature', () => {
     await Promise.all([p1, p2]);
 
     expect(h.spawns).toHaveLength(1);
+  });
+});
+
+describe('SddpPipeline per-step control + auto-assign (P5)', () => {
+  it('paused: the engine neither runs nor advances the step', async () => {
+    const h = mkPipeline();
+    h.setTasks([withControl(epicWith('data-model'), 'data-model', 'paused')]);
+    await h.pipeline.advanceFeature('S:/repo', '00001');
+    expect(h.spawns).toHaveLength(0);
+    expect(milestone(h.getTasks()[0], 'data-model').status).toBe('active');
+    expect(h.pipeline.statusFor('00001')?.state).toBe('paused');
+  });
+
+  it('manual: the engine skips the run + advances when the artifact appears (a desk authored it)', async () => {
+    const h = mkPipeline();
+    h.setTasks([withControl(epicWith('data-model'), 'data-model', 'manual')]);
+    await h.pipeline.advanceFeature('S:/repo', '00001');
+    expect(h.spawns).toHaveLength(0);                                  // engine did not run it
+    expect(milestone(h.getTasks()[0], 'data-model').status).toBe('active'); // no artifact yet → wait
+    h.artifacts.add('00001/data-model.md');                            // a desk/human wrote it
+    await h.pipeline.advanceFeature('S:/repo', '00001');
+    expect(h.spawns).toHaveLength(0);
+    expect(milestone(h.getTasks()[0], 'data-model').status).toBe('done'); // engine advanced on the artifact
+  });
+
+  it('stopped: aborts the in-flight sub-agent run', async () => {
+    const h = mkPipeline();
+    const epic = epicWith('data-model');
+    h.setTasks([epic]);
+    let release!: () => void;
+    h.setGate(new Promise<void>((r) => { release = r; }));
+    const p1 = h.pipeline.advanceFeature('S:/repo', '00001');         // auto → spawns, held by the gate
+    const sig = h.spawns[0].signal!;
+    expect(sig.aborted).toBe(false);
+    h.setTasks([withControl(epic, 'data-model', 'stopped')]);          // operator stops the step
+    await h.pipeline.advanceFeature('S:/repo', '00001');              // stopped branch → abort the in-flight run
+    expect(sig.aborted).toBe(true);
+    release();
+    await p1;
+  });
+
+  it('auto-assign: an epic with no usable owner is assigned to an available planner desk', async () => {
+    const h = mkPipeline();
+    h.state.ownerUsable = false;
+    h.state.plannerDesk = 'planner-x';
+    h.setTasks([epicWith('data-model')]);
+    await h.pipeline.advanceFeature('S:/repo', '00001');
+    expect(h.assigns).toEqual([{ cardId: 'epic-1', deskId: 'planner-x' }]);
+    expect(h.spawns).toHaveLength(0);                                  // waits for the next pass (now owned)
+    expect(h.escalations).toHaveLength(0);                             // assigned, not escalated
+  });
+
+  it('auto-assign: escalates only when there is no planner desk to assign', async () => {
+    const h = mkPipeline();
+    h.state.ownerUsable = false;
+    h.state.plannerDesk = null;
+    h.setTasks([epicWith('data-model')]);
+    await h.pipeline.advanceFeature('S:/repo', '00001');
+    expect(h.assigns).toHaveLength(0);
+    expect(h.escalations).toHaveLength(1);
+    expect(h.escalations[0].message).toMatch(/no usable native owner desk/);
   });
 });
 

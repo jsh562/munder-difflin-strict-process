@@ -36,7 +36,7 @@ import { makeElectronWorkerTransport } from './runtime/electronWorkerTransport';
 import { runOneShotSubAgent, subAgentChildId, resolveSubAgentModel } from './runtime/subAgentRunner';
 import { nativeSddpGodPrompt, nativeSddpRolePrompt } from './sddpPrompts';
 import { SddpPipeline } from './sddpPipeline';
-import { executeAgentTool, subAgentSpec, SUB_AGENT_NAMES, type AgentToolDeps, type FeatureStatus } from '@jsh562/won-agent-core';
+import { executeAgentTool, subAgentSpec, SUB_AGENT_NAMES, agentTaskBranch, type AgentToolDeps, type FeatureStatus } from '@jsh562/won-agent-core';
 import { redactConfig, injectionEnvForProvider, keyPresence, setKeyInConfig, clearKeyInConfig, WEB_SEARCH_KEY_ID, NATIVE_PROVIDER_MODEL_ENV, type SafeConfig } from './credentials';
 import { searchWebDuckDuckGo } from './webSearch';
 import { resolveBashEnv, describeBashEnv } from './bashShell';
@@ -585,69 +585,70 @@ const agentToolDeps: AgentToolDeps = {
   // + integrate + board mutation; low turn/hop caps; a turn budget; the runner adds a wall-clock
   // timeout + concurrency cap). The sub-run is VISIBLE on the caller's transcript as the
   // spawn_subagent tool call + its result; the child's token cost ROLLS UP to the caller (below).
-  spawnSubAgent: async (callerId, name, input) => {
-    const spec = subAgentSpec(name);
-    if (!spec) return { content: `unknown sub-agent '${name}' (available: ${SUB_AGENT_NAMES.join(', ')})`, success: false };
-    const providerId = agentProviderIds.get(callerId);
-    const callerModel = agentModels.get(callerId);
-    if (!providerId || providerId === 'anthropic' || !callerModel) {
-      return { content: 'spawn_subagent requires the calling desk to run on a native (non-Claude) provider with a model assigned', success: false };
-    }
-    const credEnv = injectionEnvForProvider(readConfig(), providerId);
-    if (!credEnv) return { content: `no stored credentials for provider '${providerId}' — the operator can add a key in Settings`, success: false };
-    // Sub-agent model: the operator's `sddpSubAgentModel` override when it maps to the SAME provider
-    // as the caller (so the caller's injected key still authenticates); otherwise the caller's own
-    // model. Provider + credentials are always the caller's.
-    const model = resolveSubAgentModel(callerModel, readConfig().sddpSubAgentModel, providerId, deriveProviderId);
-    // The child's denied tools: its role-derived denials PLUS the hard ones (no nesting, no merge,
-    // no board mutation — the calling desk owns the board). Enforced both by NOT advertising them
-    // and by the executor wrapper below (the execution gate uses caller roles, so re-check here).
-    const denySet = new Set<string>([...deniedNativeToolNames(spec.roles), 'spawn_subagent', 'hive_integrate', 'hive_update_task', 'hive_add_task']);
-    const childId = subAgentChildId(callerId, name);
-    const env: Record<string, string> = {
-      ...credEnv,
-      [NATIVE_PROVIDER_MODEL_ENV]: model,
-      NATIVE_AGENT_SUBAGENT_PROMPT: spec.systemPrompt,
-      NATIVE_AGENT_ENV_NOTE: describeBashEnv(),
-      NATIVE_AGENT_DENY_TOOLS: [...denySet].join(','),
-      // Bound the one-shot: a couple of turns, a dozen hops, a 2-minute turn budget.
-      NATIVE_AGENT_MAX_TURNS: '2',
-      NATIVE_AGENT_MAX_HOPS: '12',
-      NATIVE_AGENT_TURN_BUDGET_MS: '120000'
-    };
-    return runOneShotSubAgent({
-      callerId,
-      childId,
-      input,
-      transportFactory: () => makeElectronWorkerTransport({ agentId: childId, maxOldSpaceMb: 512, env }),
-      // Route the child's tool calls through the SAME governed path, but UNDER THE CALLER'S ID so
-      // cwd/repo/roles resolve to the caller (specs/ redirect + worktree correct for free). Deny
-      // the hard-denied tools here too (the advertised-catalog filter is the primary control).
-      executeTool: async (req) => {
-        if (denySet.has(req.toolName)) return { content: `a sub-agent may not call ${req.toolName}`, success: false };
-        return executeNativeToolFor(callerId, req);
-      },
-      // Observability: do NOT forward the raw child stream under a synthetic id (that created a
-      // phantom desk + an illegal agents/sub:… dir). Instead ROLL THE CHILD'S TOKEN COST UP to the
-      // calling desk via the telemetry collector, so the sub-agent's usage feeds the caller's cost
-      // ledger + breaker. The sub-run itself is already visible as the caller's spawn_subagent tool
-      // call (start) and its returned result (end).
-      onEvent: (event) => {
-        if (event.kind !== 'token-usage') return;
-        try {
-          telemetry.ingestNativeUsage({
-            agentId: callerId,
-            sessionId: event.sessionId ?? '',
-            providerName: deriveProviderId(event.model ?? undefined) ?? providerId,
-            requestModel: event.model ?? model,
-            responseModel: event.model ?? null,
-            tokens: { input: event.input, output: event.output, cacheRead: event.cacheRead, cacheCreation: event.cacheCreation }
-          });
-        } catch { /* best-effort cost rollup — never break the run */ }
-      }
-    });
-  }
+  spawnSubAgent: (callerId, name, input) => spawnSubAgentFor(callerId, name, input)
 };
+
+/**
+ * Fork + run one ephemeral sub-agent AS `callerId` (the native Task-tool replica). Shared by the
+ * `spawn_subagent` TOOL (`agentToolDeps.spawnSubAgent`, no signal) and the SDDP ENGINE (which passes
+ * a `signal` so it can ABORT a step's in-flight run when the operator stops it). Inherits the
+ * caller's provider+model, runs caller-scoped via `executeNativeToolFor(callerId)`, rolls the child's
+ * token cost up to the caller. Never throws — returns `{ success:false }` on any guard/error.
+ */
+async function spawnSubAgentFor(callerId: string, name: string, input: string, signal?: AbortSignal): Promise<{ content: string; success: boolean }> {
+  const spec = subAgentSpec(name);
+  if (!spec) return { content: `unknown sub-agent '${name}' (available: ${SUB_AGENT_NAMES.join(', ')})`, success: false };
+  const providerId = agentProviderIds.get(callerId);
+  const callerModel = agentModels.get(callerId);
+  if (!providerId || providerId === 'anthropic' || !callerModel) {
+    return { content: 'spawn_subagent requires the calling desk to run on a native (non-Claude) provider with a model assigned', success: false };
+  }
+  const credEnv = injectionEnvForProvider(readConfig(), providerId);
+  if (!credEnv) return { content: `no stored credentials for provider '${providerId}' — the operator can add a key in Settings`, success: false };
+  // Sub-agent model: the operator's `sddpSubAgentModel` override when it maps to the SAME provider as
+  // the caller (so the caller's injected key still authenticates); otherwise the caller's own model.
+  const model = resolveSubAgentModel(callerModel, readConfig().sddpSubAgentModel, providerId, deriveProviderId);
+  // The child's denied tools: its role-derived denials PLUS the hard ones (no nesting, no merge, no
+  // board mutation). Enforced by NOT advertising them + the executor wrapper below.
+  const denySet = new Set<string>([...deniedNativeToolNames(spec.roles), 'spawn_subagent', 'hive_integrate', 'hive_update_task', 'hive_add_task']);
+  const childId = subAgentChildId(callerId, name);
+  const env: Record<string, string> = {
+    ...credEnv,
+    [NATIVE_PROVIDER_MODEL_ENV]: model,
+    NATIVE_AGENT_SUBAGENT_PROMPT: spec.systemPrompt,
+    NATIVE_AGENT_ENV_NOTE: describeBashEnv(),
+    NATIVE_AGENT_DENY_TOOLS: [...denySet].join(','),
+    NATIVE_AGENT_MAX_TURNS: '2',
+    NATIVE_AGENT_MAX_HOPS: '12',
+    NATIVE_AGENT_TURN_BUDGET_MS: '120000'
+  };
+  return runOneShotSubAgent({
+    callerId,
+    childId,
+    input,
+    signal,
+    transportFactory: () => makeElectronWorkerTransport({ agentId: childId, maxOldSpaceMb: 512, env }),
+    executeTool: async (req) => {
+      if (denySet.has(req.toolName)) return { content: `a sub-agent may not call ${req.toolName}`, success: false };
+      return executeNativeToolFor(callerId, req);
+    },
+    // Roll the child's token cost up to the caller (the sub-run is visible as the caller's
+    // spawn_subagent tool call + result; we don't forward the raw child stream under a synthetic id).
+    onEvent: (event) => {
+      if (event.kind !== 'token-usage') return;
+      try {
+        telemetry.ingestNativeUsage({
+          agentId: callerId,
+          sessionId: event.sessionId ?? '',
+          providerName: deriveProviderId(event.model ?? undefined) ?? providerId,
+          requestModel: event.model ?? model,
+          responseModel: event.model ?? null,
+          tokens: { input: event.input, output: event.output, cacheRead: event.cacheRead, cacheCreation: event.cacheCreation }
+        });
+      } catch { /* best-effort cost rollup */ }
+    }
+  });
+}
 
 // The orchestrator ROLE injected into a NATIVE god's system prompt (Michael on a
 // non-Claude provider). The Claude god gets its role via `--append-system-prompt`
@@ -826,6 +827,21 @@ const nativeRuntime = new NativeRuntime({
   maxOldSpaceMb: 512
 });
 
+// Desks holding `role` that the host engine can run sub-agents AS (a SPAWNED native desk:
+// non-anthropic provider + a recorded model). Used to auto-assign the epic OWNER (a planner).
+function usableDesksForRole(role: AgentRole): string[] {
+  const agents = hive.registry().agents;
+  return Object.values(agents)
+    .filter((a) => a.archived !== true && (a.roles ?? []).includes(role))
+    .map((a) => a.id)
+    .filter((id) => { const p = agentProviderIds.get(id); return !!p && p !== 'anthropic' && !!agentModels.get(id); });
+}
+// Desks holding `role` (any non-archived — they run their own loop), for assigning WORK to (workers).
+function desksForRole(role: AgentRole): string[] {
+  const agents = hive.registry().agents;
+  return Object.values(agents).filter((a) => a.archived !== true && (a.roles ?? []).includes(role)).map((a) => a.id);
+}
+
 // Host-driven SDDP engine — when the floor is in SDDP mode, it DRIVES the sub-agents per phase
 // (the milestone checklist is the program; this is the interpreter). It runs each host-driven
 // milestone's specialist AS the feature epic's owner desk (inheriting its provider/model + holding
@@ -846,10 +862,11 @@ const sddpPipeline = new SddpPipeline({
     return !!provider && provider !== 'anthropic' && !!agentModels.get(id);
   },
   featureArtifactExists: (repo, feature, relPath) => agentToolDeps.featureArtifactExists!(repo, feature, relPath),
-  spawnSubAgent: (callerId, name, input) => agentToolDeps.spawnSubAgent!(callerId, name, input),
+  spawnSubAgent: (callerId, name, input, signal) => spawnSubAgentFor(callerId, name, input, signal),
   advanceMilestone: (epicId, key) => hive.advanceMilestone(epicId, key),
   // Seed the implement cards from tasks.md (deterministic — the same parse hive_import_tasks uses):
-  // one feature-tagged `todo` card per task, UNASSIGNED (the god routes them to workers).
+  // one feature-tagged `todo` card per task, ROUND-ROBIN ASSIGNED to worker desks (P5b) — falling
+  // back to unassigned when no worker desks exist (the god then routes them).
   seedImplementCards: (epic) => {
     const repo = epic.project ?? (epic.assignee ? repoForId(epic.assignee) : null);
     const feature = epic.feature;
@@ -858,19 +875,38 @@ const sddpPipeline = new SddpPipeline({
     if (parsed.length === 0) return 0;
     const ledger = hive.tasks() as { tasks?: HiveTask[] } | undefined;
     const existing = Array.isArray(ledger?.tasks) ? ledger!.tasks : [];
+    const workers = desksForRole('worker'); // round-robin across worker desks (cold ones wake on assign)
     const now = new Date().toISOString();
-    const created: HiveTask[] = parsed.map((p, i) => ({
-      id: `task-${Date.now()}-${existing.length + i}`,
-      title: p.taskId ? `${p.taskId} ${p.title}`.trim() : p.title,
-      status: 'todo',
-      dependsOn: [],
-      project: repo ?? undefined,
-      feature,
-      priority: 0,
-      createdAt: now
-    }));
+    const created: HiveTask[] = parsed.map((p, i) => {
+      const id = `task-${Date.now()}-${existing.length + i}`;
+      const assignee = workers.length ? workers[i % workers.length] : undefined;
+      return {
+        id,
+        title: p.taskId ? `${p.taskId} ${p.title}`.trim() : p.title,
+        assignee,
+        status: 'todo',
+        dependsOn: [],
+        project: assignee ? (repoForId(assignee) ?? repo ?? undefined) : (repo ?? undefined),
+        branch: assignee ? agentTaskBranch(assignee, id) : undefined,
+        feature,
+        priority: 0,
+        createdAt: now
+      };
+    });
     hive.writeTasks([...existing, ...created]);
     return created.length;
+  },
+  // Auto-assign helpers (P5b): the engine picks a usable planner desk to OWN the epic (run sub-agents
+  // as), and assigns it via assignCard.
+  findDeskForRole: (role) => usableDesksForRole(role as AgentRole)[0] ?? null,
+  assignCard: (cardId, deskId) => {
+    const ledger = hive.tasks() as { tasks?: HiveTask[] } | undefined;
+    const tasks = Array.isArray(ledger?.tasks) ? ledger!.tasks : [];
+    const idx = tasks.findIndex((t) => t.id === cardId);
+    if (idx < 0) return;
+    const next = [...tasks];
+    next[idx] = { ...next[idx], assignee: deskId, project: repoForId(deskId) ?? next[idx].project };
+    hive.writeTasks(next);
   },
   escalate: (feature, message) => {
     try { hive.send({ to: 'god', act: 'request', needs_human: true, subject: `SDDP pipeline — ${feature}`, body: message }, 'system'); }
@@ -1812,6 +1848,9 @@ ipcMain.handle('hive:featureStatus', (_evt, repo: unknown, feature: unknown) => 
   if (typeof feature !== 'string' || !feature.trim()) return null;
   return scanFeatureStatus(typeof repo === 'string' ? repo : null, feature);
 });
+// SDDP host engine's per-feature live status (the active step + running/waiting/paused/blocked) for
+// the milestone-pill monitor. Read-only; in-memory (not persisted).
+ipcMain.handle('pipeline:status', () => sddpPipeline.statusAll());
 ipcMain.handle('hive:log', (_evt, n: unknown) => hive.logTail(typeof n === 'number' ? n : 200));
 ipcMain.handle('hive:memory', (_evt, id: unknown) => (typeof id === 'string' ? hive.memory(id) : ''));
 ipcMain.handle('hive:inbox', (_evt, id: unknown) => (typeof id === 'string' ? hive.inbox(id) : []));

@@ -25,6 +25,15 @@ export interface FeatureMilestone {
   subAgent?: string;
   gateArtifact: string;
   status: 'pending' | 'active' | 'done';
+  /** Per-step operator control of the host engine (default 'auto'); set from the pill. */
+  control?: 'auto' | 'paused' | 'stopped' | 'manual';
+}
+
+/** SDDP host engine's live per-feature status (mirrors FeatureEngineStatus; from pipeline:status). */
+export interface FeatureEngineStatus {
+  step: string | null;
+  state: 'running' | 'waiting' | 'paused' | 'stopped' | 'manual' | 'blocked' | 'done';
+  message?: string;
 }
 
 export interface HiveTask {
@@ -143,7 +152,9 @@ function parseTasks(raw: unknown): HiveTask[] {
               subAgent: typeof m.subAgent === 'string' ? m.subAgent : undefined,
               gateArtifact: typeof m.gateArtifact === 'string' ? m.gateArtifact : '',
               status: (['pending', 'active', 'done'] as const).includes(m.status as FeatureMilestone['status'])
-                ? (m.status as FeatureMilestone['status']) : 'pending'
+                ? (m.status as FeatureMilestone['status']) : 'pending',
+              control: (['auto', 'paused', 'stopped', 'manual'] as const).includes(m.control as NonNullable<FeatureMilestone['control']>)
+                ? (m.control as FeatureMilestone['control']) : undefined
             }))
             .filter((m) => m.key)
         : undefined,
@@ -164,6 +175,8 @@ export function TasksKanban({ onAssign }: { onAssign: (prefill: string) => void 
   const [tasks, setTasks] = useState<HiveTask[]>([]);
   // SDDP: per-feature on-disk phase (keyed by feature folder), for the phase tracker banner.
   const [featureStatuses, setFeatureStatuses] = useState<Record<string, FeatureStatus | null>>({});
+  // SDDP: the host engine's live per-feature step status (running/waiting/paused/blocked), for the pills.
+  const [engineStatus, setEngineStatus] = useState<Record<string, FeatureEngineStatus>>({});
   const [adding, setAdding] = useState(false);
   // Transient confirmation after dispatching the god a board triage.
   const [triageMsg, setTriageMsg] = useState<string | null>(null);
@@ -197,6 +210,8 @@ export function TasksKanban({ onAssign }: { onAssign: (prefill: string) => void 
       );
       setFeatureStatuses(Object.fromEntries(entries));
     } catch { /* keep last good */ }
+    // The host engine's live per-feature step status (in-memory; for the pill monitor).
+    try { setEngineStatus(((await window.cth.pipelineStatus?.()) ?? {}) as Record<string, FeatureEngineStatus>); } catch { /* keep last good */ }
   }, [sddpMode]);
 
   useEffect(() => {
@@ -222,6 +237,14 @@ export function TasksKanban({ onAssign }: { onAssign: (prefill: string) => void 
 
   const setBlockedBy = useCallback((id: string, ids: string[]) => {
     persist(tasks.map((t) => (t.id === id ? { ...t, blockedBy: ids.length ? ids : undefined } : t)));
+  }, [tasks, persist]);
+
+  // SDDP per-step control: set a milestone's `control` on the epic card (the engine reads it on its
+  // next trigger). Rides the same writeTasks→poll loop as every other board mutation.
+  const setMilestoneControl = useCallback((epicId: string, stepKey: string, control: NonNullable<FeatureMilestone['control']>) => {
+    persist(tasks.map((t) => (t.id === epicId && t.milestones
+      ? { ...t, milestones: t.milestones.map((m) => (m.key === stepKey ? { ...m, control } : m)) }
+      : t)));
   }, [tasks, persist]);
 
   const titleFor = (tid: string): string => tasks.find((t) => t.id === tid)?.title ?? tid;
@@ -369,15 +392,21 @@ export function TasksKanban({ onAssign }: { onAssign: (prefill: string) => void 
             display: 'flex', flexDirection: 'column', gap: 5, padding: '7px 10px', flexShrink: 0,
             borderBottom: '1px solid var(--cth-ink-300)', background: 'var(--cth-cream-100)'
           }}>
-            {feats.map((f) => (
-              <FeatureBanner
-                key={f}
-                feature={f}
-                status={featureStatuses[f] ?? null}
-                cardCount={tasks.filter((t) => t.feature === f).length}
-                milestones={tasks.find((t) => t.feature === f && t.milestones && t.milestones.length > 0)?.milestones ?? null}
-              />
-            ))}
+            {feats.map((f) => {
+              const epic = tasks.find((t) => t.feature === f && t.milestones && t.milestones.length > 0) ?? null;
+              return (
+                <FeatureBanner
+                  key={f}
+                  feature={f}
+                  status={featureStatuses[f] ?? null}
+                  cardCount={tasks.filter((t) => t.feature === f).length}
+                  milestones={epic?.milestones ?? null}
+                  epicId={epic?.id ?? null}
+                  engine={engineStatus[f] ?? null}
+                  onSetControl={setMilestoneControl}
+                />
+              );
+            })}
           </div>
         );
       })()}
@@ -617,11 +646,14 @@ function TaskCard({ task, assigneeName, nameFor, orphanReason, flashing, blocker
 /** One feature's lifecycle tracker: the phase ladder (Specify → … → Integrate) with the
  *  current phase highlighted and completed phases ticked, derived from the on-disk markers.
  *  `status` null ⇒ the feature dir hasn't been created yet ("not started"). */
-function FeatureBanner({ feature, status, cardCount, milestones }: {
+function FeatureBanner({ feature, status, cardCount, milestones, epicId, engine, onSetControl }: {
   feature: string;
   status: FeatureStatus | null;
   cardCount: number;
   milestones?: FeatureMilestone[] | null;
+  epicId?: string | null;
+  engine?: FeatureEngineStatus | null;
+  onSetControl?: (epicId: string, stepKey: string, control: NonNullable<FeatureMilestone['control']>) => void;
 }) {
   const phase = status ? featurePhase(status) : null;
   const reachedIdx = phase ? SDDP_PHASES.indexOf(phase) : -1;
@@ -652,18 +684,45 @@ function FeatureBanner({ feature, status, cardCount, milestones }: {
         <span style={{ fontSize: 11, color: 'var(--cth-ink-500)' }}>{cardCount} card{cardCount === 1 ? '' : 's'}</span>
         {!status && <span style={{ fontSize: 11, color: 'var(--cth-ink-300)' }}>not started</span>}
       </div>
-      {/* The feature epic card's milestone checklist (the gated sub-agent pipeline), when present:
-          a read-only pill row beneath the phase ladder (✓ done / ▶ active / · pending). */}
+      {/* The feature epic card's milestone checklist (the gated sub-agent pipeline) — each pill shows
+          its status + the host engine's live state, and (on the active step / any non-auto step) a
+          control affordance: pause / stop (abort) / switch to manual / resume. */}
       {milestones && milestones.length > 0 && (
-        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3, flexWrap: 'wrap', paddingLeft: 2 }}>
-          {milestones.map((m) => (
-            <span key={m.key} title={`${m.label} — gate: specs/${feature}/${m.gateArtifact}${m.subAgent ? ` · sub-agent: ${m.subAgent}` : ''}`} style={{
-              padding: '0 5px', fontFamily: 'var(--cth-font-ui)', fontSize: 10,
-              background: m.status === 'active' ? 'var(--cth-lemon)' : m.status === 'done' ? 'var(--cth-mint)' : 'var(--cth-cream-200)',
-              boxShadow: `inset 0 0 0 1px ${m.status === 'active' ? 'var(--cth-ink-900)' : 'var(--cth-ink-300)'}`,
-              color: m.status === 'pending' ? 'var(--cth-ink-500)' : 'var(--cth-ink-900)'
-            }}>{m.status === 'done' ? '✓ ' : m.status === 'active' ? '▶ ' : '· '}{m.label}</span>
-          ))}
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, flexWrap: 'wrap', paddingLeft: 2 }}>
+          {milestones.map((m) => {
+            const ctrl = m.control ?? 'auto';
+            const isActive = m.status === 'active';
+            const eng = isActive && engine && engine.step === m.key ? engine.state : null;
+            const bg = ctrl === 'stopped' ? 'var(--cth-coral)'
+              : ctrl === 'manual' ? 'var(--cth-sky)'
+              : ctrl === 'paused' ? 'var(--cth-cream-200)'
+              : eng === 'blocked' ? 'var(--cth-coral)'
+              : m.status === 'active' ? 'var(--cth-lemon)'
+              : m.status === 'done' ? 'var(--cth-mint)' : 'var(--cth-cream-200)';
+            const glyph = m.status === 'done' ? '✓ '
+              : ctrl === 'paused' ? '⏸ ' : ctrl === 'stopped' ? '⏹ ' : ctrl === 'manual' ? '✋ '
+              : m.status === 'active' ? '▶ ' : '· ';
+            const engNote = eng === 'running' ? ' ⟳' : eng === 'blocked' ? ' ⚠' : eng === 'waiting' ? ' …' : '';
+            const showCtl = !!onSetControl && !!epicId && (isActive || ctrl !== 'auto');
+            const set = (c: NonNullable<FeatureMilestone['control']>) => { if (epicId) onSetControl?.(epicId, m.key, c); };
+            const ctlBtn = (label: string, c: NonNullable<FeatureMilestone['control']>, t: string) => (
+              <span role="button" title={t} onClick={() => set(c)}
+                style={{ cursor: 'pointer', padding: '0 3px', fontSize: 10, color: 'var(--cth-ink-700)', boxShadow: 'inset 0 0 0 1px var(--cth-ink-300)' }}>{label}</span>
+            );
+            return (
+              <span key={m.key} style={{ display: 'inline-flex', alignItems: 'center', gap: 2 }}>
+                <span title={`${m.label} — gate: specs/${feature}/${m.gateArtifact}${m.subAgent ? ` · ${m.subAgent}` : ''} · control: ${ctrl}${eng ? ` · engine: ${eng}${engine?.message ? ` (${engine.message})` : ''}` : ''}`} style={{
+                  padding: '0 5px', fontFamily: 'var(--cth-font-ui)', fontSize: 10,
+                  background: bg,
+                  boxShadow: `inset 0 0 0 1px ${m.status === 'active' ? 'var(--cth-ink-900)' : 'var(--cth-ink-300)'}`,
+                  color: m.status === 'pending' && ctrl === 'auto' ? 'var(--cth-ink-500)' : 'var(--cth-ink-900)'
+                }}>{glyph}{m.label}{engNote}</span>
+                {showCtl && (ctrl === 'auto'
+                  ? <>{ctlBtn('⏸', 'paused', 'pause this step')}{ctlBtn('⏹', 'stopped', 'stop (abort the running sub-agent)')}{ctlBtn('✋', 'manual', 'switch to manual — a desk/human does this step')}</>
+                  : ctlBtn('▶', 'auto', 'resume (back to auto)'))}
+              </span>
+            );
+          })}
         </span>
       )}
     </div>
