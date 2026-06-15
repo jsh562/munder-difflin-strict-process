@@ -344,6 +344,17 @@ const api = {
    *  delete-confirm warning. 0 when merged/missing. */
   gitBranchAhead: (repo: string, branch: string): Promise<number> =>
     ipcRenderer.invoke('git:branchAhead', repo, branch),
+  /** Per-worktree/agent health for the diagnostics table (one entry per registered repo). */
+  worktreeHealth: (): Promise<Array<{
+    repo: string; trunk: string; baseBranch: string | null; baseOnAgentBranch: boolean;
+    worktrees: Array<{ path: string; branch: string | null; head: string; isMain: boolean; locked: boolean; dirty: number; ahead: number; agentId: string | null; flags: string[] }>;
+  }>> => ipcRenderer.invoke('git:worktreeHealth'),
+  /** Move a desk's branch out of the base tree into its own worktree (stashes uncommitted state). */
+  migrateWorktree: (repo: string, branch: string): Promise<{ ok: boolean; stashed: boolean; error?: string }> =>
+    ipcRenderer.invoke('git:migrateWorktree', repo, branch),
+  /** Put a repo's base tree back on its trunk (clean-only). */
+  resetBaseToTrunk: (repo: string): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('git:resetBaseToTrunk', repo),
 
   // ─── Terminal.app ────────────────────────────────────────────────────────
   openTerminalAt: (cwd: string): Promise<{ ok: boolean; error?: string }> =>

@@ -217,16 +217,35 @@ export function agentBranchFor(wtPath: string): string {
   return agentBranchForId(wtPath.split(/[\\/]/).filter(Boolean).pop() ?? 'agent');
 }
 
-/** How many commits `branch` is AHEAD of the repo's base (current) branch — i.e. unmerged work
- *  that would be lost if the branch's worktree were deleted. 0 when merged, missing, or on error
- *  (best-effort: a failed/unknown branch never blocks the operator's delete). */
-export async function branchCommitsAhead(repo: string, branch: string): Promise<number> {
-  const br = await getBranch(repo);
-  const base = 'current' in br && br.current ? br.current : null;
-  if (!base || base === branch) return 0;
-  const res = await runGit(repo, ['rev-list', '--count', `${base}..${branch}`]);
+/** How many commits `branch` is AHEAD of the integration TRUNK — i.e. unmerged work that would be
+ *  lost if the branch's worktree were deleted. `base` defaults to `repoTrunk(repo)` (NOT the base
+ *  tree's possibly-stray current branch). 0 when merged, missing, or on error (best-effort: a
+ *  failed/unknown branch never blocks the operator's delete). */
+export async function branchCommitsAhead(repo: string, branch: string, base?: string): Promise<number> {
+  const trunk = base ?? await repoTrunk(repo);
+  if (!trunk || trunk === branch) return 0;
+  const res = await runGit(repo, ['rev-list', '--count', `${trunk}..${branch}`]);
   if (!res.ok) return 0;
   return parseInt(res.stdout.trim(), 10) || 0;
+}
+
+/**
+ * The repo's INTEGRATION TRUNK — the branch new agent worktrees should be based on, and the branch
+ * the base tree should sit on. Prefer the base tree's current branch when it's a real trunk (NOT an
+ * `agent/*` worktree branch — which would poison every new worktree); else a conventional `main`/
+ * `master`, else the first non-`agent/*` local branch; fallback `main`. Read-only.
+ */
+export async function repoTrunk(repo: string): Promise<string> {
+  const br = await getBranch(repo);
+  const current = 'current' in br && br.current ? br.current : null;
+  if (current && !current.startsWith('agent/')) return current;
+  const branches = await getBranches(repo);
+  if (!('error' in branches)) {
+    for (const cand of ['main', 'master']) if (branches.local.includes(cand)) return cand;
+    const firstNonAgent = branches.local.find((b) => !b.startsWith('agent/'));
+    if (firstNonAgent) return firstNonAgent;
+  }
+  return current ?? 'main';
 }
 
 /** Small deterministic hash (djb2 → base36) — repo-discriminates a worktree path when a
@@ -275,19 +294,23 @@ export function planWorktree(args: {
   return { action: 'create', path: target };
 }
 
-/** Provision an isolated git worktree for an agent at `wtPath`, branching off
- *  `baseBranch`. Tries to create a fresh `agent/<id>` branch first; if that
- *  branch already exists, falls back to checking out `baseBranch` directly. */
+/** Provision an isolated git worktree for an agent at `wtPath` on its `agent/<id>` branch. Creates
+ *  the branch fresh off `baseBranch` (the trunk); if the branch already EXISTS, attaches THAT branch
+ *  to the worktree (restart/reattach when only the branch survived). `inUse` is set when the branch
+ *  is checked out elsewhere (e.g. the base tree holds it) so the caller can degrade + surface a
+ *  migrate action instead of erroring. */
 export async function addWorktree(
   cwd: string, wtPath: string, baseBranch: string
-): Promise<{ ok: boolean; error?: string }> {
+): Promise<{ ok: boolean; error?: string; inUse?: boolean }> {
   const branch = agentBranchFor(wtPath);
   const fresh = await runGit(cwd, ['worktree', 'add', wtPath, '-b', branch, baseBranch]);
   if (fresh.ok) return { ok: true };
-  // Branch likely already exists (or the path is taken) — retry without -b.
-  const fallback = await runGit(cwd, ['worktree', 'add', wtPath, baseBranch]);
-  if (fallback.ok) return { ok: true };
-  return { ok: false, error: fallback.error };
+  // Branch already exists → attach IT (not the trunk) to the new worktree.
+  const attach = await runGit(cwd, ['worktree', 'add', wtPath, branch]);
+  if (attach.ok) return { ok: true };
+  const error = attach.error || fresh.error;
+  const inUse = /already (used|checked out)|already used by worktree/i.test(error);
+  return { ok: false, error, inUse };
 }
 
 /** Best-effort removal of an agent's worktree. Forced so a dirty tree doesn't
@@ -298,4 +321,119 @@ export async function removeWorktree(
   const res = await runGit(cwd, ['worktree', 'remove', '--force', wtPath]);
   if (res.ok) return { ok: true };
   return { ok: false, error: res.error };
+}
+
+// ─── Worktree diagnostics + recovery (Settings → Worktrees) ──────────────────
+
+/** A health flag for a worktree row in the operator diagnostics. */
+export type WorktreeFlag = 'main' | 'not-isolated' | 'dirty' | 'unmerged' | 'detached' | 'locked';
+
+export interface WorktreeHealthEntry {
+  path: string;
+  branch: string | null;
+  head: string;
+  isMain: boolean;
+  locked: boolean;
+  /** changed + staged + untracked file count in the worktree (0 = clean). */
+  dirty: number;
+  /** commits ahead of the trunk (unmerged work). */
+  ahead: number;
+  /** the desk id, when the branch is `agent/<id>`. */
+  agentId: string | null;
+  flags: WorktreeFlag[];
+}
+
+export interface RepoWorktreeHealth {
+  repo: string;
+  trunk: string;
+  /** the base tree's current branch (the integration target — should equal `trunk`). */
+  baseBranch: string | null;
+  /** true when the base tree is sitting on an `agent/*` branch (misconfigured integration target). */
+  baseOnAgentBranch: boolean;
+  worktrees: WorktreeHealthEntry[];
+}
+
+/** Pure flag classification (unit-tested) — keeps the diagnostics logic free of git I/O. */
+export function classifyWorktree(w: {
+  isMain: boolean; branch: string | null; dirty: number; ahead: number; locked: boolean;
+}): WorktreeFlag[] {
+  const flags: WorktreeFlag[] = [];
+  if (w.isMain) flags.push('main');
+  if (w.isMain && w.branch?.startsWith('agent/')) flags.push('not-isolated'); // an agent branch sits in the base tree
+  if (!w.branch) flags.push('detached');
+  if (w.dirty > 0) flags.push('dirty');
+  if (w.ahead > 0) flags.push('unmerged');
+  if (w.locked) flags.push('locked');
+  return flags;
+}
+
+/** The desk id behind an `agent/<id>` branch (else null). */
+function agentIdFromBranch(branch: string | null): string | null {
+  return branch && branch.startsWith('agent/') ? branch.slice('agent/'.length) : null;
+}
+
+/** Read-only health of every worktree of `repo` (for the operator diagnostics table). */
+export async function worktreeHealth(repo: string): Promise<RepoWorktreeHealth> {
+  const trunk = await repoTrunk(repo);
+  const br = await getBranch(repo);
+  const baseBranch = 'current' in br && br.current ? br.current : null;
+  const wts = await listWorktrees(repo);
+  const list = Array.isArray(wts) ? wts : [];
+  const worktrees: WorktreeHealthEntry[] = [];
+  for (const w of list) {
+    const st = await getStatus(w.path);
+    const dirty = 'error' in st ? 0 : st.staged.length + st.unstaged.length + st.untracked.length;
+    const ahead = w.branch && w.branch !== trunk ? await branchCommitsAhead(repo, w.branch, trunk) : 0;
+    worktrees.push({
+      path: w.path, branch: w.branch, head: w.head, isMain: w.isMain, locked: w.locked,
+      dirty, ahead, agentId: agentIdFromBranch(w.branch),
+      flags: classifyWorktree({ isMain: w.isMain, branch: w.branch, dirty, ahead, locked: w.locked })
+    });
+  }
+  return { repo, trunk, baseBranch, baseOnAgentBranch: !!baseBranch?.startsWith('agent/'), worktrees };
+}
+
+/**
+ * Move `branch` out of the base tree into its own worktree at `wtPath` ("put the desk where it
+ * belongs"). Preserves everything: any uncommitted base-tree state (incl. a wiped/staged-deleted
+ * dir) is STASHED (recoverable via `git stash`), the base tree is checked back onto the trunk, then
+ * the worktree is added on `branch` (its committed work intact). Only valid when the base tree
+ * currently holds `branch`. Best-effort + reported.
+ */
+export async function migrateBranchToWorktree(
+  repo: string, branch: string, wtPath: string
+): Promise<{ ok: boolean; stashed: boolean; error?: string }> {
+  const br = await getBranch(repo);
+  const current = 'current' in br && br.current ? br.current : null;
+  if (current !== branch) return { ok: false, stashed: false, error: `base tree is not on ${branch} (on ${current ?? 'detached HEAD'})` };
+  const trunk = await repoTrunk(repo);
+  if (trunk === branch) return { ok: false, stashed: false, error: `no trunk to move the base tree onto (only ${branch} exists)` };
+  const st = await getStatus(repo);
+  const dirty = !('error' in st) && (st.staged.length + st.unstaged.length + st.untracked.length) > 0;
+  let stashed = false;
+  if (dirty) {
+    const s = await runGit(repo, ['stash', 'push', '-u', '-m', `harness: migrate ${branch} to worktree`]);
+    if (!s.ok) return { ok: false, stashed: false, error: `stash failed: ${s.error}` };
+    stashed = true;
+  }
+  const co = await runGit(repo, ['checkout', trunk]);
+  if (!co.ok) return { ok: false, stashed, error: `checkout ${trunk} failed: ${co.error}` };
+  const add = await runGit(repo, ['worktree', 'add', wtPath, branch]);
+  if (!add.ok) return { ok: false, stashed, error: `worktree add failed: ${add.error}` };
+  return { ok: true, stashed };
+}
+
+/** Put the base tree back on the trunk — CLEAN-only (refuses if there are uncommitted changes, so
+ *  nothing is discarded; use `migrateBranchToWorktree`, which stashes, for a dirty base tree). */
+export async function resetBaseToTrunk(repo: string): Promise<{ ok: boolean; error?: string }> {
+  const trunk = await repoTrunk(repo);
+  const br = await getBranch(repo);
+  const current = 'current' in br && br.current ? br.current : null;
+  if (current === trunk) return { ok: true };
+  const st = await getStatus(repo);
+  const dirty = !('error' in st) && (st.staged.length + st.unstaged.length + st.untracked.length) > 0;
+  if (dirty) return { ok: false, error: 'base tree has uncommitted changes — resolve them first, or use Migrate (which stashes)' };
+  const co = await runGit(repo, ['checkout', trunk]);
+  if (!co.ok) return { ok: false, error: co.error };
+  return { ok: true };
 }

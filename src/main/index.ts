@@ -12,7 +12,8 @@ import { normalizeRepoPath, normalizedPathSet } from './paths';
 import {
   getBranch, getStatus, getLog, getBranches, getAheadBehind, isRepo,
   addWorktree, removeWorktree, listWorktrees, planWorktree, type GitWorktree,
-  previewMerge, mergeBranch, agentBranchFor, agentBranchForId, branchCommitsAhead
+  previewMerge, mergeBranch, agentBranchFor, agentBranchForId, branchCommitsAhead,
+  repoTrunk, worktreeHealth, migrateBranchToWorktree, resetBaseToTrunk
 } from './git';
 import { HiveManager, roleCanEditCode, canIntegrate as rolesCanIntegrate, canReview as rolesCanReview, boardCapabilityLine, type AgentMeta, type HiveMessage, type HiveTask, type AgentRole } from './hive';
 import { HookServer } from './hooks';
@@ -239,12 +240,15 @@ async function provisionWorktree(
     const plan = planWorktree({ wtRoot, agentId, origCwd, forceNew, registered, exists: existsSync });
     if (plan.action === 'skip') return null;
     if (plan.action === 'reattach') return { path: plan.path, origin: origCwd };
-    // create
-    const br = await getBranch(origCwd);
-    const baseBranch = 'current' in br && br.current ? br.current : 'main';
+    // create — base the new agent branch on the repo's TRUNK (never a stray agent/* branch the
+    // base tree might be sitting on, which would poison every new worktree).
+    const baseBranch = await repoTrunk(origCwd);
     const wt = await addWorktree(origCwd, plan.path, baseBranch);
     if (wt.ok) return { path: plan.path, origin: origCwd };
-    console.error('[worktree] addWorktree failed:', wt.error);
+    // Can't isolate (commonly: the desk's branch is checked out in the base tree — a legacy
+    // pre-isolation desk). Degrade to the shared base cwd; this is surfaced in Settings →
+    // Worktrees diagnostics with a one-click "migrate to worktree". Calm note, not an error.
+    console.log(`[worktree] note: ${agentId} runs in the base tree (couldn't isolate${wt.inUse ? ' — its branch is checked out there' : ''}). Fix via Settings → Worktrees.`);
     return null;
   } catch (e) {
     console.error('[worktree] provision failed:', e);
@@ -1420,6 +1424,32 @@ ipcMain.handle('git:removeWorktree', async (_evt, repo: unknown, wtPath: unknown
 ipcMain.handle('git:branchAhead', async (_evt, repo: unknown, branch: unknown) => {
   if (typeof repo !== 'string' || typeof branch !== 'string') return 0;
   return branchCommitsAhead(repo, branch);
+});
+// Per-worktree/agent health for the Settings → Worktrees diagnostics table (read-only): branch,
+// dirty/unmerged counts, and problem flags per worktree, for every registered repo + live origin.
+ipcMain.handle('git:worktreeHealth', async () => {
+  const repos = new Set<string>([...(readConfig().registeredRepos ?? []), ...worktreeOrigins.values()]);
+  const out = [];
+  for (const repo of repos) {
+    try { out.push(await worktreeHealth(repo)); } catch { /* skip an unreadable repo */ }
+  }
+  return out;
+});
+// Recovery: move a desk's branch out of the base tree into its own worktree (stashes any
+// uncommitted base-tree state). The target path mirrors provisionWorktree's primary path.
+ipcMain.handle('git:migrateWorktree', async (_evt, repo: unknown, branch: unknown) => {
+  if (typeof repo !== 'string' || typeof branch !== 'string') return { ok: false, stashed: false, error: 'invalid args' };
+  const id = branch.startsWith('agent/') ? branch.slice('agent/'.length) : branch;
+  const seg = id.replace(/[^A-Za-z0-9._-]/g, '-');
+  const wtPath = join(readConfig().harnessHome ?? repo, 'worktrees', seg);
+  const res = await migrateBranchToWorktree(repo, branch, wtPath);
+  if (res.ok) { worktreePaths.set(`pty-${id}`, wtPath); worktreeOrigins.set(`pty-${id}`, repo); }
+  return res;
+});
+// Recovery: put the base tree back on its trunk (clean-only; refuses a dirty tree).
+ipcMain.handle('git:resetBaseToTrunk', async (_evt, repo: unknown) => {
+  if (typeof repo !== 'string') return { ok: false, error: 'invalid args' };
+  return resetBaseToTrunk(repo);
 });
 
 // ─── IPC: clipboard ─────────────────────────────────────────────────────────

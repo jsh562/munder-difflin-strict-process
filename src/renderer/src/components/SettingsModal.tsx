@@ -95,44 +95,44 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
     await window.cth.updateConfig({ godWorkspace: undefined });
   };
 
-  // Worktrees — isolated agents' worktrees are kept on exit; let the operator review +
-  // bulk-delete stale ones. Loaded when the modal opens.
-  type Worktree = { repo: string; path: string; branch: string | null; head: string; isMain: boolean; locked: boolean };
-  const [worktrees, setWorktrees] = useState<Worktree[]>([]);
-  const [wtSelected, setWtSelected] = useState<Set<string>>(new Set());
+  // Worktrees diagnostics — per-repo, per-worktree health (branch, dirty/unmerged, problem flags)
+  // so the operator can SEE issues (e.g. a base tree stuck on an agent branch) and recover them.
+  type WtEntry = { path: string; branch: string | null; head: string; isMain: boolean; locked: boolean; dirty: number; ahead: number; agentId: string | null; flags: string[] };
+  type RepoHealth = { repo: string; trunk: string; baseBranch: string | null; baseOnAgentBranch: boolean; worktrees: WtEntry[] };
+  const [health, setHealth] = useState<RepoHealth[]>([]);
   const [wtBusy, setWtBusy] = useState(false);
-  // Armed when a delete press found unmerged work in the selection — requires a second
-  // (confirm) press so committed-but-unintegrated work isn't lost by accident.
-  const [wtConfirm, setWtConfirm] = useState<{ unmerged: number } | null>(null);
-  const loadWorktrees = async () => {
-    try { setWorktrees(await window.cth.listWorktrees()); } catch { setWorktrees([]); }
+  const [wtMsg, setWtMsg] = useState<string>('');
+  const [delArm, setDelArm] = useState<string | null>(null); // worktree path armed for an unmerged-confirm delete
+  const loadHealth = async () => {
+    try { setHealth(await window.cth.worktreeHealth()); } catch { setHealth([]); }
   };
-  useEffect(() => { void loadWorktrees(); }, []);
-  const toggleWt = (path: string) =>
-    setWtSelected((s) => { const n = new Set(s); if (n.has(path)) n.delete(path); else n.add(path); return n; });
-  // Changing the selection invalidates a pending confirm.
-  useEffect(() => { setWtConfirm(null); }, [wtSelected]);
-  const deleteSelectedWorktrees = async () => {
-    const selected = worktrees.filter((w) => wtSelected.has(w.path));
-    if (selected.length === 0) return;
-    setWtBusy(true);
+  useEffect(() => { void loadHealth(); }, []);
+  const agentNameFor = (id: string | null) => (id && useStore.getState().agents.find((a) => a.id === id)?.name) || id || '';
+  const migrateWt = async (repo: string, branch: string) => {
+    setWtBusy(true); setWtMsg('');
     try {
-      // First press: warn if any selected worktree's branch has commits not merged into base.
-      if (!wtConfirm) {
-        let unmerged = 0;
-        for (const wt of selected) {
-          if (wt.branch && (await window.cth.gitBranchAhead(wt.repo, wt.branch)) > 0) unmerged++;
-        }
-        if (unmerged > 0) { setWtConfirm({ unmerged }); return; } // arm — require a confirm press
-      }
-      // Armed (confirmed) or nothing unmerged → delete.
-      for (const wt of selected) {
-        await window.cth.removeWorktree(wt.repo, wt.path).catch(() => { /* best-effort; keep going */ });
-      }
-      setWtSelected(new Set());
-      setWtConfirm(null);
-      await loadWorktrees();
+      const r = await window.cth.migrateWorktree(repo, branch);
+      setWtMsg(r.ok ? `Migrated ${branch} to its worktree${r.stashed ? ' (uncommitted base-tree changes were stashed — recover/discard with `git stash` in the repo)' : ''}.` : `Migrate failed: ${r.error ?? 'unknown'}`);
+      await loadHealth();
     } finally { setWtBusy(false); }
+  };
+  const resetBase = async (repo: string) => {
+    setWtBusy(true); setWtMsg('');
+    try {
+      const r = await window.cth.resetBaseToTrunk(repo);
+      setWtMsg(r.ok ? 'Base tree reset to trunk.' : `Reset failed: ${r.error ?? 'unknown'}`);
+      await loadHealth();
+    } finally { setWtBusy(false); }
+  };
+  const deleteWt = async (repo: string, branch: string | null, path: string) => {
+    // First press on a branch with unmerged commits → arm a confirm (don't lose work silently).
+    if (delArm !== path && branch) {
+      const ahead = await window.cth.gitBranchAhead(repo, branch);
+      if (ahead > 0) { setDelArm(path); setWtMsg(`${branch} has ${ahead} unmerged commit(s) — click delete again to remove anyway.`); return; }
+    }
+    setWtBusy(true);
+    try { await window.cth.removeWorktree(repo, path); setDelArm(null); setWtMsg(''); await loadHealth(); }
+    finally { setWtBusy(false); }
   };
 
   // Project repos — the registered code repos the fleet works in (Add-Agent quick-picks,
@@ -614,34 +614,60 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
               </div>
               <div style={subLabelStyle}>The god's own neutral folder (native god) — not a project. The god reads the project repos and delegates; give it a role to have it edit/merge directly.</div>
 
-              {/* Worktrees — isolated agents' worktrees are kept on exit so committed work
-                  survives for integration/review; this is where you bulk-clean stale ones. */}
+              {/* Worktrees diagnostics — per repo, per worktree: branch, health flags, and recovery
+                  actions (migrate a desk's branch out of the base tree, reset base to trunk, delete). */}
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
                   <span style={{ width: 140, flexShrink: 0, color: 'var(--cth-ink-500)', fontSize: 14 }}>Worktrees</span>
                   <span style={{ flex: 1, fontSize: 13, color: 'var(--cth-ink-500)' }}>
-                    {worktrees.length === 0 ? 'none — isolated agents create these per repo' : `${worktrees.length} isolated worktree${worktrees.length === 1 ? '' : 's'}`}
+                    {health.length === 0 ? 'none — isolated agents create these per repo' : `${health.length} repo${health.length === 1 ? '' : 's'}`}
                   </span>
-                  <PixelButton variant="secondary" size="sm" onClick={() => void loadWorktrees()} disabled={wtBusy}>refresh</PixelButton>
-                  {wtSelected.size > 0 && (
-                    <span title={wtConfirm ? `${wtConfirm.unmerged} of these have commits not merged into base — click again to delete anyway` : undefined}>
-                      <PixelButton variant="destructive" size="sm" onClick={() => void deleteSelectedWorktrees()} disabled={wtBusy}>
-                        {wtBusy ? 'deleting…' : wtConfirm ? `confirm delete (${wtConfirm.unmerged} unmerged)` : `delete ${wtSelected.size}`}
-                      </PixelButton>
-                    </span>
-                  )}
+                  <PixelButton variant="secondary" size="sm" onClick={() => void loadHealth()} disabled={wtBusy}>refresh</PixelButton>
                 </div>
-                {worktrees.length > 0 && (
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 180, overflowY: 'auto', paddingLeft: 152 }}>
-                    {worktrees.map((w) => (
-                      <label key={w.path} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, cursor: 'pointer' }}>
-                        <input type="checkbox" checked={wtSelected.has(w.path)} onChange={() => toggleWt(w.path)} />
-                        <span style={{ fontFamily: 'var(--cth-font-mono, monospace)', color: 'var(--cth-ink-900)' }}>{w.branch ?? '(detached)'}</span>
-                        <span style={{ color: 'var(--cth-ink-500)', wordBreak: 'break-all' }}>{w.path}</span>
-                      </label>
+                {wtMsg && (
+                  <div style={{ paddingLeft: 152, fontSize: 12, color: 'var(--cth-ink-700)' }}>{wtMsg}</div>
+                )}
+                {health.map((h) => (
+                  <div key={h.repo} style={{ paddingLeft: 152, display: 'flex', flexDirection: 'column', gap: 3 }}>
+                    {/* repo header: name, trunk, and a warning when the base tree is on an agent branch */}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
+                      <span style={{ fontFamily: 'var(--cth-font-display)', fontSize: 8, color: 'var(--cth-ink-700)' }}>{h.repo.split(/[\\/]/).filter(Boolean).pop()}</span>
+                      <span style={{ color: 'var(--cth-ink-500)' }}>trunk: {h.trunk}</span>
+                      {h.baseOnAgentBranch && (
+                        <span title={`The integration base tree is on ${h.baseBranch}, not the trunk — migrate that desk to its own worktree.`}
+                          style={{ color: 'var(--cth-coral)' }}>⚠ base on {h.baseBranch}</span>
+                      )}
+                    </div>
+                    {h.worktrees.map((w) => (
+                      <div key={w.path} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, flexWrap: 'wrap' }}>
+                        <span style={{ fontFamily: 'var(--cth-font-mono, monospace)', color: 'var(--cth-ink-900)' }}>
+                          {w.branch ?? '(detached)'}
+                        </span>
+                        {w.agentId && <span style={{ color: 'var(--cth-ink-500)' }}>{agentNameFor(w.agentId)}</span>}
+                        {w.flags.filter((f) => f !== 'main').map((f) => (
+                          <span key={f} style={{
+                            padding: '0 5px', fontSize: 10, lineHeight: '15px',
+                            background: f === 'not-isolated' || f === 'detached' ? 'var(--cth-coral-light)' : f === 'unmerged' || f === 'dirty' ? 'var(--cth-lemon)' : 'var(--cth-cream-300)',
+                            boxShadow: 'inset 0 0 0 1px var(--cth-ink-300)', color: 'var(--cth-ink-900)'
+                          }}>{f === 'dirty' ? `dirty ${w.dirty}` : f === 'unmerged' ? `unmerged ${w.ahead}` : f}</span>
+                        ))}
+                        <span style={{ marginLeft: 'auto', display: 'inline-flex', gap: 4 }}>
+                          {w.flags.includes('not-isolated') && w.branch && (
+                            <PixelButton variant="secondary" size="sm" onClick={() => void migrateWt(h.repo, w.branch!)} disabled={wtBusy}>migrate…</PixelButton>
+                          )}
+                          {w.flags.includes('not-isolated') && !w.flags.includes('dirty') && (
+                            <PixelButton variant="secondary" size="sm" onClick={() => void resetBase(h.repo)} disabled={wtBusy}>reset to {h.trunk}</PixelButton>
+                          )}
+                          {!w.isMain && (
+                            <PixelButton variant="destructive" size="sm" onClick={() => void deleteWt(h.repo, w.branch, w.path)} disabled={wtBusy}>
+                              {delArm === w.path ? 'confirm delete' : 'delete'}
+                            </PixelButton>
+                          )}
+                        </span>
+                      </div>
                     ))}
                   </div>
-                )}
+                ))}
               </div>
 
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
