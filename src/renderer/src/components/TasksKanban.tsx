@@ -4,6 +4,7 @@ import { PixelButton } from './PixelButton';
 import { PixelBadge } from './PixelBadge';
 import { Icon } from './Icon';
 import { useStore } from '@/store/store';
+import { assigneesForStatus, pauseAgents, stopAgents } from '@/lib/fleetControl';
 import { TRIAGE_PROMPT, ORPHAN_TRIAGE_PROMPT } from '@shared/missionTemplates';
 
 /** A card on the task kanban. Mirrors HiveTask in the main/preload process —
@@ -361,6 +362,9 @@ export function TasksKanban({ onAssign }: { onAssign: (prefill: string) => void 
       }}>
         {COLUMNS.map((col) => {
           const cards = tasks.filter((t) => t.status === col.key);
+          // Per-phase pause/stop targets the desks ASSIGNED to cards in this lane right now
+          // (transient — a phase belongs to cards, not desks).
+          const laneAssignees = assigneesForStatus(cards, col.key);
           return (
             <div key={col.key} style={{
               flex: '1 1 0', minWidth: 170, display: 'flex', flexDirection: 'column',
@@ -372,6 +376,20 @@ export function TasksKanban({ onAssign }: { onAssign: (prefill: string) => void 
                 fontFamily: 'var(--cth-font-display)', fontSize: 9, color: 'var(--cth-ink-900)'
               }}>
                 {col.label}
+                {laneAssignees.length > 0 && (
+                  <span style={{ display: 'inline-flex', gap: 3 }}>
+                    <button
+                      title={`Pause the ${laneAssignees.length} desk(s) holding a card in ${col.label}`}
+                      onClick={() => void pauseAgents(laneAssignees, true)}
+                      style={phaseBtnStyle}
+                    >⏸</button>
+                    <button
+                      title={`Stop the ${laneAssignees.length} desk(s) holding a card in ${col.label}`}
+                      onClick={() => void stopAgents(agents.filter((a) => laneAssignees.includes(a.id)))}
+                      style={phaseBtnStyle}
+                    >⏹</button>
+                  </span>
+                )}
                 <span style={{ marginLeft: 'auto', fontSize: 11, fontFamily: 'var(--cth-font-ui)' }}>{cards.length}</span>
               </div>
               <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: 6, display: 'flex', flexDirection: 'column', gap: 6 }}>
@@ -744,6 +762,11 @@ function AddTaskForm({ agents, existing, sddpMode, onCancel, onCreate }: {
     </div>
   );
 }
+
+const phaseBtnStyle: React.CSSProperties = {
+  border: 'none', cursor: 'pointer', background: 'transparent', padding: '0 2px',
+  fontSize: 11, lineHeight: '11px', color: 'var(--cth-ink-700)'
+};
 
 const inputStyle: React.CSSProperties = {
   width: '100%', padding: '6px 8px', background: 'var(--cth-paper-100)', border: 'none',

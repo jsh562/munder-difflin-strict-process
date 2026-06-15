@@ -9,6 +9,7 @@ import { Icon } from './Icon';
 import { SpritePortrait } from './SpritePortrait';
 import { useStore, type Agent } from '@/store/store';
 import { usePtyParser } from '@/hooks/usePtyParser';
+import { displayStatus } from '@/lib/agentStatus';
 
 export function FullscreenTerminal() {
   const agents = useStore(s => s.agents);
@@ -155,6 +156,8 @@ export function FullscreenTerminal() {
 }
 
 function Tab({ agent, active, onClick }: { agent: Agent; active: boolean; onClick: () => void }) {
+  const paused = useStore((s) => !!s.paused[agent.id]);
+  const godDesired = useStore((s) => s.godDesired);
   return (
     <button
       onClick={onClick}
@@ -190,12 +193,14 @@ function Tab({ agent, active, onClick }: { agent: Agent; active: boolean; onClic
         overflow: 'hidden', textOverflow: 'ellipsis',
         fontFamily: 'var(--cth-font-display)', fontSize: 8, lineHeight: '12px'
       }}>{agent.name.toUpperCase()}</span>
-      <PixelBadge status={agent.status} />
+      <PixelBadge status={displayStatus(agent, paused, godDesired)} />
     </button>
   );
 }
 
 function Header({ agent }: { agent: Agent }) {
+  const paused = useStore((s) => !!s.paused[agent.id]);
+  const godDesired = useStore((s) => s.godDesired);
   return (
     <div style={{
       display: 'flex', alignItems: 'center', gap: 12,
@@ -217,7 +222,7 @@ function Header({ agent }: { agent: Agent }) {
         fontStyle: 'italic'
       }}>“{agent.description}”</span>
       <div style={{ marginLeft: 'auto' }}>
-        <PixelBadge status={agent.status} />
+        <PixelBadge status={displayStatus(agent, paused, godDesired)} />
       </div>
     </div>
   );

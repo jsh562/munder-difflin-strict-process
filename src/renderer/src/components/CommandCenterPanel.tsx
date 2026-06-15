@@ -261,6 +261,8 @@ export function CommandCenterPanel({ agent }: { agent: Agent }) {
 
 function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
   const agents = useStore((s) => s.agents);
+  const pausedMap = useStore((s) => s.paused);
+  const godDesired = useStore((s) => s.godDesired);
   const select = useStore((s) => s.select);
   const updateAgent = useStore((s) => s.updateAgent);
   // E005 {FR-003/FR-004} — per-desk re-assign + revert-to-default helpers. These
@@ -537,7 +539,7 @@ function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
                   fontFamily: 'var(--cth-font-ui)', fontSize: 13, color: 'var(--cth-ink-900)'
                 }}
               >{a.name}{a.isGod ? ' (god)' : a.isAssistant ? ' (assistant)' : ''}</button>
-              <PixelBadge status={armed ? 'looping' : a.status} />
+              <PixelBadge status={armed ? 'looping' : displayStatus(a, !!pausedMap[a.id], godDesired)} />
               {armed && <span title={breaker?.reason} style={{ color: 'var(--cth-coral)', fontSize: 12 }}>⚠</span>}
               <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--cth-ink-500)' }}>
                 {(toolCounts[a.id] ?? 0)} tool calls

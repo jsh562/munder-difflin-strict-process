@@ -476,6 +476,29 @@ const agentToolDeps: AgentToolDeps = {
         success: false
       };
     }
+    // Post-merge cleanup (the merger is the only one who deletes a worktree, and only after a
+    // clean merge): the merged branch's work is now in base, so its worktree is disposable —
+    // BUT only remove it when its worker desk is COLD (so a still-live worker isn't yanked
+    // mid-step), and only when we can positively identify that worker (else keep, conservative).
+    // Best-effort; the merge already succeeded regardless. The operator can still bulk-clean the
+    // rest from Settings → Worktrees.
+    try {
+      const wts = await listWorktrees(repo);
+      const merged = Array.isArray(wts) ? wts.find((w) => !w.isMain && w.branch === branch) : undefined;
+      if (merged) {
+        const ownerId = Object.values(hive.registry().agents).find((a) => agentBranchForId(a.id) === branch)?.id ?? null;
+        const ownerLive = ownerId ? isAgentRunning(ownerId) : true; // unknown owner ⇒ treat as live (don't delete)
+        if (!ownerLive) {
+          const rm = await removeWorktree(repo, merged.path);
+          if (rm.ok) {
+            if (ownerId) { worktreePaths.delete(`pty-${ownerId}`); worktreeOrigins.delete(`pty-${ownerId}`); }
+            return { content: `merged ${branch} into ${m.base}; removed its worktree (worker idle)`, success: true };
+          }
+        } else {
+          return { content: `merged ${branch} into ${m.base}; worktree kept — its worker is still live (clean it from Settings → Worktrees when done)`, success: true };
+        }
+      }
+    } catch { /* best-effort cleanup — never fail a successful merge on it */ }
     return { content: `merged ${branch} into ${m.base}`, success: true };
   },
   appendMemory: (id, text) => hive.appendMemory(id, text),

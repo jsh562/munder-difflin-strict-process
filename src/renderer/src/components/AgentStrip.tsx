@@ -9,6 +9,7 @@ import { displayStatus, bucketCounts, CELL_BUCKET_ORDER, type CellBucket } from 
 import { scheduleDeskRestart } from '@/lib/restartDesk';
 import { restartSigOf, deskStaleKeys } from '@/lib/restartSig';
 import { groupAgents, effectiveRoles, FLOOR_GROUP, type AgentGroup } from '@/lib/agentGroups';
+import { pauseAgents, stopAgents } from '@/lib/fleetControl';
 
 export interface AgentStripProps {
   /** Needed to rebuild a spawn command when a restorable agent predates the
@@ -129,8 +130,10 @@ export function AgentStrip({ config, onConfigChange }: AgentStripProps) {
   const addProjectRepo = async () => {
     const res = await window.cth.chooseFolder();
     if (!res.ok || registeredRepos.includes(res.path)) return;
-    const next = await window.cth.updateConfig({ registeredRepos: [...registeredRepos, res.path] });
-    onConfigChange?.(next);
+    await window.cth.updateConfig({ registeredRepos: [...registeredRepos, res.path] });
+    // Re-pull the (redacted) config so App.config stays consistent + the matrix gains the row.
+    const fresh = await window.cth.getConfig();
+    onConfigChange?.(fresh);
   };
   // Columns in WORKFLOW order: god → (planner →) worker → reviewer → (qc →) integrator → assistant.
   const cols: Col[] = [
@@ -280,6 +283,14 @@ export function AgentStrip({ config, onConfigChange }: AgentStripProps) {
                   <Icon name="plus" /> add agent here
                 </span>
               </PixelButton>
+            )}
+            {/* Pause/stop the shown desks (the whole repo on the row drill; a single role-cell otherwise). */}
+            {flyoutAgents.length > 0 && (
+              <div style={{ display: 'flex', gap: 4 }}>
+                <PixelButton variant="secondary" size="sm" onClick={() => void pauseAgents(flyoutAgents.map((a) => a.id), true)}>pause {flyoutAgents.length}</PixelButton>
+                <PixelButton variant="secondary" size="sm" onClick={() => void pauseAgents(flyoutAgents.map((a) => a.id), false)}>resume</PixelButton>
+                <PixelButton variant="destructive" size="sm" onClick={() => { void stopAgents(flyoutAgents); setOpen(null); }}>stop</PixelButton>
+              </div>
             )}
             {flyoutAgents.map((a) => {
               const warm = a.id in liveness ? liveness[a.id] : undefined;

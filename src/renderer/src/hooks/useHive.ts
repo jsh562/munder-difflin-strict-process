@@ -222,6 +222,13 @@ export function useHive(config: HarnessConfig | null): void {
       const godCwd = godIsNative
         ? (config.godWorkspace?.trim() || godWorkspace(config.harnessHome!))
         : config.harnessHome!;
+      // Seed the god's capability roles from the PERSISTED registry — the renderer rebuilds the
+      // god fresh each boot, so without this its roles reset to the default integrator+reviewer
+      // in the UI/matrix even though the registry persists the operator's choice. Undefined on a
+      // first run (no persisted god) ⇒ the default applies.
+      let godRoles: Agent['roles'];
+      try { godRoles = (await window.cth.hiveRegistry())?.agents?.[GOD_ID]?.roles; } catch { /* best-effort */ }
+      if (cancelled) { godSpawning.current = false; return; }
       const god: Agent = {
         id: GOD_ID,
         name: 'Michael',
@@ -239,6 +246,7 @@ export function useHive(config: HarnessConfig | null): void {
         command: command.trim(),
         model: config.defaultModel,
         isGod: true,
+        roles: godRoles,
         recentTextTs: Date.now()
       };
       const res = await window.cth.spawnPty({
@@ -248,7 +256,7 @@ export function useHive(config: HarnessConfig | null): void {
         args,
         cols: 100,
         rows: 30,
-        hive: { id: GOD_ID, name: 'Michael', cwd: godCwd, isGod: true, role: 'orchestrator (god)' }
+        hive: { id: GOD_ID, name: 'Michael', cwd: godCwd, isGod: true, role: 'orchestrator (god)', roles: godRoles }
       });
       if (cancelled) { godSpawning.current = false; return; }
       if (!res.ok) {

@@ -19,6 +19,7 @@ import { ToolWaterfall } from './ToolWaterfall';
 import { AgentControlStrip } from './AgentControlStrip';
 import { Icon } from './Icon';
 import { useStore, type Agent } from '@/store/store';
+import { displayStatus } from '@/lib/agentStatus';
 import { usePtyParser } from '@/hooks/usePtyParser';
 import { deriveProviderId } from '@shared/assignment';
 
@@ -74,6 +75,8 @@ export function AgentDetailPanel({ agent }: AgentDetailPanelProps) {
   const sidebarTab = useStore(s => s.sidebarTab);
   const setSidebarTab = useStore(s => s.setSidebarTab);
   const fleetDefaultModel = useStore(s => s.fleetDefaultModel);
+  const paused = useStore(s => s.paused);
+  const godDesired = useStore(s => s.godDesired);
   const isReal = !!agent.ptyId;
   // E008 / T020 — does this desk render the synthesized native transcript (vs the
   // Claude PTY)? Derived from the runtime kind (see `isNativeRuntimeDesk`); evaluated
@@ -177,7 +180,7 @@ export function AgentDetailPanel({ agent }: AgentDetailPanelProps) {
           <div style={{
             display: 'flex', gap: 6, alignItems: 'center', marginTop: 1
           }}>
-            <PixelBadge status={agent.status} />
+            <PixelBadge status={displayStatus(agent, !!paused[agent.id], godDesired)} />
             <span style={{
               fontSize: 12, color: 'var(--cth-ink-500)',
               whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'

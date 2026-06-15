@@ -289,7 +289,15 @@ export function App() {
       )}
 
       {settingsOpen && (
-        <SettingsModal config={config} onClose={() => setSettingsOpen(false)} />
+        <SettingsModal
+          config={config}
+          onClose={() => {
+            setSettingsOpen(false);
+            // Settings writes config to disk but holds local copies; re-pull so the matrix +
+            // project-repo rows (and anything else reading App.config) reflect the changes.
+            window.cth.getConfig().then((c) => setConfig(c)).catch(() => { /* keep current */ });
+          }}
+        />
       )}
 
       {quitWarn && (

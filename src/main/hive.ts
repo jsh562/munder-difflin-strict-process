@@ -807,7 +807,7 @@ export class HiveManager {
       // card so they can continue from the previous desk's branch instead of redoing it.
       if (was && was.assignee !== t.assignee && t.assignee) {
         const where = [was.branch ? `branch \`${was.branch}\`` : null, was.project ? `in ${was.project}` : null].filter(Boolean).join(' ');
-        const prior = was.assignee && where ? ` Prior work is on ${where} (worktree kept) — read that branch before redoing it.` : '';
+        const prior = was.assignee && where ? ` Prior work is on ${where} (worktree kept) — read it first; if it's worth continuing, git merge/cherry-pick that branch into yours and build on it, else start fresh and note why.` : '';
         ping(t.assignee, 'request', `Assigned: ${t.title}`,
           `Task "${t.title}" (${t.id}) was assigned to you${was.assignee ? ` (reassigned from ${was.assignee})` : ''}.${prior}`);
       }
