@@ -14,11 +14,14 @@
  * de-duped escalation when there's no usable owner desk or a step's artifact never lands. Never
  * throws into the caller (the hive write path is fire-and-forget into `schedule`).
  */
-import { milestoneDriver, templateForStep, type HiveTask } from '@jsh562/won-agent-core';
+import { milestoneDriver, templateForStep, type HiveTask, type FeatureMilestone } from '@jsh562/won-agent-core';
 
 export interface SddpPipelineDeps {
   /** Is the floor in SDDP mode? (read live) — the engine is inert when off. */
   enabled(): boolean;
+  /** SDDP autopilot (read live): when ON, human-gated steps (Clarify) auto-resolve instead of
+   *  pausing for the operator. See the Human-Gates Registry. */
+  autopilot(): boolean;
   /** The current task ledger (the engine finds the feature epic card in it). */
   listTasks(): HiveTask[];
   /** The repo a feature's artifacts live under (`epic.project` ?? the owner's repo). */
@@ -34,6 +37,9 @@ export interface SddpPipelineDeps {
   advanceMilestone(epicId: string, key: string): void;
   /** Surface a blocker to the god/operator (no usable owner, or a step's artifact never landed). */
   escalate(feature: string, message: string): void;
+  /** Relay a human-gated step's prompt to the operator (e.g. Clarify questions) — `needs_human`.
+   *  Distinct from `escalate` (which is for blockers). */
+  askHuman(feature: string, questions: string): void;
   /** Optional diagnostic log. */
   log?(message: string): void;
   /** Debounce window for `schedule` (ms); default 1500. */
@@ -42,11 +48,18 @@ export interface SddpPipelineDeps {
 
 /** Build the input handed to a host step's sub-agent — the deterministic `specs/<feature>/…` paths
  *  each specialist prompt expects, PLUS the step's structure template (when it has one — the engine
- *  supplies templates as data rather than baking them into prompts). */
-export function buildStepInput(key: string, feature: string): string {
+ *  supplies templates as data rather than baking them into prompts). `ctx.request` carries the
+ *  feature request for the `spec` step. */
+export function buildStepInput(key: string, feature: string, ctx?: { request?: string }): string {
   const dir = `specs/${feature}`;
   let task: string;
   switch (key) {
+    case 'spec':
+      task = `Feature folder ${dir}/. Draft ${dir}/spec.md for this FEATURE REQUEST: "${(ctx?.request ?? '').trim() || '(see the epic card)'}". Mark genuine unknowns [NEEDS CLARIFICATION: <question>].`;
+      break;
+    case 'clarify':
+      task = `Feature folder ${dir}/. Read ${dir}/spec.md and return the highest-impact clarification questions (its [NEEDS CLARIFICATION] markers + any material gaps), ranked.`;
+      break;
     case 'research':
       task = `Feature folder ${dir}/. Read ${dir}/spec.md. Research the open technical questions and write ${dir}/research.md.`;
       break;
@@ -79,6 +92,7 @@ export class SddpPipeline {
   private readonly debounce = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly inflight = new Set<string>();   // `${feature}::${key}` currently running
   private readonly escalated = new Set<string>();  // features already escalated (dedupe)
+  private readonly asked = new Set<string>();      // human-gated steps already relayed to the operator
 
   constructor(private readonly deps: SddpPipelineDeps) {}
 
@@ -114,7 +128,14 @@ export class SddpPipeline {
 
       const active = epic.milestones.find((m) => m.status === 'active');
       if (!active) return;                                  // all done / none active
-      if (milestoneDriver(active) !== 'host' || !active.subAgent) return; // desk/human step — engine waits
+
+      // HUMAN-GATED step (Clarify): a registry gate the operator can flip via `sddpAutopilot`.
+      if (active.humanGated && active.subAgent) {
+        await this.runHumanGated(epic, active, ownerId);
+        return;
+      }
+
+      if (milestoneDriver(active) !== 'host' || !active.subAgent) return; // desk step — engine waits
 
       const lockKey = `${feature}::${active.key}`;
       if (this.inflight.has(lockKey)) return;               // already running this step
@@ -127,7 +148,8 @@ export class SddpPipeline {
 
       this.inflight.add(lockKey);
       try {
-        const res = await this.deps.spawnSubAgent(ownerId, active.subAgent, buildStepInput(active.key, feature));
+        const input = buildStepInput(active.key, feature, { request: epic.description ?? epic.title });
+        const res = await this.deps.spawnSubAgent(ownerId, active.subAgent, input);
         if (this.deps.featureArtifactExists(r, feature, active.gateArtifact)) {
           this.escalated.delete(feature);                   // made progress — clear any stale escalation
           this.deps.advanceMilestone(epic.id, active.key);  // re-triggers the engine → chains to next step
@@ -141,6 +163,39 @@ export class SddpPipeline {
       }
     } catch (e) {
       this.deps.log?.(`[sddp-pipeline] advanceFeature(${feature}) failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  /** Run a HUMAN-GATED milestone (Clarify). Under autopilot: `spec-author` resolves the
+   *  clarifications with documented defaults + advance (no human). Otherwise: run the gate's
+   *  sub-agent (`requirements-scanner`) ONCE for the questions, relay them to the operator, and
+   *  WAIT — the operator answers + advances the milestone, which re-triggers the chain. */
+  private async runHumanGated(epic: HiveTask, active: FeatureMilestone, ownerId: string): Promise<void> {
+    const feature = epic.feature!;
+    const lockKey = `${feature}::${active.key}`;
+    if (this.inflight.has(lockKey)) return;
+
+    if (this.deps.autopilot()) {
+      this.inflight.add(lockKey);
+      try {
+        await this.deps.spawnSubAgent(ownerId, 'spec-author',
+          `Feature folder specs/${feature}/. Read specs/${feature}/spec.md, RESOLVE each [NEEDS CLARIFICATION] with a reasonable default, and add a ## Clarifications section documenting each assumption (what + why). Rewrite specs/${feature}/spec.md.`);
+        this.deps.advanceMilestone(epic.id, active.key); // optional + best-effort → advance regardless
+      } finally {
+        this.inflight.delete(lockKey);
+      }
+      return;
+    }
+
+    // Human-gated (default): relay the questions ONCE + wait for the operator to answer + advance.
+    if (this.asked.has(lockKey)) return;
+    this.inflight.add(lockKey);
+    try {
+      const res = await this.deps.spawnSubAgent(ownerId, active.subAgent!, buildStepInput(active.key, feature));
+      this.asked.add(lockKey);
+      this.deps.askHuman(feature, res.content);
+    } finally {
+      this.inflight.delete(lockKey);
     }
   }
 

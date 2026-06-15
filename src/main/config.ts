@@ -189,6 +189,11 @@ export interface HarnessConfig {
    *  kanban shows a feature-phase banner, and `hive_update_task` enforces the phase gates.
    *  A wholesale switch — when off, standard behaviour is unchanged. */
   sddpMode?: boolean;
+  /** SDDP autopilot (mirrors sddp27's AUTOPILOT): when ON, the host engine AUTO-RESOLVES the
+   *  human-in-the-loop gates instead of pausing for the operator — e.g. Clarify is resolved by the
+   *  spec-author with documented reasonable defaults rather than asking. OFF by default (the human
+   *  gates stay in the loop). See the Human-Gates Registry in docs/orchestration-model.md. */
+  sddpAutopilot?: boolean;
   /** SDDP only: the model an ephemeral `spawn_subagent` specialist runs on. Lets the operator
    *  point sub-agents at a cheaper/faster model than the orchestrator desk. The provider +
    *  credentials are ALWAYS inherited from the calling desk; only the model id is overridden, and

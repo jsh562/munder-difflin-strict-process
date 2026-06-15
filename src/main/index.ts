@@ -833,6 +833,7 @@ const nativeRuntime = new NativeRuntime({
 // the hive's board-change trigger below. All host concerns are the same deps the toolkit uses.
 const sddpPipeline = new SddpPipeline({
   enabled: () => readConfig().sddpMode === true,
+  autopilot: () => readConfig().sddpAutopilot === true,
   listTasks: () => {
     const ledger = hive.tasks() as { tasks?: HiveTask[] } | undefined;
     return Array.isArray(ledger?.tasks) ? ledger!.tasks : [];
@@ -850,6 +851,11 @@ const sddpPipeline = new SddpPipeline({
   escalate: (feature, message) => {
     try { hive.send({ to: 'god', act: 'request', needs_human: true, subject: `SDDP pipeline — ${feature}`, body: message }, 'system'); }
     catch (e) { console.error('[sddp-pipeline] escalate failed:', e); }
+  },
+  // Clarify questions → the operator/god (needs_human). They answer + advance the clarify milestone.
+  askHuman: (feature, questions) => {
+    try { hive.send({ to: 'god', act: 'query', needs_human: true, subject: `Clarify — ${feature}`, body: `Feature "${feature}" needs clarification before planning. Answer these, fold them into specs/${feature}/spec.md (## Clarifications), then advance the clarify milestone (hive_update_task advanceMilestone:'clarify'):\n\n${questions}` }, 'system'); }
+    catch (e) { console.error('[sddp-pipeline] askHuman failed:', e); }
   },
   log: (m) => console.log(m)
 });

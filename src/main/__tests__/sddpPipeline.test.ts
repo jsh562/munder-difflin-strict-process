@@ -22,12 +22,14 @@ function mkPipeline() {
   const artifacts = new Set<string>();           // `${feature}/${relPath}` present on "disk"
   const spawns: { caller: string; name: string; input: string }[] = [];
   const escalations: { feature: string; message: string }[] = [];
-  const state = { enabled: true, ownerUsable: true };
+  const asks: { feature: string; questions: string }[] = [];
+  const state = { enabled: true, ownerUsable: true, autopilot: false };
   let onSpawn: (name: string) => void = () => {}; // simulate what a sub-agent writes
   let gate: Promise<void> | null = null;          // optional latch to hold a spawn open (lock test)
 
   const deps: SddpPipelineDeps = {
     enabled: () => state.enabled,
+    autopilot: () => state.autopilot,
     listTasks: () => tasks,
     repoForEpic: () => 'S:/repo',
     ownerUsable: () => state.ownerUsable,
@@ -45,11 +47,12 @@ function mkPipeline() {
       if (adv) tasks = tasks.map((t, j) => (j === i ? { ...t, milestones: adv } : t));
     },
     escalate: (feature, message) => escalations.push({ feature, message }),
+    askHuman: (feature, questions) => asks.push({ feature, questions }),
     debounceMs: 0
   };
   const pipeline = new SddpPipeline(deps);
   return {
-    pipeline, artifacts, spawns, escalations, state,
+    pipeline, artifacts, spawns, escalations, asks, state,
     setTasks: (t: HiveTask[]) => { tasks = t; },
     getTasks: () => tasks,
     setOnSpawn: (fn: (name: string) => void) => { onSpawn = fn; },
@@ -102,11 +105,53 @@ describe('SddpPipeline.advanceFeature', () => {
 
   it('leaves a DESK step alone (no spawn) — the notifier pings the desk', async () => {
     const h = mkPipeline();
-    h.setTasks([epicWith('spec')]);                      // spec is desk-driven (authored by a desk/human until P3)
+    h.setTasks([epicWith('implement')]);                 // implement is desk/worker-driven
     await h.pipeline.advanceFeature('S:/repo', '00001');
     expect(h.spawns).toHaveLength(0);
-    expect(milestone(h.getTasks()[0], 'spec').status).toBe('active');
+    expect(milestone(h.getTasks()[0], 'implement').status).toBe('active');
     expect(h.escalations).toHaveLength(0);
+  });
+
+  it('drives the spec step via spec-author (request + template in the input) and advances to clarify', async () => {
+    const h = mkPipeline();
+    const epic = epicWith('spec');
+    epic.description = 'Build a notes API';
+    h.setTasks([epic]);
+    h.setOnSpawn((name) => { if (name === 'spec-author') h.artifacts.add('00001/spec.md'); });
+
+    await h.pipeline.advanceFeature('S:/repo', '00001');
+
+    expect(h.spawns.map((s) => s.name)).toEqual(['spec-author']);
+    expect(h.spawns[0].input).toMatch(/Build a notes API/);          // the feature request rode in
+    expect(h.spawns[0].input).toMatch(/Success Criteria/);            // the spec template rode in
+    expect(milestone(h.getTasks()[0], 'spec').status).toBe('done');
+    expect(milestone(h.getTasks()[0], 'clarify').status).toBe('active');
+  });
+
+  it('Clarify (autopilot OFF): runs requirements-scanner once, asks the human, does NOT advance + does not re-run', async () => {
+    const h = mkPipeline();
+    h.setTasks([epicWith('clarify')]);
+    await h.pipeline.advanceFeature('S:/repo', '00001');
+    await h.pipeline.advanceFeature('S:/repo', '00001'); // second trigger while waiting
+
+    expect(h.spawns.map((s) => s.name)).toEqual(['requirements-scanner']); // only once (asked dedup)
+    expect(h.asks).toHaveLength(1);
+    expect(milestone(h.getTasks()[0], 'clarify').status).toBe('active');   // paused, not advanced
+    expect(h.escalations).toHaveLength(0);
+  });
+
+  it('Clarify (autopilot ON): spec-author resolves + the engine advances, no human ask', async () => {
+    const h = mkPipeline();
+    h.state.autopilot = true;
+    h.setTasks([epicWith('clarify')]);
+
+    await h.pipeline.advanceFeature('S:/repo', '00001');
+
+    expect(h.spawns.map((s) => s.name)).toEqual(['spec-author']);          // auto-resolved
+    expect(h.spawns[0].input).toMatch(/RESOLVE each \[NEEDS CLARIFICATION\]/);
+    expect(h.asks).toHaveLength(0);                                        // no human asked
+    expect(milestone(h.getTasks()[0], 'clarify').status).toBe('done');
+    expect(milestone(h.getTasks()[0], 'research').status).toBe('active');
   });
 
   it('drives the plan step via plan-author (now host) and advances on plan.md', async () => {
