@@ -17,6 +17,16 @@ export interface HiveComment {
   text: string;
 }
 
+/** SDDP: one gated step in a feature's lifecycle, on the feature "epic" card (mirrors
+ *  FeatureMilestone in won-agent-core). */
+export interface FeatureMilestone {
+  key: string;
+  label: string;
+  subAgent?: string;
+  gateArtifact: string;
+  status: 'pending' | 'active' | 'done';
+}
+
 export interface HiveTask {
   id: string;
   title: string;
@@ -32,6 +42,8 @@ export interface HiveTask {
   project?: string;
   /** SDDP: the feature folder this card belongs to (its specs/<feature>/ dir). */
   feature?: string;
+  /** SDDP: the ordered milestone checklist on a feature "epic" card (the gated pipeline). */
+  milestones?: FeatureMilestone[];
   priority: number;
   createdAt: string;
 }
@@ -122,6 +134,19 @@ function parseTasks(raw: unknown): HiveTask[] {
         : undefined,
       project: typeof t.project === 'string' ? t.project : undefined,
       feature: typeof t.feature === 'string' ? t.feature : undefined,
+      milestones: Array.isArray(t.milestones)
+        ? (t.milestones as unknown[])
+            .filter((m): m is Record<string, unknown> => !!m && typeof m === 'object')
+            .map((m) => ({
+              key: typeof m.key === 'string' ? m.key : '',
+              label: typeof m.label === 'string' ? m.label : (typeof m.key === 'string' ? m.key : '?'),
+              subAgent: typeof m.subAgent === 'string' ? m.subAgent : undefined,
+              gateArtifact: typeof m.gateArtifact === 'string' ? m.gateArtifact : '',
+              status: (['pending', 'active', 'done'] as const).includes(m.status as FeatureMilestone['status'])
+                ? (m.status as FeatureMilestone['status']) : 'pending'
+            }))
+            .filter((m) => m.key)
+        : undefined,
       priority: typeof t.priority === 'number' ? t.priority : 3,
       createdAt: typeof t.createdAt === 'string' ? t.createdAt : new Date().toISOString()
     }));
@@ -350,6 +375,7 @@ export function TasksKanban({ onAssign }: { onAssign: (prefill: string) => void 
                 feature={f}
                 status={featureStatuses[f] ?? null}
                 cardCount={tasks.filter((t) => t.feature === f).length}
+                milestones={tasks.find((t) => t.feature === f && t.milestones && t.milestones.length > 0)?.milestones ?? null}
               />
             ))}
           </div>
@@ -591,38 +617,55 @@ function TaskCard({ task, assigneeName, nameFor, orphanReason, flashing, blocker
 /** One feature's lifecycle tracker: the phase ladder (Specify → … → Integrate) with the
  *  current phase highlighted and completed phases ticked, derived from the on-disk markers.
  *  `status` null ⇒ the feature dir hasn't been created yet ("not started"). */
-function FeatureBanner({ feature, status, cardCount }: {
+function FeatureBanner({ feature, status, cardCount, milestones }: {
   feature: string;
   status: FeatureStatus | null;
   cardCount: number;
+  milestones?: FeatureMilestone[] | null;
 }) {
   const phase = status ? featurePhase(status) : null;
   const reachedIdx = phase ? SDDP_PHASES.indexOf(phase) : -1;
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-      <span
-        title={status ? `phase: ${phase}` : 'no specs/<feature>/ found yet — run Specify'}
-        style={{ fontFamily: 'var(--cth-font-display)', fontSize: 9, color: 'var(--cth-ink-900)' }}
-      >▸ {feature}</span>
-      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3, flexWrap: 'wrap' }}>
-        {SDDP_PHASES.map((p, i) => {
-          const done = reachedIdx >= 0 && i < reachedIdx;
-          const current = i === reachedIdx;
-          return (
-            <span key={p} style={{
-              padding: '1px 6px 0', fontFamily: 'var(--cth-font-ui)', fontSize: 11,
-              background: current ? 'var(--cth-lemon)' : done ? 'var(--cth-mint)' : 'var(--cth-cream-200)',
-              boxShadow: `inset 0 0 0 1px ${current ? 'var(--cth-ink-900)' : 'var(--cth-ink-300)'}`,
-              color: current || done ? 'var(--cth-ink-900)' : 'var(--cth-ink-500)'
-            }}>{done ? '✓ ' : current ? '▶ ' : ''}{p}</span>
-          );
-        })}
-      </span>
-      {status?.hasClarifications && (
-        <span title="spec.md has a ## Clarifications section" style={{ fontSize: 11, color: 'var(--cth-ink-500)' }}>clarified</span>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+        <span
+          title={status ? `phase: ${phase}` : 'no specs/<feature>/ found yet — run Specify'}
+          style={{ fontFamily: 'var(--cth-font-display)', fontSize: 9, color: 'var(--cth-ink-900)' }}
+        >▸ {feature}</span>
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3, flexWrap: 'wrap' }}>
+          {SDDP_PHASES.map((p, i) => {
+            const done = reachedIdx >= 0 && i < reachedIdx;
+            const current = i === reachedIdx;
+            return (
+              <span key={p} style={{
+                padding: '1px 6px 0', fontFamily: 'var(--cth-font-ui)', fontSize: 11,
+                background: current ? 'var(--cth-lemon)' : done ? 'var(--cth-mint)' : 'var(--cth-cream-200)',
+                boxShadow: `inset 0 0 0 1px ${current ? 'var(--cth-ink-900)' : 'var(--cth-ink-300)'}`,
+                color: current || done ? 'var(--cth-ink-900)' : 'var(--cth-ink-500)'
+              }}>{done ? '✓ ' : current ? '▶ ' : ''}{p}</span>
+            );
+          })}
+        </span>
+        {status?.hasClarifications && (
+          <span title="spec.md has a ## Clarifications section" style={{ fontSize: 11, color: 'var(--cth-ink-500)' }}>clarified</span>
+        )}
+        <span style={{ fontSize: 11, color: 'var(--cth-ink-500)' }}>{cardCount} card{cardCount === 1 ? '' : 's'}</span>
+        {!status && <span style={{ fontSize: 11, color: 'var(--cth-ink-300)' }}>not started</span>}
+      </div>
+      {/* The feature epic card's milestone checklist (the gated sub-agent pipeline), when present:
+          a read-only pill row beneath the phase ladder (✓ done / ▶ active / · pending). */}
+      {milestones && milestones.length > 0 && (
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3, flexWrap: 'wrap', paddingLeft: 2 }}>
+          {milestones.map((m) => (
+            <span key={m.key} title={`${m.label} — gate: specs/${feature}/${m.gateArtifact}${m.subAgent ? ` · sub-agent: ${m.subAgent}` : ''}`} style={{
+              padding: '0 5px', fontFamily: 'var(--cth-font-ui)', fontSize: 10,
+              background: m.status === 'active' ? 'var(--cth-lemon)' : m.status === 'done' ? 'var(--cth-mint)' : 'var(--cth-cream-200)',
+              boxShadow: `inset 0 0 0 1px ${m.status === 'active' ? 'var(--cth-ink-900)' : 'var(--cth-ink-300)'}`,
+              color: m.status === 'pending' ? 'var(--cth-ink-500)' : 'var(--cth-ink-900)'
+            }}>{m.status === 'done' ? '✓ ' : m.status === 'active' ? '▶ ' : '· '}{m.label}</span>
+          ))}
+        </span>
       )}
-      <span style={{ fontSize: 11, color: 'var(--cth-ink-500)' }}>{cardCount} card{cardCount === 1 ? '' : 's'}</span>
-      {!status && <span style={{ fontSize: 11, color: 'var(--cth-ink-300)' }}>not started</span>}
     </div>
   );
 }

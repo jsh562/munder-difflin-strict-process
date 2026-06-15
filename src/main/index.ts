@@ -1,7 +1,7 @@
 import { app, BrowserWindow, clipboard, dialog, ipcMain, powerSaveBlocker, screen, shell, Notification } from 'electron';
 import { spawn } from 'node:child_process';
 import { rmSync, existsSync, readFileSync, readdirSync, statSync, cpSync, mkdirSync } from 'node:fs';
-import { join, resolve, sep } from 'node:path';
+import { join, resolve, sep, relative, isAbsolute } from 'node:path';
 import { PtyManager, type SpawnOptions } from './pty';
 import {
   readConfig, writeConfig, resetConfig, ensureHarnessHome, ensureClaudePermissionsAccepted,
@@ -32,8 +32,10 @@ import { ClaudeRuntime } from './runtime/claudeRuntime';
 import { NativeRuntime } from './runtime/nativeRuntime';
 import { deniedNativeToolNames } from './runtime/toolGating';
 import { createNativeEventBridge, loadNativeEvents } from './runtime/nativeEventBridge';
-import { executeAgentTool, type AgentToolDeps, type FeatureStatus } from '@jsh562/won-agent-core';
-import { redactConfig, injectionEnvForProvider, keyPresence, setKeyInConfig, clearKeyInConfig, WEB_SEARCH_KEY_ID, type SafeConfig } from './credentials';
+import { makeElectronWorkerTransport } from './runtime/electronWorkerTransport';
+import { runOneShotSubAgent, subAgentChildId, resolveSubAgentModel } from './runtime/subAgentRunner';
+import { executeAgentTool, subAgentSpec, SUB_AGENT_NAMES, type AgentToolDeps, type FeatureStatus } from '@jsh562/won-agent-core';
+import { redactConfig, injectionEnvForProvider, keyPresence, setKeyInConfig, clearKeyInConfig, WEB_SEARCH_KEY_ID, NATIVE_PROVIDER_MODEL_ENV, type SafeConfig } from './credentials';
 import { searchWebDuckDuckGo } from './webSearch';
 import { resolveBashEnv, describeBashEnv } from './bashShell';
 import { listProviders } from '../shared/providerRegistry';
@@ -52,6 +54,10 @@ const ptyToAgent = new Map<string, string>();
  *  (`nativeRuntime.spawn(agentId, providerId?)`) can consume it; E005 records only
  *  — it does not wire native execution. Absent ⇒ unresolvable/role-based model. */
 const agentProviderIds = new Map<string, string>();
+/** agent id → the resolved model id it runs on (recorded alongside `agentProviderIds` at the
+ *  assign + spawn seams). An ephemeral sub-agent inherits its CALLER's exact model from here, so a
+ *  spawned specialist runs on the same provider+model as the desk that spawned it. */
+const agentModels = new Map<string, string>();
 /** E005 {FR-008} — the providerId derived from an agent's spawned model, or
  *  `undefined` when none resolved (role-based/unresolvable). The E006 native
  *  runtime seam reads this to call `nativeRuntime.spawn(agentId, providerId)`. */
@@ -87,6 +93,7 @@ export function assignAgentModel(agentId: string, modelId: string | undefined):
   const providerId = deriveProviderId(id);
   if (providerId) agentProviderIds.set(agentId, providerId);
   else agentProviderIds.delete(agentId);
+  agentModels.set(agentId, id);
   // Forward to the renderer to apply via the existing agent-update path. The
   // renderer's useHive subscriber calls reassignAgentModel(agentId, id), so the
   // GOD path writes the SAME fields and persists the SAME way as an operator pick.
@@ -299,6 +306,7 @@ function teardownPty(id: string): void {
     ptyToAgent.delete(id);
     // E005 — drop the derived-provider record alongside the agent (no leak).
     agentProviderIds.delete(agentId);
+    agentModels.delete(agentId);
     // A killed/crashed Claude PTY emits no graceful Stop hook, so clear its turn state here; the
     // fleet:state reconcile (running:false ⇒ idle) then drops any stale "working" badge.
     markTurn(agentId, false);
@@ -421,6 +429,27 @@ const agentToolDeps: AgentToolDeps = {
   // scan backs both those gates and the hive_feature_status tool with the real on-disk markers.
   sddpMode: () => readConfig().sddpMode === true,
   featureStatus: (repo, feature) => scanFeatureStatus(repo, feature),
+  // Milestone advance gate: does `relPath` exist under <repo>/specs/<feature>/? Generic (covers
+  // data-model.md, contracts/, tasks.md, .qc-passed, …). Feature + relPath are sanitized to stay
+  // inside the feature dir (no traversal). Null repo / missing dir ⇒ false (the gate fails open
+  // only when the dep itself is ABSENT, not when the artifact is known-missing).
+  featureArtifactExists: (repo, feature, relPath) => {
+    if (!repo) return false;
+    const safeFeature = feature.replace(/[\\/]/g, '_').trim();
+    if (!safeFeature || safeFeature === '.' || safeFeature === '..') return false;
+    const base = join(repo, 'specs', safeFeature);
+    const target = join(base, relPath);
+    const rel = relative(base, target);
+    if (rel.startsWith('..') || isAbsolute(rel)) return false; // no escaping the feature dir
+    return existsSync(target);
+  },
+  // SDDP feature-scope WRITE gate: does this desk hold a task card on `feature`? (a sub-agent runs
+  // under its caller's id, so it scopes to the caller's cards). Reads stay free.
+  deskHoldsFeature: (id, feature) => {
+    const ledger = hive.tasks() as { tasks?: HiveTask[] } | undefined;
+    const tasks = Array.isArray(ledger?.tasks) ? ledger!.tasks : [];
+    return tasks.some((t) => t.assignee === id && t.feature === feature);
+  },
   // May edit code (write_file/edit_file/bash)? Role-driven, NO god/assistant special-case:
   // the `worker` role (writes features + tests) and the `integrator` role (writes merge-fix
   // code) grant editing; a reviewer / no-edit-role / assistant desk is read-only. This is the
@@ -518,7 +547,76 @@ const agentToolDeps: AgentToolDeps = {
   // DuckDuckGo; config is read live per call so the operator's enable/disable takes
   // effect at once. Throws a clear note when disabled — the executor turns that into a
   // recoverable success:false tool-result.
-  searchWeb: (query, opts) => searchWebDuckDuckGo(query, opts, readConfig())
+  searchWeb: (query, opts) => searchWebDuckDuckGo(query, opts, readConfig()),
+  // The native sub-agent runtime (the Task-tool replica): fork an EPHEMERAL specialist worker with
+  // the named sub-agent's prompt, run it once on `input`, return its final text. The child INHERITS
+  // the caller's provider + credentials, runs caller-scoped (its tools resolve cwd/repo/roles as the
+  // caller via executeNativeToolFor(callerId, …)), and is tightly bounded (deny-list incl. nesting
+  // + integrate + board mutation; low turn/hop caps; a turn budget; the runner adds a wall-clock
+  // timeout + concurrency cap). The sub-run is VISIBLE on the caller's transcript as the
+  // spawn_subagent tool call + its result; the child's token cost ROLLS UP to the caller (below).
+  spawnSubAgent: async (callerId, name, input) => {
+    const spec = subAgentSpec(name);
+    if (!spec) return { content: `unknown sub-agent '${name}' (available: ${SUB_AGENT_NAMES.join(', ')})`, success: false };
+    const providerId = agentProviderIds.get(callerId);
+    const callerModel = agentModels.get(callerId);
+    if (!providerId || providerId === 'anthropic' || !callerModel) {
+      return { content: 'spawn_subagent requires the calling desk to run on a native (non-Claude) provider with a model assigned', success: false };
+    }
+    const credEnv = injectionEnvForProvider(readConfig(), providerId);
+    if (!credEnv) return { content: `no stored credentials for provider '${providerId}' — the operator can add a key in Settings`, success: false };
+    // Sub-agent model: the operator's `sddpSubAgentModel` override when it maps to the SAME provider
+    // as the caller (so the caller's injected key still authenticates); otherwise the caller's own
+    // model. Provider + credentials are always the caller's.
+    const model = resolveSubAgentModel(callerModel, readConfig().sddpSubAgentModel, providerId, deriveProviderId);
+    // The child's denied tools: its role-derived denials PLUS the hard ones (no nesting, no merge,
+    // no board mutation — the calling desk owns the board). Enforced both by NOT advertising them
+    // and by the executor wrapper below (the execution gate uses caller roles, so re-check here).
+    const denySet = new Set<string>([...deniedNativeToolNames(spec.roles), 'spawn_subagent', 'hive_integrate', 'hive_update_task', 'hive_add_task']);
+    const childId = subAgentChildId(callerId, name);
+    const env: Record<string, string> = {
+      ...credEnv,
+      [NATIVE_PROVIDER_MODEL_ENV]: model,
+      NATIVE_AGENT_SUBAGENT_PROMPT: spec.systemPrompt,
+      NATIVE_AGENT_ENV_NOTE: describeBashEnv(),
+      NATIVE_AGENT_DENY_TOOLS: [...denySet].join(','),
+      // Bound the one-shot: a couple of turns, a dozen hops, a 2-minute turn budget.
+      NATIVE_AGENT_MAX_TURNS: '2',
+      NATIVE_AGENT_MAX_HOPS: '12',
+      NATIVE_AGENT_TURN_BUDGET_MS: '120000'
+    };
+    return runOneShotSubAgent({
+      callerId,
+      childId,
+      input,
+      transportFactory: () => makeElectronWorkerTransport({ agentId: childId, maxOldSpaceMb: 512, env }),
+      // Route the child's tool calls through the SAME governed path, but UNDER THE CALLER'S ID so
+      // cwd/repo/roles resolve to the caller (specs/ redirect + worktree correct for free). Deny
+      // the hard-denied tools here too (the advertised-catalog filter is the primary control).
+      executeTool: async (req) => {
+        if (denySet.has(req.toolName)) return { content: `a sub-agent may not call ${req.toolName}`, success: false };
+        return executeNativeToolFor(callerId, req);
+      },
+      // Observability: do NOT forward the raw child stream under a synthetic id (that created a
+      // phantom desk + an illegal agents/sub:… dir). Instead ROLL THE CHILD'S TOKEN COST UP to the
+      // calling desk via the telemetry collector, so the sub-agent's usage feeds the caller's cost
+      // ledger + breaker. The sub-run itself is already visible as the caller's spawn_subagent tool
+      // call (start) and its returned result (end).
+      onEvent: (event) => {
+        if (event.kind !== 'token-usage') return;
+        try {
+          telemetry.ingestNativeUsage({
+            agentId: callerId,
+            sessionId: event.sessionId ?? '',
+            providerName: deriveProviderId(event.model ?? undefined) ?? providerId,
+            requestModel: event.model ?? model,
+            responseModel: event.model ?? null,
+            tokens: { input: event.input, output: event.output, cacheRead: event.cacheRead, cacheCreation: event.cacheCreation }
+          });
+        } catch { /* best-effort cost rollup — never break the run */ }
+      }
+    });
+  }
 };
 
 // The orchestrator ROLE injected into a NATIVE god's system prompt (Michael on a
@@ -665,34 +763,41 @@ function nativeSddpRolePrompt(roles: AgentRole[]): string {
   return parts.join('\n\n');
 }
 
+// A native worker (or an ephemeral sub-agent) requests a tool; MAIN executes it against the
+// GOVERNED, cwd-sandboxed toolkit so a native desk is a full hive peer with parity to a Claude
+// desk. Every call is routed through the SAME guardrails a Claude desk hits: (1) the permission
+// gate (operator pause/halt/gated-tool deny); (2) the circuit breaker (loop/cost guard); (3)
+// executeAgentTool (single-committer I/O, cwd-sandboxed, bash opt-in). Extracted as a named
+// function so the sub-agent runner can route a CHILD's tool calls through it under the CALLER's id
+// (caller-scoped cwd/repo/roles) — same governance, same single-committer.
+async function executeNativeToolFor(
+  id: string,
+  req: { toolCallId: string; toolName: string; toolInput: unknown }
+): Promise<{ content: string; success: boolean }> {
+  if (control.shouldHalt(id)) return { content: 'halted by operator', success: false };
+  const decision = control.toolDecision(id, req.toolName);
+  if (decision.deny) return { content: decision.reason ?? 'denied by operator', success: false };
+  // The attempt is recorded BEFORE execution, so a desk hammering an identical denied tool
+  // still feeds the breaker's loop guard.
+  breaker.recordToolUse(id, req.toolName, req.toolInput);
+  const result = await executeAgentTool(agentToolDeps, id, req);
+  // Visibility (#edit-gate): make a read-only role denial observable in the main log, so
+  // "is the god actually writing?" is a fact, not a guess.
+  if (!result.success && (req.toolName === 'write_file' || req.toolName === 'edit_file' || req.toolName === 'bash')
+      && /read-only/.test(result.content)) {
+    console.log(`[edit-gate] denied ${req.toolName} for ${id} roles=[${(hive.registry().agents[id]?.roles ?? []).join(',')}]`);
+  }
+  return result;
+}
+
 // E003 — native (non-Claude) agents run in isolated utilityProcess workers,
 // fronted by the ProviderRuntime port. The drain runs in MAIN (single-committer
 // hive); a worker exit reuses the same archive path as a PTY exit (AD-004).
 const nativeRuntime = new NativeRuntime({
   drainForStop: (id) => (hive.enabled() ? hive.drainForStop(id) : { block: false }),
-  // A native worker requests a tool; MAIN executes it against the GOVERNED, cwd-
-  // sandboxed toolkit so a native desk is a full hive peer with parity to a Claude
-  // desk. Every call is routed through the SAME guardrails a Claude desk hits:
-  //  (1) the permission gate — operator pause / halt / gated-tool deny (parity with
-  //      Claude's PreToolUse hook, which native calls otherwise bypassed);
-  //  (2) the circuit breaker — feed the loop/cost guard (parity with PostToolUse);
-  //  (3) executeAgentTool — single-committer I/O, cwd-sandboxed, bash opt-in.
-  executeToolFor: async (id, req) => {
-    if (control.shouldHalt(id)) return { content: 'halted by operator', success: false };
-    const decision = control.toolDecision(id, req.toolName);
-    if (decision.deny) return { content: decision.reason ?? 'denied by operator', success: false };
-    // The attempt is recorded BEFORE execution, so a desk hammering an identical denied tool
-    // still feeds the breaker's loop guard.
-    breaker.recordToolUse(id, req.toolName, req.toolInput);
-    const result = await executeAgentTool(agentToolDeps, id, req);
-    // Visibility (#edit-gate): make a read-only role denial observable in the main log, so
-    // "is the god actually writing?" is a fact, not a guess.
-    if (!result.success && (req.toolName === 'write_file' || req.toolName === 'edit_file' || req.toolName === 'bash')
-        && /read-only/.test(result.content)) {
-      console.log(`[edit-gate] denied ${req.toolName} for ${id} roles=[${(hive.registry().agents[id]?.roles ?? []).join(',')}]`);
-    }
-    return result;
-  },
+  // A native worker requests a tool; MAIN executes it through the governed, cwd-sandboxed toolkit
+  // (permission gate → circuit breaker → executeAgentTool). See `executeNativeToolFor` above.
+  executeToolFor: executeNativeToolFor,
   // A native worker exit is TRANSIENT, not a retire: the desk is revive-on-demand and stays on
   // the operator's floor, so do NOT archive it (archiving would hide a still-wanted role-holder
   // from the god's routing). Clear its turn state + drop its breaker counters; the desk reads as
@@ -1348,6 +1453,7 @@ ipcMain.handle('pty:spawn', async (_evt, opts: SpawnOptions & { hive?: AgentMeta
     const providerId = deriveProviderId(resolvedModel);
     if (providerId) agentProviderIds.set(opts.hive.id, providerId);
     else agentProviderIds.delete(opts.hive.id);
+    if (resolvedModel) agentModels.set(opts.hive.id, resolvedModel);
     // E006 {FR-008} — spawn router: a desk assigned to a NATIVE provider (a derived
     // providerId that is not Claude/anthropic) LAUNCHES on that provider via the
     // native worker + the adapter selected from the injected env, NOT the Claude PTY

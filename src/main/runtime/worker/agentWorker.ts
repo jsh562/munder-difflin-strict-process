@@ -65,6 +65,10 @@ if (parentPort) {
   // SDDP mode: a single spec-driven preamble assembled host-side from the desk's roles
   // (replaces the standard worker/reviewer/integrator prompts above when the floor is in SDDP mode).
   const sddpPrompt = (process.env.NATIVE_AGENT_SDDP_PROMPT ?? '').trim();
+  // Ephemeral sub-agent: when this worker IS a one-shot specialist (spawn_subagent), its single
+  // responsibility + I/O contract is injected here and REPLACES the role prompts (the host sets
+  // only this for a child). Empty for a normal desk.
+  const subAgentPrompt = (process.env.NATIVE_AGENT_SUBAGENT_PROMPT ?? '').trim();
   // The board transitions this (non-god) desk may make — host-derived from its roles so the
   // model knows what it can do on hive_update_task before attempting a move it can't.
   const boardLine = (process.env.NATIVE_AGENT_BOARD_LINE ?? '').trim();
@@ -72,9 +76,21 @@ if (parentPort) {
   // Order: base toolkit preamble → role prompt(s) (god orchestrator; or a non-god desk's
   // worker/reviewer/integrator preamble — a desk can hold several; or the SDDP preamble when
   // the floor is in spec-driven mode) → board-capability line → shell note.
-  const nativePreamble = [NATIVE_AGENT_PREAMBLE, godPrompt, workerPrompt, reviewerPrompt, integratorPrompt, sddpPrompt, boardLine, envNote]
+  const nativePreamble = [NATIVE_AGENT_PREAMBLE, godPrompt, workerPrompt, reviewerPrompt, integratorPrompt, sddpPrompt, subAgentPrompt, boardLine, envNote]
     .filter(Boolean)
     .join('\n\n');
+
+  // Loop caps — defaults match prior behavior (50/50, no wall-clock bound). A host can tighten
+  // them per spawn via env (used for ephemeral sub-agents: fewer turns/hops + a turn budget so a
+  // one-shot specialist can't run away on cost). A non-numeric/absent value falls back.
+  const intEnv = (k: string, dflt: number): number => {
+    const n = parseInt(process.env[k] ?? '', 10);
+    return Number.isFinite(n) && n > 0 ? n : dflt;
+  };
+  const maxTurns = intEnv('NATIVE_AGENT_MAX_TURNS', 50);
+  const maxHops = intEnv('NATIVE_AGENT_MAX_HOPS', 50);
+  const turnBudgetEnv = parseInt(process.env.NATIVE_AGENT_TURN_BUDGET_MS ?? '', 10);
+  const turnBudgetMs = Number.isFinite(turnBudgetEnv) && turnBudgetEnv > 0 ? turnBudgetEnv : undefined;
 
   const requestDrain = (): Promise<{ block: boolean; reason?: string }> => {
     const turnId = ++turnSeq;
@@ -139,7 +155,7 @@ if (parentPort) {
               systemPrompt: isNative ? nativePreamble : undefined,
               emit: (event) => post({ type: 'event', event }),
               requestDrain,
-              caps: { maxTurns: 50, maxHops: 50 }
+              caps: { maxTurns, maxHops, ...(turnBudgetMs ? { turnBudgetMs } : {}) }
             },
             cmd.input.text
           );

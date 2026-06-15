@@ -189,6 +189,12 @@ export interface HarnessConfig {
    *  kanban shows a feature-phase banner, and `hive_update_task` enforces the phase gates.
    *  A wholesale switch — when off, standard behaviour is unchanged. */
   sddpMode?: boolean;
+  /** SDDP only: the model an ephemeral `spawn_subagent` specialist runs on. Lets the operator
+   *  point sub-agents at a cheaper/faster model than the orchestrator desk. The provider +
+   *  credentials are ALWAYS inherited from the calling desk; only the model id is overridden, and
+   *  only when the override resolves to the SAME provider as the caller (a cross-provider override
+   *  is ignored so the caller's key still works). Absent ⇒ sub-agents run on the caller's model. */
+  sddpSubAgentModel?: string;
 
   // ─── Memory reflection (the janitor's condense half) ───────────────────────
   /** Master toggle for the in-process MemoryReflector. Default on. */
