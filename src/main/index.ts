@@ -443,6 +443,34 @@ const agentToolDeps: AgentToolDeps = {
     if (rel.startsWith('..') || isAbsolute(rel)) return false; // no escaping the feature dir
     return existsSync(target);
   },
+  // hive_import_tasks: parse a feature's tasks.md into its open implement tasks (the `- [ ] T### …`
+  // lines), stripping the [P]/[US#]/{FR-###}/[after:…] annotations down to the human description.
+  // The host owns the fs read; the executor turns each into a feature-tagged card. Feature is
+  // sanitized to a single path segment (no traversal), like scanFeatureStatus.
+  parseFeatureTasks: (repo, feature) => {
+    if (!repo) return [];
+    const safe = feature.replace(/[\\/]/g, '_').trim();
+    if (!safe || safe === '.' || safe === '..') return [];
+    const file = join(repo, 'specs', safe, 'tasks.md');
+    if (!existsSync(file)) return [];
+    let text: string;
+    try { text = readFileSync(file, 'utf8'); } catch { return []; }
+    const out: { taskId?: string; title: string }[] = [];
+    for (const raw of text.split('\n')) {
+      const m = /^\s*-\s*\[ \]\s*(T\d+)\b\s*(.*)$/.exec(raw);
+      if (!m) continue; // only OPEN `- [ ] T###` tasks
+      let rest = m[2].trim();
+      // strip the leading [P]/[US#|OBJ#]/{FR-###} tag tokens
+      for (;;) {
+        const tag = /^(?:\[[^\]]*\]|\{[^}]*\})\s*/.exec(rest);
+        if (!tag) break;
+        rest = rest.slice(tag[0].length);
+      }
+      rest = rest.replace(/\s*\[after:[^\]]*\]\s*$/i, '').trim(); // drop the trailing ordering hint
+      out.push({ taskId: m[1], title: rest || m[1] });
+    }
+    return out;
+  },
   // SDDP feature-scope WRITE gate: does this desk hold a task card on `feature`? (a sub-agent runs
   // under its caller's id, so it scopes to the caller's cards). Reads stay free.
   deskHoldsFeature: (id, feature) => {
@@ -707,7 +735,7 @@ function nativeSddpGodPrompt(godRoles: AgentRole[]): string {
     SDDP_LIFECYCLE,
     '- Specify→Clarify→Plan→Tasks: assign to a PLANNER desk (it authors spec.md, resolves clarifications, plan.md, tasks.md). Answer its clarification questions.',
     '- SPEC/PLAN gate: have a REVIEWER read spec.md/plan.md/tasks.md (read-only) and approve, or send back to the planner.',
-    '- Implement: once tasks.md exists, turn its tasks into cards (hive_import_tasks if available, else hive_add_task) assigned to WORKER desks — P1 first, independent tasks in parallel.',
+    '- Implement: once tasks.md exists, run hive_import_tasks (feature) to turn its `- [ ] T###` tasks into board cards in one call, then assign them to WORKER desks — P1 first, independent tasks in parallel.',
     '- CODE gate: a REVIEWER reviews each implemented slice.',
     '- QC: a QC desk runs tests/lint/security + verifies stories vs spec → it sets .qc-passed, or files bug tasks back to workers.',
     '- Integrate: an INTEGRATOR merges only AFTER .qc-passed, then signs off (done).',
