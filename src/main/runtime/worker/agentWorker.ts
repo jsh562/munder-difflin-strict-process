@@ -59,19 +59,20 @@ if (parentPort) {
   // stable per machine/desk ⇒ no prompt-cache bust. Order: base toolkit preamble → god
   // role (if any) → shell note.
   const godPrompt = (process.env.NATIVE_AGENT_GOD_PROMPT ?? '').trim();
+  const workerPrompt = (process.env.NATIVE_AGENT_WORKER_PROMPT ?? '').trim();
   const reviewerPrompt = (process.env.NATIVE_AGENT_REVIEWER_PROMPT ?? '').trim();
   const integratorPrompt = (process.env.NATIVE_AGENT_INTEGRATOR_PROMPT ?? '').trim();
   // SDDP mode: a single spec-driven preamble assembled host-side from the desk's roles
-  // (replaces the standard reviewer/integrator prompts above when the floor is in SDDP mode).
+  // (replaces the standard worker/reviewer/integrator prompts above when the floor is in SDDP mode).
   const sddpPrompt = (process.env.NATIVE_AGENT_SDDP_PROMPT ?? '').trim();
   // The board transitions this (non-god) desk may make — host-derived from its roles so the
   // model knows what it can do on hive_update_task before attempting a move it can't.
   const boardLine = (process.env.NATIVE_AGENT_BOARD_LINE ?? '').trim();
   const envNote = (process.env.NATIVE_AGENT_ENV_NOTE ?? '').trim();
   // Order: base toolkit preamble → role prompt(s) (god orchestrator; or a non-god desk's
-  // reviewer and/or integrator preamble — a desk can hold both; or the SDDP preamble when
+  // worker/reviewer/integrator preamble — a desk can hold several; or the SDDP preamble when
   // the floor is in spec-driven mode) → board-capability line → shell note.
-  const nativePreamble = [NATIVE_AGENT_PREAMBLE, godPrompt, reviewerPrompt, integratorPrompt, sddpPrompt, boardLine, envNote]
+  const nativePreamble = [NATIVE_AGENT_PREAMBLE, godPrompt, workerPrompt, reviewerPrompt, integratorPrompt, sddpPrompt, boardLine, envNote]
     .filter(Boolean)
     .join('\n\n');
 

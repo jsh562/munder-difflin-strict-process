@@ -13,9 +13,9 @@ import {
   getBranch, getStatus, getLog, getBranches, getAheadBehind, isRepo,
   addWorktree, removeWorktree, listWorktrees, planWorktree, type GitWorktree,
   previewMerge, mergeBranch, agentBranchFor, agentBranchForId, branchCommitsAhead,
-  repoTrunk, worktreeHealth, migrateBranchToWorktree, resetBaseToTrunk
+  repoTrunk, worktreeHealth, resetBaseToTrunk, deleteMergedBranch
 } from './git';
-import { HiveManager, roleCanEditCode, canIntegrate as rolesCanIntegrate, canReview as rolesCanReview, boardCapabilityLine, type AgentMeta, type HiveMessage, type HiveTask, type AgentRole } from './hive';
+import { HiveManager, roleCanEditCode, roleAuthorsCode, roleCanWriteFiles, canIntegrate as rolesCanIntegrate, canReview as rolesCanReview, boardCapabilityLine, type AgentMeta, type HiveMessage, type HiveTask, type AgentRole } from './hive';
 import { HookServer } from './hooks';
 import { CircuitBreaker, type BreakerInput } from './breaker';
 import type { UsageProvider } from './usage';
@@ -199,6 +199,18 @@ const worktreePaths = new Map<string, string>();
  *  `git worktree remove` from the parent tree, not the worktree itself). */
 const worktreeOrigins = new Map<string, string>();
 
+/** Per-repo merge serialization: all integrations into one repo land on its single base tree, so
+ *  concurrent `git merge` would race the index. This chains merges-into-the-same-repo so two
+ *  integrators (or a double hive_integrate) run one-at-a-time. Keyed by normalized repo path. */
+const repoMergeChains = new Map<string, Promise<unknown>>();
+function withRepoMergeLock<T>(repo: string, fn: () => Promise<T>): Promise<T> {
+  const key = normalizeRepoPath(repo);
+  const prev = repoMergeChains.get(key) ?? Promise.resolve();
+  const run = prev.then(fn, fn); // run regardless of whether the previous merge resolved/rejected
+  repoMergeChains.set(key, run.then(() => {}, () => {})); // keep the chain alive past errors
+  return run;
+}
+
 // Tell the hive how to resolve a desk's *project repo* (used to match a task's
 // reviewer/integrator to the project it belongs to). An isolated desk's cwd is its
 // worktree, so prefer the worktree's ORIGIN repo; otherwise the desk's registry cwd.
@@ -371,6 +383,7 @@ const agentToolDeps: AgentToolDeps = {
       const origin = worktreeOrigins.get(wtKey);
       const wtPath = worktreePaths.get(wtKey);
       const isWorker = a.isGod !== true && a.isAssistant !== true;
+      const authors = roleAuthorsCode(a.roles); // only authors have an isolated worktree/branch
       return {
         id: a.id,
         name: a.name,
@@ -383,10 +396,10 @@ const agentToolDeps: AgentToolDeps = {
           nativeRuntime.runtimeFor(a.id) !== undefined ||
           [...ptyToAgent.entries()].some(([ptyId, aid]) => aid === a.id && livePtys.has(ptyId)),
         repo: origin ?? (isWorker ? a.cwd : undefined),
-        // Live worktree branch when mapped; else the deterministic agent/<id> for a worker desk
-        // (the map is cleared on exit, but every worker isolates onto agent/<id> and the worktree
-        // is kept) — so a COLD desk still reports the branch where its work lives.
-        branch: wtPath ? agentBranchFor(wtPath) : (isWorker ? agentBranchForId(a.id) : undefined)
+        // The desk's worktree home branch when mapped; else the deterministic agent/<id> for an
+        // AUTHOR desk (worktree kept; map cleared on exit) — integrator/reviewer don't isolate, so
+        // they report no branch. (A card's actual per-task branch lives on its `branch` field.)
+        branch: wtPath ? agentBranchFor(wtPath) : (authors ? agentBranchForId(a.id) : undefined)
       };
     });
   },
@@ -401,15 +414,9 @@ const agentToolDeps: AgentToolDeps = {
   // Holds the `reviewer` role? Lets it approve/send-back a card in `review`.
   canReview: (id) => rolesCanReview(hive.registry().agents[id]?.roles),
   // A desk's project repo — stamps a task's `project` on assignment (off-project detection).
+  // (A card's per-task `branch` is now deterministic — `agentTaskBranch(assignee, cardId)` in the
+  // executor — so no host branch resolver is needed.)
   repoFor: (id) => repoForId(id),
-  // A desk's `agent/<id>` worktree branch — stamps a task's `branch` on assignment so a
-  // reassigned card carries a durable pointer to the prior work. Prefer the LIVE worktree
-  // branch; fall back to the deterministic name so a cold/never-spawned desk still stamps a
-  // usable pointer (every worker isolates onto agent/<id>).
-  branchFor: (id) => {
-    const wt = worktreePaths.get(`pty-${id}`);
-    return wt ? agentBranchFor(wt) : agentBranchForId(id);
-  },
   // SDDP mode (read live) gates the lifecycle hard-checks in hive_update_task; the feature
   // scan backs both those gates and the hive_feature_status tool with the real on-disk markers.
   sddpMode: () => readConfig().sddpMode === true,
@@ -419,10 +426,20 @@ const agentToolDeps: AgentToolDeps = {
   // code) grant editing; a reviewer / no-edit-role / assistant desk is read-only. This is the
   // god's delegation lever — a god holding neither worker nor integrator (e.g. reviewer-only)
   // physically cannot implement, so it must delegate. Read live so a role toggle applies at once.
+  // NOTE: canEditCode now governs `bash` specifically (incl. the integrator's test/merge gate);
+  // file writes use canWriteFiles below.
   canEditCode: (id) => {
     const a = hive.registry().agents[id];
     if (!a) return true; // unknown desk → don't over-restrict
     return roleCanEditCode(a.roles);
+  },
+  // May WRITE project files (write_file/edit_file + specs/ artifacts)? AUTHORS only
+  // (worker/planner/qc) — the integrator is a gate+merger (merges host-side, never authors the
+  // trunk) and the reviewer is read-only. Read live so a role toggle applies at once.
+  canWriteFiles: (id) => {
+    const a = hive.registry().agents[id];
+    if (!a) return true; // unknown desk → don't over-restrict
+    return roleCanWriteFiles(a.roles);
   },
   // Extra READ roots: every desk may READ any registered project repo + any worktree (to
   // compare versions or read a peer's branch — the god/reviewer especially need this), while
@@ -471,39 +488,25 @@ const agentToolDeps: AgentToolDeps = {
         success: true
       };
     }
-    const m = await mergeBranch(repo, branch);
-    if (!m.ok) {
-      return {
-        content: m.conflict
-          ? `merge CONFLICT — aborted, repo left clean. Send ${branch} back to its author to rebase/resolve.\n${m.error}`
-          : `merge failed: ${m.error}`,
-        success: false
-      };
-    }
-    // Post-merge cleanup (the merger is the only one who deletes a worktree, and only after a
-    // clean merge): the merged branch's work is now in base, so its worktree is disposable —
-    // BUT only remove it when its worker desk is COLD (so a still-live worker isn't yanked
-    // mid-step), and only when we can positively identify that worker (else keep, conservative).
-    // Best-effort; the merge already succeeded regardless. The operator can still bulk-clean the
-    // rest from Settings → Worktrees.
-    try {
-      const wts = await listWorktrees(repo);
-      const merged = Array.isArray(wts) ? wts.find((w) => !w.isMain && w.branch === branch) : undefined;
-      if (merged) {
-        const ownerId = Object.values(hive.registry().agents).find((a) => agentBranchForId(a.id) === branch)?.id ?? null;
-        const ownerLive = ownerId ? isAgentRunning(ownerId) : true; // unknown owner ⇒ treat as live (don't delete)
-        if (!ownerLive) {
-          const rm = await removeWorktree(repo, merged.path);
-          if (rm.ok) {
-            if (ownerId) { worktreePaths.delete(`pty-${ownerId}`); worktreeOrigins.delete(`pty-${ownerId}`); }
-            return { content: `merged ${branch} into ${m.base}; removed its worktree (worker idle)`, success: true };
-          }
-        } else {
-          return { content: `merged ${branch} into ${m.base}; worktree kept — its worker is still live (clean it from Settings → Worktrees when done)`, success: true };
-        }
+    // Serialize merges into THIS repo (one base tree → concurrent git merge would race the index),
+    // so two integrators (or a double hive_integrate) can't corrupt it.
+    return withRepoMergeLock(repo, async () => {
+      const m = await mergeBranch(repo, branch);
+      if (!m.ok) {
+        return {
+          content: m.conflict
+            ? `merge CONFLICT — aborted, repo left clean. Send ${branch} back to its author to rebase/resolve.\n${m.error}`
+            : `merge failed: ${m.error}`,
+          success: false
+        };
       }
-    } catch { /* best-effort cleanup — never fail a successful merge on it */ }
-    return { content: `merged ${branch} into ${m.base}`, success: true };
+      // Post-merge cleanup: the per-task branch is now in the trunk, so delete the merged branch
+      // (best-effort `git branch -d` — refuses if still checked out / not merged). The worker's
+      // per-DESK worktree persists (reused for its next card). Never fails a successful merge.
+      let cleaned = '';
+      try { if ((await deleteMergedBranch(repo, branch)).ok) cleaned = '; deleted the merged branch'; } catch { /* best-effort */ }
+      return { content: `merged ${branch} into ${m.base}${cleaned}`, success: true };
+    });
   },
   appendMemory: (id, text) => hive.appendMemory(id, text),
   resolveCwd: (id) => hive.registry().agents[id]?.cwd ?? null,
@@ -566,11 +569,24 @@ const NATIVE_AGENT_REVIEWER_PROMPT = [
 ].join('\n');
 
 // Injected into a NON-god desk that holds the `integrator` role (a dedicated integrator).
+// The integrator is a GATE + MERGER, not an author: it runs in the base tree on the trunk (no
+// isolated worktree), keeps `bash` for the test gate + `hive_integrate`, but has NO write_file/
+// edit_file — it never authors the trunk; conflicts go back to the author.
 const NATIVE_AGENT_INTEGRATOR_PROMPT = [
-  'You also hold the INTEGRATOR role: you MERGE other desks\' approved work and sign it off (you do not re-implement it). You are the project\'s last quality gate.',
-  '- You are PINGED automatically when a card enters "integrate" (one integrator is picked, so no double-merge); you should ALSO, on each wake, scan hive_list_tasks for any cards in "integrate" and merge them — don\'t wait to be asked.',
-  '- hive_list_agents shows each desk\'s repo + worktree branch. For an "integrate" card: FIRST run the test suite (bash) as the merge gate — if it is red, send the card back to its author (status "doing") with a `note`; do not merge red work. If green, hive_integrate (no apply) to inspect commits + diff, then hive_integrate apply:true to merge into the repo\'s base branch, then hive_update_task it to "done".',
-  '- A reported merge conflict aborts cleanly — resolve it yourself (you may edit ONLY to settle the conflict) or send the card back to its author (status "doing", with a `note`) to rebase/resolve; never force it.'
+  'You also hold the INTEGRATOR role: you GATE + MERGE other desks\' approved work and sign it off — you do NOT author or re-implement it. You run in the base tree on the trunk; you have no write_file/edit_file (you merge host-side, you don\'t edit the trunk).',
+  '- You are PINGED automatically when a card enters "integrate" (one integrator per card, no double-merge); you should ALSO, on each wake, scan hive_list_tasks for cards in "integrate" and merge them.',
+  '- Merge the CARD\'S branch (its `branch` field on the card / hive_list_tasks). FIRST run the test suite (bash) as the merge gate — if red, send the card back to its author (status "doing") with a `note`; don\'t merge red work. If green: hive_integrate (no apply) to inspect commits + diff, then hive_integrate apply:true to merge that branch into the trunk, then hive_update_task it to "done".',
+  '- A merge conflict aborts cleanly (the trunk is left untouched) — send the card back to its author (status "doing", with a `note`) to rebase/resolve on their own branch and resubmit. You do not resolve conflicts in the trunk yourself.'
+].join('\n');
+
+// Injected into a NON-god desk that holds the `worker` role (standard mode). Workers author code
+// on a PER-CARD branch off the trunk — so each card integrates independently and the next card
+// starts clean (never two cards on one branch).
+const NATIVE_AGENT_WORKER_PROMPT = [
+  'You hold the WORKER role: you implement ONE card at a time on its OWN branch.',
+  '- For each card, work on the branch named in the card\'s `branch` field (from hive_list_tasks). Start it fresh off the latest trunk: `git fetch`/update, then `git checkout -b <card.branch> <trunk>` (e.g. master/main). Commit ONLY that card\'s work there.',
+  '- Run the build/tests, then move the card "doing"→"review". A reviewer approves it to "integrate" and an integrator merges that branch into the trunk. After it merges, start your NEXT card on a fresh branch off the (now-updated) trunk — never pile two cards on one branch.',
+  '- If a card comes back to you (send-back / conflict), it\'s the same branch + context — fix it there and resubmit; merge the latest trunk into your branch first to clear conflicts.'
 ].join('\n');
 
 // ─── SPEC-DRIVEN (SDDP) mode prompts ─────────────────────────────────────────
@@ -615,9 +631,9 @@ const NATIVE_SDDP_PLANNER_PROMPT = [
 ].join('\n');
 
 const NATIVE_SDDP_WORKER_PROMPT = [
-  'You hold the SDDP WORKER role: you IMPLEMENT from tasks.md (you do not change the spec).',
-  '- Take a task assigned to you, do EXACTLY that task, respect `after:T###` ordering, run the build/tests, then mark its checkbox `[ ]`→`[X]` in tasks.md and commit on your branch.',
-  '- Move your card doing→review when the slice is done. If a task is wrong or under-specified, do NOT guess — message "god" to route it back to the planner.'
+  'You hold the SDDP WORKER role: you IMPLEMENT from tasks.md (you do not change the spec). One card at a time, on its OWN branch.',
+  '- For each card, check out the branch named in its `branch` field, fresh off the latest trunk (`git checkout -b <card.branch> <trunk>`). Do EXACTLY that task, respect `after:T###` ordering, run the build/tests, mark its checkbox `[ ]`→`[X]` in tasks.md (the SHARED specs/ — auto-anchored to the base repo), and commit your CODE on that branch.',
+  '- Move your card doing→review when the slice is done; after it merges, take the next card on a fresh branch off the updated trunk (never two cards on one branch). If a task is wrong/under-specified, do NOT guess — message "god" to route it back to the planner.'
 ].join('\n');
 
 const NATIVE_SDDP_REVIEWER_PROMPT = [
@@ -634,8 +650,8 @@ const NATIVE_SDDP_QC_PROMPT = [
 ].join('\n');
 
 const NATIVE_SDDP_INTEGRATOR_PROMPT = [
-  'You hold the SDDP INTEGRATOR role: merge a feature ONLY after it has `.qc-passed`.',
-  '- Then hive_integrate (preview → apply) to merge the feature\'s branch into the repo base, and sign its cards off to "done". On conflict, resolve it (conflict-only edits) or send it back.'
+  'You hold the SDDP INTEGRATOR role: you GATE + MERGE (you do NOT author). Merge a feature ONLY after it has `.qc-passed`.',
+  '- Then hive_integrate (preview → apply) to merge the card\'s branch (its `branch` field) into the trunk, and sign its cards off to "done". On conflict, send the card back to its author to rebase/resolve on their branch — you don\'t edit the trunk yourself.'
 ].join('\n');
 
 /** Assemble the SDDP preamble for a NON-god desk from the roles it holds. */
@@ -706,8 +722,9 @@ const nativeRuntime = new NativeRuntime({
         // reviewer/qc/integrator). agentWorker prepends it to the system prompt.
         env.NATIVE_AGENT_SDDP_PROMPT = nativeSddpRolePrompt(roles);
       } else {
-        // A non-god desk can hold reviewer and/or integrator on top of (or instead of) worker;
-        // inject each role's preamble so its responsibilities are spelled out.
+        // A non-god desk can hold worker and/or reviewer and/or integrator; inject each role's
+        // preamble so its responsibilities are spelled out (a desk may hold several).
+        if (roles.includes('worker')) env.NATIVE_AGENT_WORKER_PROMPT = NATIVE_AGENT_WORKER_PROMPT;
         if (roles.includes('reviewer')) env.NATIVE_AGENT_REVIEWER_PROMPT = NATIVE_AGENT_REVIEWER_PROMPT;
         if (roles.includes('integrator')) env.NATIVE_AGENT_INTEGRATOR_PROMPT = NATIVE_AGENT_INTEGRATOR_PROMPT;
       }
@@ -1269,16 +1286,17 @@ ipcMain.handle('pty:spawn', async (_evt, opts: SpawnOptions & { hive?: AgentMeta
   if (!opts || typeof opts.id !== 'string' || typeof opts.cwd !== 'string' || typeof opts.command !== 'string') {
     return { ok: false, error: 'invalid SpawnOptions' };
   }
-  // Git isolation: EVERY worker desk on a git repo gets its own worktree on an `agent/<id>`
-  // branch — including the first. The repo's base/main tree is reserved as the INTEGRATION
-  // TARGET and is never an agent's cwd (no desk commits straight to the trunk); the integrator
-  // merges branches into it host-side via hive_integrate→mergeBranch, which needs no agent in
-  // the base tree. A RESTART of an already-isolated desk REATTACHES to its existing worktree
-  // (planWorktree, independent of forceNew), so a role-toggle restart never drops a desk into
-  // the shared tree. Best-effort — a failure falls back to the shared cwd. (The god/assistant
-  // never isolate; their cwd is a neutral home, not a project repo.)
-  const isWorkerDesk = !!opts.hive && !opts.hive.isGod && !opts.hive.isAssistant;
-  if (isWorkerDesk && await isRepo(opts.cwd)) {
+  // Git isolation: only code AUTHORS (worker/planner/qc) get their own `agent/<id>` worktree —
+  // they author on their own branch. The INTEGRATOR + REVIEWER do NOT isolate: the integrator
+  // merges branches into the base/trunk host-side (hive_integrate→mergeBranch) and the reviewer
+  // is read-only, so both run in the base tree on the trunk (the integration target). A RESTART
+  // of an already-isolated desk REATTACHES to its existing worktree (planWorktree, independent of
+  // forceNew). Best-effort — a failure falls back to the shared cwd. (god/assistant never isolate
+  // — neutral home, not a project repo. A desk with no explicit roles defaults to worker.)
+  const roles = opts.hive?.roles ?? [];
+  const isAuthorDesk = !!opts.hive && !opts.hive.isGod && !opts.hive.isAssistant
+    && (roles.length === 0 || roleAuthorsCode(roles));
+  if (isAuthorDesk && await isRepo(opts.cwd)) {
     const wt = await provisionWorktree(opts.cwd, opts.hive?.id ?? opts.id, /* forceNew (always isolate) */ true);
     if (wt) {
       opts.cwd = wt.path;
@@ -1435,20 +1453,11 @@ ipcMain.handle('git:worktreeHealth', async () => {
   }
   return out;
 });
-// Recovery: move a desk's branch out of the base tree into its own worktree (stashes any
-// uncommitted base-tree state). The target path mirrors provisionWorktree's primary path.
-ipcMain.handle('git:migrateWorktree', async (_evt, repo: unknown, branch: unknown) => {
-  if (typeof repo !== 'string' || typeof branch !== 'string') return { ok: false, stashed: false, error: 'invalid args' };
-  const id = branch.startsWith('agent/') ? branch.slice('agent/'.length) : branch;
-  const seg = id.replace(/[^A-Za-z0-9._-]/g, '-');
-  const wtPath = join(readConfig().harnessHome ?? repo, 'worktrees', seg);
-  const res = await migrateBranchToWorktree(repo, branch, wtPath);
-  if (res.ok) { worktreePaths.set(`pty-${id}`, wtPath); worktreeOrigins.set(`pty-${id}`, repo); }
-  return res;
-});
-// Recovery: put the base tree back on its trunk (clean-only; refuses a dirty tree).
+// Recovery: put the base tree back on its trunk (stashes any uncommitted state first). When the
+// freed branch belongs to an author desk, it re-isolates onto it on next spawn; an integrator/
+// reviewer just runs in the base on the trunk.
 ipcMain.handle('git:resetBaseToTrunk', async (_evt, repo: unknown) => {
-  if (typeof repo !== 'string') return { ok: false, error: 'invalid args' };
+  if (typeof repo !== 'string') return { ok: false, stashed: false, error: 'invalid args' };
   return resetBaseToTrunk(repo);
 });
 

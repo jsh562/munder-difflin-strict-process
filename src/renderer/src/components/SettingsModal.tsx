@@ -108,19 +108,13 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
   };
   useEffect(() => { void loadHealth(); }, []);
   const agentNameFor = (id: string | null) => (id && useStore.getState().agents.find((a) => a.id === id)?.name) || id || '';
-  const migrateWt = async (repo: string, branch: string) => {
-    setWtBusy(true); setWtMsg('');
-    try {
-      const r = await window.cth.migrateWorktree(repo, branch);
-      setWtMsg(r.ok ? `Migrated ${branch} to its worktree${r.stashed ? ' (uncommitted base-tree changes were stashed — recover/discard with `git stash` in the repo)' : ''}.` : `Migrate failed: ${r.error ?? 'unknown'}`);
-      await loadHealth();
-    } finally { setWtBusy(false); }
-  };
   const resetBase = async (repo: string) => {
     setWtBusy(true); setWtMsg('');
     try {
       const r = await window.cth.resetBaseToTrunk(repo);
-      setWtMsg(r.ok ? 'Base tree reset to trunk.' : `Reset failed: ${r.error ?? 'unknown'}`);
+      setWtMsg(r.ok
+        ? `Base tree reset to trunk${r.stashed ? ' (uncommitted state was stashed — recover/discard with `git stash` in the repo)' : ''}.`
+        : `Reset failed: ${r.error ?? 'unknown'}`);
       await loadHealth();
     } finally { setWtBusy(false); }
   };
@@ -615,7 +609,7 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
               <div style={subLabelStyle}>The god's own neutral folder (native god) — not a project. The god reads the project repos and delegates; give it a role to have it edit/merge directly.</div>
 
               {/* Worktrees diagnostics — per repo, per worktree: branch, health flags, and recovery
-                  actions (migrate a desk's branch out of the base tree, reset base to trunk, delete). */}
+                  actions (reset base to trunk, delete). */}
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
                   <span style={{ width: 140, flexShrink: 0, color: 'var(--cth-ink-500)', fontSize: 14 }}>Worktrees</span>
@@ -634,7 +628,7 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
                       <span style={{ fontFamily: 'var(--cth-font-display)', fontSize: 8, color: 'var(--cth-ink-700)' }}>{h.repo.split(/[\\/]/).filter(Boolean).pop()}</span>
                       <span style={{ color: 'var(--cth-ink-500)' }}>trunk: {h.trunk}</span>
                       {h.baseOnAgentBranch && (
-                        <span title={`The integration base tree is on ${h.baseBranch}, not the trunk — migrate that desk to its own worktree.`}
+                        <span title={`The integration base tree is on ${h.baseBranch}, not the trunk — "reset base to trunk" to restore it (author branches re-isolate; integrator/reviewer run on the trunk).`}
                           style={{ color: 'var(--cth-coral)' }}>⚠ base on {h.baseBranch}</span>
                       )}
                     </div>
@@ -652,10 +646,7 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
                           }}>{f === 'dirty' ? `dirty ${w.dirty}` : f === 'unmerged' ? `unmerged ${w.ahead}` : f}</span>
                         ))}
                         <span style={{ marginLeft: 'auto', display: 'inline-flex', gap: 4 }}>
-                          {w.flags.includes('not-isolated') && w.branch && (
-                            <PixelButton variant="secondary" size="sm" onClick={() => void migrateWt(h.repo, w.branch!)} disabled={wtBusy}>migrate…</PixelButton>
-                          )}
-                          {w.flags.includes('not-isolated') && !w.flags.includes('dirty') && (
+                          {w.flags.includes('not-isolated') && (
                             <PixelButton variant="secondary" size="sm" onClick={() => void resetBase(h.repo)} disabled={wtBusy}>reset to {h.trunk}</PixelButton>
                           )}
                           {!w.isMain && (

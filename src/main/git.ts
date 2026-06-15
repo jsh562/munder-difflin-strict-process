@@ -323,6 +323,15 @@ export async function removeWorktree(
   return { ok: false, error: res.error };
 }
 
+/** Best-effort delete of a per-task branch AFTER it's been merged — `git branch -d` (safe: only
+ *  deletes a branch fully merged into the current/trunk HEAD; refuses if it's still checked out in
+ *  a worktree or not merged). Callers ignore failures (the merge already succeeded). */
+export async function deleteMergedBranch(repo: string, branch: string): Promise<{ ok: boolean; error?: string }> {
+  const res = await runGit(repo, ['branch', '-d', branch]);
+  if (res.ok) return { ok: true };
+  return { ok: false, error: res.error };
+}
+
 // ─── Worktree diagnostics + recovery (Settings → Worktrees) ──────────────────
 
 /** A health flag for a worktree row in the operator diagnostics. */
@@ -394,46 +403,28 @@ export async function worktreeHealth(repo: string): Promise<RepoWorktreeHealth> 
 }
 
 /**
- * Move `branch` out of the base tree into its own worktree at `wtPath` ("put the desk where it
- * belongs"). Preserves everything: any uncommitted base-tree state (incl. a wiped/staged-deleted
- * dir) is STASHED (recoverable via `git stash`), the base tree is checked back onto the trunk, then
- * the worktree is added on `branch` (its committed work intact). Only valid when the base tree
- * currently holds `branch`. Best-effort + reported.
+ * Put the base tree back on the trunk (the integration target). When the base tree sits on a stray
+ * `agent/*` branch, this restores the proper model: any uncommitted base-tree state (incl. a
+ * wiped/staged-deleted dir) is STASHED first (recoverable via `git stash` — nothing discarded),
+ * then the base tree is checked out onto the trunk. The agent branch's COMMITS are untouched (they
+ * stay on the branch); an author desk whose branch is freed re-isolates onto it on next spawn.
+ * No-op when already on the trunk. Best-effort + reported.
  */
-export async function migrateBranchToWorktree(
-  repo: string, branch: string, wtPath: string
-): Promise<{ ok: boolean; stashed: boolean; error?: string }> {
+export async function resetBaseToTrunk(repo: string): Promise<{ ok: boolean; stashed: boolean; error?: string }> {
+  const trunk = await repoTrunk(repo);
   const br = await getBranch(repo);
   const current = 'current' in br && br.current ? br.current : null;
-  if (current !== branch) return { ok: false, stashed: false, error: `base tree is not on ${branch} (on ${current ?? 'detached HEAD'})` };
-  const trunk = await repoTrunk(repo);
-  if (trunk === branch) return { ok: false, stashed: false, error: `no trunk to move the base tree onto (only ${branch} exists)` };
+  if (current === trunk) return { ok: true, stashed: false };
+  if (!trunk || trunk === current) return { ok: false, stashed: false, error: `no distinct trunk to move onto (on ${current ?? 'detached HEAD'})` };
   const st = await getStatus(repo);
   const dirty = !('error' in st) && (st.staged.length + st.unstaged.length + st.untracked.length) > 0;
   let stashed = false;
   if (dirty) {
-    const s = await runGit(repo, ['stash', 'push', '-u', '-m', `harness: migrate ${branch} to worktree`]);
+    const s = await runGit(repo, ['stash', 'push', '-u', '-m', `harness: reset base to ${trunk} (was ${current})`]);
     if (!s.ok) return { ok: false, stashed: false, error: `stash failed: ${s.error}` };
     stashed = true;
   }
   const co = await runGit(repo, ['checkout', trunk]);
   if (!co.ok) return { ok: false, stashed, error: `checkout ${trunk} failed: ${co.error}` };
-  const add = await runGit(repo, ['worktree', 'add', wtPath, branch]);
-  if (!add.ok) return { ok: false, stashed, error: `worktree add failed: ${add.error}` };
   return { ok: true, stashed };
-}
-
-/** Put the base tree back on the trunk — CLEAN-only (refuses if there are uncommitted changes, so
- *  nothing is discarded; use `migrateBranchToWorktree`, which stashes, for a dirty base tree). */
-export async function resetBaseToTrunk(repo: string): Promise<{ ok: boolean; error?: string }> {
-  const trunk = await repoTrunk(repo);
-  const br = await getBranch(repo);
-  const current = 'current' in br && br.current ? br.current : null;
-  if (current === trunk) return { ok: true };
-  const st = await getStatus(repo);
-  const dirty = !('error' in st) && (st.staged.length + st.unstaged.length + st.untracked.length) > 0;
-  if (dirty) return { ok: false, error: 'base tree has uncommitted changes — resolve them first, or use Migrate (which stashes)' };
-  const co = await runGit(repo, ['checkout', trunk]);
-  if (!co.ok) return { ok: false, error: co.error };
-  return { ok: true };
 }

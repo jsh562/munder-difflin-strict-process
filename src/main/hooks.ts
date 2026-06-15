@@ -14,14 +14,14 @@
 import { createServer, type Server } from 'node:net';
 import { existsSync, rmSync } from 'node:fs';
 import { Notification, type WebContents } from 'electron';
-import { roleCanEditCode, type HiveManager } from './hive';
+import { roleCanEditCode, roleCanWriteFiles, type HiveManager } from './hive';
 import type { HarnessConfig } from './config';
 import type { ControlRegistry } from './control';
 import type { CircuitBreaker } from './breaker';
 
-/** Claude Code tool names that EDIT code (write/shell) — gated by the desk's role, parity
- *  with the native executor's write_file/edit_file/bash gate. */
-const EDIT_TOOL_NAMES = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'Bash']);
+/** Claude Code tool names that WRITE project files — gated by `roleCanWriteFiles` (AUTHORS only:
+ *  worker/planner/qc; the integrator merges host-side, the reviewer reads). */
+const WRITE_TOOL_NAMES = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit']);
 
 interface HookPayload {
   hook_event_name?: string;
@@ -202,20 +202,26 @@ export class HookServer {
       }
     }
 
-    // Role edit-gate (parity with the native `canEditCode`): a Claude desk holding no
-    // worker/integrator role is read-only — deny code-edit tools here, since the Claude CLI
-    // tools otherwise bypass the native gate entirely. A desk not in the hive registry is
-    // left unrestricted (unknown desk). Mirrors agentTools.ts so both runtimes agree.
-    if (event === 'PreToolUse' && agentId && EDIT_TOOL_NAMES.has(p.tool_name ?? '')) {
+    // Role edit-gate (parity with the native split): FILE-WRITE tools (Write/Edit/...) need an
+    // AUTHOR role (worker/planner/qc) — an integrator/reviewer/orchestrator-only god is denied
+    // (the integrator merges host-side, not by editing the trunk). BASH needs roleCanEditCode
+    // (authors + the integrator's test/merge gate). The Claude CLI tools otherwise bypass the
+    // native gate entirely; a desk not in the registry is left unrestricted. Mirrors agentTools.ts.
+    if (event === 'PreToolUse' && agentId) {
+      const tool = p.tool_name ?? '';
       const agent = this.hive.registry().agents[agentId];
-      if (agent && !roleCanEditCode(agent.roles)) {
-        console.log(`[edit-gate] denied ${p.tool_name} for ${agentId} roles=[${(agent.roles ?? []).join(',')}]`);
+      const denyWrite = agent && WRITE_TOOL_NAMES.has(tool) && !roleCanWriteFiles(agent.roles);
+      const denyBash = agent && tool === 'Bash' && !roleCanEditCode(agent.roles);
+      if (denyWrite || denyBash) {
+        console.log(`[edit-gate] denied ${tool} for ${agentId} roles=[${(agent.roles ?? []).join(',')}]`);
         this.emit(agentId, event, p);
         return {
           hookSpecificOutput: {
             hookEventName: 'PreToolUse',
             permissionDecision: 'deny',
-            permissionDecisionReason: 'This desk is read-only — it holds no worker/integrator role, so editing/bash is disabled. Delegate the change to a worker (the orchestrator does not implement).'
+            permissionDecisionReason: denyBash
+              ? 'This desk is read-only — it holds no code role, so bash is disabled. Delegate the work.'
+              : 'This desk does not author files — only worker/planner/qc edit code (an integrator merges host-side; a reviewer reads). Delegate the change to a worker.'
           }
         };
       }

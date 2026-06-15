@@ -30,13 +30,13 @@ import { COMMAND_GROUPS } from '../shared/claudeCommands';
 // The mailbox + task-ledger vocabulary is owned by @jsh562/won-agent-core (so the extracted
 // coding toolkit is host-agnostic); re-exported below so existing `import { HiveMessage }
 // from '../hive'` consumers across the app are unchanged.
-import { reconcileBlocked, roleCanEditCode, canIntegrate, canReview, boardCapabilityLine } from '@jsh562/won-agent-core';
+import { reconcileBlocked, roleCanEditCode, roleAuthorsCode, roleCanWriteFiles, canIntegrate, canReview, boardCapabilityLine } from '@jsh562/won-agent-core';
 import type { MessageAct, HiveMessage, HiveTask, AgentRole, FeatureStatus } from '@jsh562/won-agent-core';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 export type { MessageAct, HiveMessage, HiveTask, AgentRole };
-export { roleCanEditCode, canIntegrate, canReview, boardCapabilityLine };
+export { roleCanEditCode, roleAuthorsCode, roleCanWriteFiles, canIntegrate, canReview, boardCapabilityLine };
 
 export interface AgentMeta {
   id: string;
@@ -542,12 +542,12 @@ export class HiveManager {
       : meta.isAssistant
       ? 'You are Michael\'s PREP ASSISTANT. You will be handed short, possibly vague instructions (each begins with "ENRICH TASK:"). For each one: (1) figure out which project it concerns and cd into the most relevant repo — you start in Michael\'s home directory; (2) gather concrete context READ-ONLY (exact file paths, current state, relevant code, conventions, active branch, gotchas) — NEVER modify, create, or delete files; (3) rewrite the instruction into ONE clear, self-contained prompt that Michael can execute autonomously, preserving the user\'s original intent without inventing scope. Then deliver it: write ONE message JSON into your outbox with "to":"god", "act":"request", a short subject, and the finished prompt as the body. Do NOT perform the task yourself — your only output is the improved prompt sent to Michael.'
       : [
-          'As a WORKER, the task board flows doing → (run build/tests) → review → integrate → done: do your slice, RUN the tests, commit on your agent/<id> branch, then set the card to "review" — a reviewer comments and approves it to "integrate", where an integrator merges + signs off. Do NOT advance past "review" or mark a card "done" yourself; if a card comes back to you, read its latest comment and address it. For anything ambiguous, cross-cutting, or needing sign-off, address a message to "god".',
+          'As a WORKER, the task board flows doing → (run build/tests) → review → integrate → done. Work ONE card at a time on its OWN branch: for each card, start fresh off the latest trunk and check out the branch named in the card\'s `branch` field (`git checkout -b <card.branch> <trunk>`); commit ONLY that card\'s work there; RUN the tests; then set the card to "review". A reviewer approves it to "integrate", where an integrator merges that branch + signs off. After it merges, take your NEXT card on a fresh branch off the updated trunk — never two cards on one branch. Do NOT advance past "review" or mark a card "done" yourself; if a card comes back to you, fix it on the same branch (merge the latest trunk in first to clear conflicts). For anything ambiguous, address a message to "god".',
           (meta.roles ?? []).includes('reviewer')
-            ? 'You also hold the REVIEWER role: on a card in "review", read the author\'s agent/<id> branch READ-ONLY (do not change their code), check the tests cover the change and pass, comment on the card, then approve it to "integrate" or send it back to "doing" with exactly what to fix. You never merge or mark "done".'
+            ? 'You also hold the REVIEWER role: on a card in "review", read the author\'s branch READ-ONLY (do not change their code), check the tests cover the change and pass, comment on the card, then approve it to "integrate" or send it back to "doing" with exactly what to fix. You never merge or mark "done".'
             : '',
           (meta.roles ?? []).includes('integrator')
-            ? 'You also hold the INTEGRATOR role: on a card in "integrate", run the test suite as the merge gate, then merge the author\'s agent/<id> branch into the repo base (git in your shell) and mark the card "done"; route conflicts or red tests back to the author. You may edit only to resolve a conflict.'
+            ? 'You also hold the INTEGRATOR role: you GATE + MERGE, you do NOT author. On a card in "integrate", run the test suite as the merge gate, then merge the CARD\'S branch (its `branch` field) into the trunk and mark the card "done"; route conflicts or red tests back to the author (you don\'t resolve conflicts in the trunk — the author rebases on their branch).'
             : ''
         ].filter(Boolean).join(' ');
     const guardrailsLine = 'Guardrails: a circuit breaker watches the floor — a "Circuit breaker: steer/constrain" message means you are looping or overspending, so STOP repeating, summarize what you tried, and follow it. Be token-frugal (a floor-wide or per-agent token budget can pause you). The shared plan has two parts: board.md (freeform; god is the sole scribe) and tasks.json (structured kanban — todo/doing/blocked/review/integrate/done).';
@@ -836,12 +836,13 @@ export class HiveManager {
         const repo = t.project ?? (t.assignee ? this.repoFor(t.assignee) : null);
         const fstat = t.feature ? this.featureStatusFor(repo, t.feature) : null;
         if (t.feature && fstat && !fstat.qcPassed) {
-          const qcs = this.roleHoldersForTask('qc', t, false);
-          for (const to of qcs) {
+          // ONE qc desk per feature — multiple would clobber the SAME shared base specs/<feature>/.
+          const to = this.roleHoldersForTask('qc', t, false)[0] ?? null;
+          if (to) {
             ping(to, 'request', `QC: ${t.title}`,
               `Feature "${t.feature}" (card ${t.id}) is implemented and awaiting QC before integrate. Run build/tests/lint + verify the stories/SC-### against the spec, write specs/${t.feature}/qc-report.md, then create the .qc-passed marker (or file bug tasks back to the worker).`);
           }
-          if (qcs.length === 0) escalateNoHandler('qc', t, 'integrate (awaiting QC)');
+          if (!to) escalateNoHandler('qc', t, 'integrate (awaiting QC)');
         } else {
           // ONE integrator only (parallel hive_integrate would double-merge). Use REAL
           // role-holders (godFallback=false): the god counts only if it actually HOLDS the
@@ -882,12 +883,11 @@ export class HiveManager {
       const repo = t.project ?? (t.assignee ? this.repoFor(t.assignee) : null);
       const fstat = this.featureStatusFor(repo, t.feature!);
       if (fstat?.hasTasks) { this.nudgedPlannerFeatures.add(key); continue; } // planning done — stop checking
-      const planners = this.roleHoldersForTask('planner', t, false);
-      if (planners.length === 0) continue; // no planner ⇒ nobody plans; retry on a later write
-      for (const to of planners) {
-        ping(to, 'request', `Plan feature: ${t.feature}`,
-          `Feature "${t.feature}" needs its spec → plan → tasks before implementation. Author specs/${t.feature}/spec.md (mark unknowns [NEEDS CLARIFICATION] and ask god/operator), then plan.md and tasks.md, in the SHARED base-repo specs/. Use hive_feature_status to track the phase.`);
-      }
+      // ONE planner per feature — multiple would clobber the SAME shared base specs/<feature>/.
+      const to = this.roleHoldersForTask('planner', t, false)[0] ?? null;
+      if (!to) continue; // no planner ⇒ nobody plans; retry on a later write
+      ping(to, 'request', `Plan feature: ${t.feature}`,
+        `Feature "${t.feature}" needs its spec → plan → tasks before implementation. Author specs/${t.feature}/spec.md (mark unknowns [NEEDS CLARIFICATION] and ask god/operator), then plan.md and tasks.md, in the SHARED base-repo specs/. Use hive_feature_status to track the phase.`);
       this.nudgedPlannerFeatures.add(key);
     }
   }

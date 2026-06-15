@@ -10,8 +10,8 @@ describe('deniedNativeToolNames — advertise only the tools a desk can actually
     expect(deniedNativeToolNames(['worker'])).toEqual(['hive_integrate']);
   });
 
-  it('an integrator keeps everything (edits + integrate)', () => {
-    expect(deniedNativeToolNames(['integrator'])).toEqual([]);
+  it('an integrator is a gate+merger: keeps bash + hive_integrate, but is denied file edits', () => {
+    expect(deniedNativeToolNames(['integrator']).sort()).toEqual(['edit_file', 'write_file']);
   });
 
   it('a reviewer is read-only and cannot integrate', () => {
@@ -23,7 +23,7 @@ describe('deniedNativeToolNames — advertise only the tools a desk can actually
     expect(deniedNativeToolNames(['qc'])).toEqual(['hive_integrate']);
   });
 
-  it('a default god holding integrator+reviewer keeps everything', () => {
-    expect(deniedNativeToolNames(['integrator', 'reviewer'])).toEqual([]);
+  it('a god holding integrator+reviewer keeps bash + hive_integrate, denied file edits', () => {
+    expect(deniedNativeToolNames(['integrator', 'reviewer']).sort()).toEqual(['edit_file', 'write_file']);
   });
 });
