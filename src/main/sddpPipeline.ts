@@ -35,6 +35,10 @@ export interface SddpPipelineDeps {
   spawnSubAgent(callerId: string, name: string, input: string): Promise<{ content: string; success: boolean }>;
   /** Advance the epic's milestone checklist (mark `key` done + activate next) via the hive. */
   advanceMilestone(epicId: string, key: string): void;
+  /** Seed the implement cards for a feature from its `tasks.md` (parse → one feature-tagged card
+   *  per task). Returns the count created (0 ⇒ no tasks). The host owns the parse + card creation;
+   *  the engine calls this once when the implement step starts so the work exists deterministically. */
+  seedImplementCards(epic: HiveTask): number;
   /** Surface a blocker to the god/operator (no usable owner, or a step's artifact never landed). */
   escalate(feature: string, message: string): void;
   /** Relay a human-gated step's prompt to the operator (e.g. Clarify questions) — `needs_human`.
@@ -135,7 +139,12 @@ export class SddpPipeline {
         return;
       }
 
-      if (milestoneDriver(active) !== 'host' || !active.subAgent) return; // desk step — engine waits
+      if (milestoneDriver(active) !== 'host' || !active.subAgent) {
+        // DESK/DISTRIBUTED step (implement/qc): the engine FEEDS (seeds implement cards) + TRACKS
+        // (advances the pill when the distributed flow's marker lands) — it does not run the work.
+        this.trackDistributed(epic, active, r);
+        return;
+      }
 
       const lockKey = `${feature}::${active.key}`;
       if (this.inflight.has(lockKey)) return;               // already running this step
@@ -196,6 +205,32 @@ export class SddpPipeline {
       this.deps.askHuman(feature, res.content);
     } finally {
       this.inflight.delete(lockKey);
+    }
+  }
+
+  /** FEED + TRACK a distributed step (implement/qc). The engine does not run the work — workers /
+   *  the qc desk / the integrator do (the existing notifier flow). It (1) seeds the implement cards
+   *  from tasks.md once, so the work exists deterministically, and (2) advances the milestone pill
+   *  when the distributed flow's real marker (`.completed` / `.qc-passed`) appears. */
+  private trackDistributed(epic: HiveTask, active: FeatureMilestone, repo: string | null): void {
+    const feature = epic.feature!;
+    const markerPresent = !!active.gateArtifact && this.deps.featureArtifactExists(repo, feature, active.gateArtifact);
+
+    if (active.key === 'implement' && !markerPresent) {
+      const hasCards = this.deps.listTasks().some(
+        (t) => t.feature === feature && t.id !== epic.id && !(t.milestones && t.milestones.length)
+      );
+      if (!hasCards) {
+        const n = this.deps.seedImplementCards(epic);
+        if (n === 0) this.escalateOnce(feature, `SDDP pipeline: implement step for '${feature}' but specs/${feature}/tasks.md has no tasks to import.`);
+      }
+      // else: cards exist + still being worked — wait for the distributed flow.
+    }
+
+    // Pill tracking: advance when the distributed flow produced this step's marker.
+    if (markerPresent) {
+      this.escalated.delete(feature);
+      this.deps.advanceMilestone(epic.id, active.key);
     }
   }
 

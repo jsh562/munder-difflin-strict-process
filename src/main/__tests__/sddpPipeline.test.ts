@@ -23,7 +23,8 @@ function mkPipeline() {
   const spawns: { caller: string; name: string; input: string }[] = [];
   const escalations: { feature: string; message: string }[] = [];
   const asks: { feature: string; questions: string }[] = [];
-  const state = { enabled: true, ownerUsable: true, autopilot: false };
+  const seeds: string[] = [];                     // epic ids the engine asked to seed cards for
+  const state = { enabled: true, ownerUsable: true, autopilot: false, seedCount: 2 };
   let onSpawn: (name: string) => void = () => {}; // simulate what a sub-agent writes
   let gate: Promise<void> | null = null;          // optional latch to hold a spawn open (lock test)
 
@@ -48,11 +49,18 @@ function mkPipeline() {
     },
     escalate: (feature, message) => escalations.push({ feature, message }),
     askHuman: (feature, questions) => asks.push({ feature, questions }),
+    seedImplementCards: (epic) => {
+      seeds.push(epic.id);
+      for (let i = 0; i < state.seedCount; i++) {
+        tasks = [...tasks, { id: `t-impl-${i}`, title: `task ${i}`, status: 'todo', dependsOn: [], feature: epic.feature, priority: 0, createdAt: '' } as HiveTask];
+      }
+      return state.seedCount;
+    },
     debounceMs: 0
   };
   const pipeline = new SddpPipeline(deps);
   return {
-    pipeline, artifacts, spawns, escalations, asks, state,
+    pipeline, artifacts, spawns, escalations, asks, seeds, state,
     setTasks: (t: HiveTask[]) => { tasks = t; },
     getTasks: () => tasks,
     setOnSpawn: (fn: (name: string) => void) => { onSpawn = fn; },
@@ -152,6 +160,53 @@ describe('SddpPipeline.advanceFeature', () => {
     expect(h.asks).toHaveLength(0);                                        // no human asked
     expect(milestone(h.getTasks()[0], 'clarify').status).toBe('done');
     expect(milestone(h.getTasks()[0], 'research').status).toBe('active');
+  });
+
+  it('Implement (feed): seeds the cards from tasks.md when none exist + does NOT advance yet', async () => {
+    const h = mkPipeline();
+    h.setTasks([epicWith('implement')]);
+    await h.pipeline.advanceFeature('S:/repo', '00001');
+    expect(h.seeds).toEqual(['epic-1']);                                   // engine seeded the cards
+    expect(h.spawns).toHaveLength(0);                                      // no sub-agent — distributed work
+    expect(milestone(h.getTasks()[0], 'implement').status).toBe('active'); // waiting for workers
+    expect(h.escalations).toHaveLength(0);
+  });
+
+  it('Implement (feed): escalates when tasks.md has no tasks to import', async () => {
+    const h = mkPipeline();
+    h.state.seedCount = 0;
+    h.setTasks([epicWith('implement')]);
+    await h.pipeline.advanceFeature('S:/repo', '00001');
+    expect(h.seeds).toEqual(['epic-1']);
+    expect(h.escalations).toHaveLength(1);
+    expect(h.escalations[0].message).toMatch(/no tasks to import/);
+  });
+
+  it('Implement (track): advances to qc when .completed lands; does not re-seed', async () => {
+    const h = mkPipeline();
+    h.setTasks([epicWith('implement')]);
+    h.artifacts.add('00001/.completed');                                   // distributed flow finished implement
+    await h.pipeline.advanceFeature('S:/repo', '00001');
+    expect(h.seeds).toHaveLength(0);                                       // marker present → no seed
+    expect(milestone(h.getTasks()[0], 'implement').status).toBe('done');
+    expect(milestone(h.getTasks()[0], 'qc').status).toBe('active');
+  });
+
+  it('QC (track): advances when .qc-passed lands (qc desk produced it)', async () => {
+    const h = mkPipeline();
+    h.setTasks([epicWith('qc')]);
+    h.artifacts.add('00001/.qc-passed');
+    await h.pipeline.advanceFeature('S:/repo', '00001');
+    expect(h.spawns).toHaveLength(0);                                      // engine tracks, doesn't run QC
+    expect(milestone(h.getTasks()[0], 'qc').status).toBe('done');
+  });
+
+  it('QC (track): waits (no advance) while .qc-passed is absent', async () => {
+    const h = mkPipeline();
+    h.setTasks([epicWith('qc')]);
+    await h.pipeline.advanceFeature('S:/repo', '00001');
+    expect(milestone(h.getTasks()[0], 'qc').status).toBe('active');
+    expect(h.escalations).toHaveLength(0);
   });
 
   it('drives the plan step via plan-author (now host) and advances on plan.md', async () => {

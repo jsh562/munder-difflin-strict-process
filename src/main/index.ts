@@ -848,6 +848,30 @@ const sddpPipeline = new SddpPipeline({
   featureArtifactExists: (repo, feature, relPath) => agentToolDeps.featureArtifactExists!(repo, feature, relPath),
   spawnSubAgent: (callerId, name, input) => agentToolDeps.spawnSubAgent!(callerId, name, input),
   advanceMilestone: (epicId, key) => hive.advanceMilestone(epicId, key),
+  // Seed the implement cards from tasks.md (deterministic — the same parse hive_import_tasks uses):
+  // one feature-tagged `todo` card per task, UNASSIGNED (the god routes them to workers).
+  seedImplementCards: (epic) => {
+    const repo = epic.project ?? (epic.assignee ? repoForId(epic.assignee) : null);
+    const feature = epic.feature;
+    if (!feature) return 0;
+    const parsed = agentToolDeps.parseFeatureTasks?.(repo, feature) ?? [];
+    if (parsed.length === 0) return 0;
+    const ledger = hive.tasks() as { tasks?: HiveTask[] } | undefined;
+    const existing = Array.isArray(ledger?.tasks) ? ledger!.tasks : [];
+    const now = new Date().toISOString();
+    const created: HiveTask[] = parsed.map((p, i) => ({
+      id: `task-${Date.now()}-${existing.length + i}`,
+      title: p.taskId ? `${p.taskId} ${p.title}`.trim() : p.title,
+      status: 'todo',
+      dependsOn: [],
+      project: repo ?? undefined,
+      feature,
+      priority: 0,
+      createdAt: now
+    }));
+    hive.writeTasks([...existing, ...created]);
+    return created.length;
+  },
   escalate: (feature, message) => {
     try { hive.send({ to: 'god', act: 'request', needs_human: true, subject: `SDDP pipeline — ${feature}`, body: message }, 'system'); }
     catch (e) { console.error('[sddp-pipeline] escalate failed:', e); }

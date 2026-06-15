@@ -38,7 +38,7 @@ export function nativeSddpGodPrompt(godRoles: AgentRole[]): string {
     '- CLARIFY (human gate): when the engine posts clarification questions for a feature (a needs_human "Clarify — <feature>" message), answer them, fold the answers into specs/<feature>/spec.md under a `## Clarifications` section, then advance the clarify milestone (`hive_update_task {advanceMilestone:"clarify"}`) so the engine resumes. (Under SDDP autopilot the engine resolves these itself — no action needed.)',
     '- Specify→Clarify→Plan→Tasks: assign to a PLANNER desk (it authors spec.md, resolves clarifications, plan.md, tasks.md — spawning its specialists per step). Answer its clarification questions.',
     '- SPEC/PLAN gate: have a REVIEWER read spec.md/plan.md/tasks.md (read-only) and approve, or send back to the planner.',
-    '- Implement: once tasks.md exists, run hive_import_tasks (feature) to turn its `- [ ] T###` tasks into board cards in one call, then assign them to WORKER desks — P1 first, independent tasks in parallel.',
+    '- Implement: once tasks.md exists, the host engine SEEDS the implement cards from it automatically (you do not need hive_import_tasks). Your job is to ASSIGN those cards to WORKER desks — P1 first, independent tasks in parallel. (If the engine is off, you may still hive_import_tasks yourself.)',
     '- CODE gate: a REVIEWER reviews each implemented slice.',
     '- QC: a QC desk runs tests/lint/security + verifies stories vs spec (spawning qc-auditor + story-verifier) → it sets .qc-passed, or files bug tasks back to workers.',
     '- Integrate: an INTEGRATOR merges only AFTER .qc-passed, then signs off (done).',
