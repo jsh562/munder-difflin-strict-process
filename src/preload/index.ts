@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
 import type { AgentEvent } from '../shared/agentEvent';
+import type { BuildEnvEntry } from '../shared/buildEnv';
 
 export type { AgentEvent };
 
@@ -140,6 +141,8 @@ export interface HarnessConfig {
   godWorkspace?: string;
   /** Single root for all desks' redirected build output (else `<harnessHome>/build-cache`). */
   buildCacheDir?: string;
+  /** Token-templated per-desk build/cache env vars (else the built-in CARGO_TARGET_DIR default). */
+  buildEnv?: BuildEnvEntry[];
   registeredRepos: string[];
   autoMode: boolean;
   defaultCommand: string;

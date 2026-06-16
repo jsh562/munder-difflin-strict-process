@@ -2,6 +2,7 @@ import { app } from 'electron';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
+import type { BuildEnvEntry } from '../shared/buildEnv';
 
 /** A recurring auto-dispatched mission fired on an interval by the scheduler. */
 export interface ScheduledMission {
@@ -108,6 +109,11 @@ export interface HarnessConfig {
    *  so heavy/churning build trees stay OUT of the worktrees and the repo — the operator excludes
    *  this single folder from antivirus. Unset ⇒ auto-derived `<harnessHome>/build-cache`. */
   buildCacheDir?: string;
+  /** Per-desk build/cache env vars, injected into each desk's build environment. Each value is a
+   *  TEMPLATE with `${buildRoot}`/`${worktreeKey}`/… tokens the host expands per desk (so the user
+   *  defines the parent folder once and the per-worktree structure is filled in automatically).
+   *  Unset ⇒ the built-in default (`CARGO_TARGET_DIR`). See `src/shared/buildEnv.ts`. */
+  buildEnv?: BuildEnvEntry[];
   /** Folders the user registered during onboarding (used as quick-picks). */
   registeredRepos: string[];
   /** When true, new agents are spawned with --permission-mode bypassPermissions. */

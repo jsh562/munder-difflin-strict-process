@@ -6,6 +6,7 @@ import { PixelButton } from './PixelButton';
 import { Icon } from './Icon';
 import { ProviderModelPicker } from './ProviderModelPicker';
 import { isAssignmentStale } from '@shared/assignment';
+import { DEFAULT_BUILD_ENV, expandTokens, BUILD_ENV_TOKENS, type BuildEnvEntry } from '@shared/buildEnv';
 import { scheduleDeskRestart } from '@/lib/restartDesk';
 import { restartSigOf, deskStaleKeys, RESTART_SIG_LABELS, type RestartSig } from '@/lib/restartSig';
 
@@ -93,6 +94,50 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
   const resetGodWorkspace = async () => {
     setGodWorkspace(undefined);
     await window.cth.updateConfig({ godWorkspace: undefined });
+  };
+
+  // Build cache — the ONE parent folder under which each desk's redirected build output (Rust
+  // `target/`, …) is created per worktree. Unset ⇒ auto `<harnessHome>/build-cache`.
+  const [buildCacheDir, setBuildCacheDir] = useState<string | undefined>(config.buildCacheDir);
+  const pickBuildCacheDir = async () => {
+    const res = await window.cth.chooseFolder();
+    if (!res.ok) return; // cancelled
+    setBuildCacheDir(res.path);
+    await window.cth.updateConfig({ buildCacheDir: res.path });
+  };
+  const resetBuildCacheDir = async () => {
+    setBuildCacheDir(undefined);
+    await window.cth.updateConfig({ buildCacheDir: undefined });
+  };
+  /** The resolved build-cache root for display + preview (mirrors main's `buildCacheRoot`). */
+  const buildRootDisplay = (buildCacheDir
+    ?? (config.harnessHome ? `${config.harnessHome}${config.harnessHome.includes('\\') ? '\\' : '/'}build-cache` : '<home>/build-cache'));
+
+  // Build-env table — token-templated env vars injected into each desk's build. Seeded from config,
+  // else the built-in default so the user sees + can edit it. Persisted as the whole array.
+  const [buildEnv, setBuildEnv] = useState<BuildEnvEntry[]>(config.buildEnv ?? DEFAULT_BUILD_ENV);
+  const persistBuildEnv = (next: BuildEnvEntry[]) => {
+    setBuildEnv(next);
+    void window.cth.updateConfig({ buildEnv: next });
+  };
+  const addBuildEnvRow = () => persistBuildEnv([...buildEnv, { name: '', value: '${buildRoot}/${worktreeKey}' }]);
+  // Edits update local state per keystroke; the config is written on blur (commitBuildEnv) to avoid
+  // a file write per character. Add/remove/reset persist immediately.
+  const editBuildEnvAt = (i: number, patch: Partial<BuildEnvEntry>) =>
+    setBuildEnv((cur) => cur.map((e, j) => (j === i ? { ...e, ...patch } : e)));
+  const commitBuildEnv = () => { void window.cth.updateConfig({ buildEnv }); };
+  const removeBuildEnvRow = (i: number) => persistBuildEnv(buildEnv.filter((_, j) => j !== i));
+  const resetBuildEnv = async () => {
+    setBuildEnv(DEFAULT_BUILD_ENV);
+    await window.cth.updateConfig({ buildEnv: undefined }); // back to the built-in default
+  };
+  /** Sample vars for the per-row live preview (shows where a value resolves for a worktree desk). */
+  const buildEnvSample = {
+    buildRoot: buildRootDisplay,
+    worktreeKey: 'jim-3f2a1b',
+    cwd: 'S:/md/numrs',
+    agentId: 'jim',
+    harnessHome: config.harnessHome ?? '<home>'
   };
 
   // Worktrees diagnostics — per-repo, per-worktree health (branch, dirty/unmerged, problem flags)
@@ -340,12 +385,14 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
     let alive = true;
     window.cth.getConfig().then((c) => {
       if (!alive) return;
-      const cc = c as BreakerCfgView & SlackConfig & { notifications?: boolean; webSearchEnabled?: boolean; nativeBashEnabled?: boolean; sddpMode?: boolean; godWorkspace?: string };
+      const cc = c as BreakerCfgView & SlackConfig & { notifications?: boolean; webSearchEnabled?: boolean; nativeBashEnabled?: boolean; sddpMode?: boolean; godWorkspace?: string; buildCacheDir?: string; buildEnv?: BuildEnvEntry[] };
       setNotifications(cc.notifications === true);
       setWebSearchEnabled(cc.webSearchEnabled === true);
       setNativeBashEnabled(cc.nativeBashEnabled === true);
       setSddpMode(cc.sddpMode === true);
       setGodWorkspace(cc.godWorkspace);
+      setBuildCacheDir(cc.buildCacheDir);
+      setBuildEnv(cc.buildEnv ?? DEFAULT_BUILD_ENV);
       setAgentBudget(cc.costCapTokens != null ? String(cc.costCapTokens) : '');
       setVelocityCeiling(cc.circuitBreaker?.tokenVelocityPerMin != null ? String(cc.circuitBreaker.tokenVelocityPerMin) : '');
       setSlackEnabled(cc.slackEnabled ?? false);
@@ -607,6 +654,58 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
                 )}
               </div>
               <div style={subLabelStyle}>The god's own neutral folder (native god) — not a project. The god reads the project repos and delegates; give it a role to have it edit/merge directly.</div>
+
+              {/* Build cache root — the ONE parent folder under which each desk's build output is
+                  redirected (per worktree). Unset ⇒ auto `<harnessHome>/build-cache`. */}
+              <div style={{ display: 'flex', gap: 12, fontSize: 14, lineHeight: '20px', alignItems: 'center' }}>
+                <span style={{ width: 140, flexShrink: 0, color: 'var(--cth-ink-500)' }}>Build cache</span>
+                <span style={{
+                  flex: 1, color: buildCacheDir ? 'var(--cth-ink-900)' : 'var(--cth-ink-500)', wordBreak: 'break-all',
+                  fontFamily: 'var(--cth-font-mono, monospace)'
+                }}>{buildCacheDir ?? `auto · ${buildRootDisplay}`}</span>
+                <PixelButton variant="secondary" size="sm" onClick={pickBuildCacheDir}>change…</PixelButton>
+                {buildCacheDir && (
+                  <PixelButton variant="secondary" size="sm" onClick={resetBuildCacheDir}>reset</PixelButton>
+                )}
+              </div>
+              <div style={subLabelStyle}>One parent folder for every desk's build output (a Rust <code>target/</code>, …) — kept out of the worktrees and the repo. Per-worktree subfolders are created automatically; exclude this single folder from antivirus.</div>
+
+              {/* Build-env table — token-templated env vars injected into each desk's build env. */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                <span style={{ width: 140, flexShrink: 0, color: 'var(--cth-ink-500)', fontSize: 14 }}>Build env</span>
+                <span style={{ flex: 1, fontSize: 13, color: 'var(--cth-ink-500)' }}>
+                  {buildEnv.length} var{buildEnv.length === 1 ? '' : 's'}
+                </span>
+                <PixelButton variant="secondary" size="sm" onClick={addBuildEnvRow}><span><Icon name="plus" /> add</span></PixelButton>
+                <PixelButton variant="secondary" size="sm" onClick={() => void resetBuildEnv()}>reset</PixelButton>
+              </div>
+              <div style={subLabelStyle}>Injected into each desk's build (merged over its env). Tokens: {BUILD_ENV_TOKENS.map((t) => `\${${t}}`).join(', ')}. Values under the build cache are auto-created.</div>
+              {buildEnv.length > 0 && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6, paddingLeft: 152 }}>
+                  {buildEnv.map((e, i) => (
+                    <div key={i} style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <input
+                          value={e.name} placeholder="NAME"
+                          onChange={(ev) => editBuildEnvAt(i, { name: ev.target.value })} onBlur={commitBuildEnv}
+                          style={{ ...slackInputStyle, width: 170, fontFamily: 'var(--cth-font-mono, monospace)' }}
+                        />
+                        <input
+                          value={e.value} placeholder="${buildRoot}/tool/${worktreeKey}"
+                          onChange={(ev) => editBuildEnvAt(i, { value: ev.target.value })} onBlur={commitBuildEnv}
+                          style={{ ...slackInputStyle, flex: 1, fontFamily: 'var(--cth-font-mono, monospace)' }}
+                        />
+                        <PixelButton variant="ghost" size="sm" onClick={() => removeBuildEnvRow(i)}><Icon name="x" /></PixelButton>
+                      </div>
+                      {e.name.trim() !== '' && (
+                        <div style={{ fontSize: 11, color: 'var(--cth-ink-500)', fontFamily: 'var(--cth-font-mono, monospace)', wordBreak: 'break-all' }}>
+                          → {expandTokens(e.value, buildEnvSample)}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
 
               {/* Worktrees diagnostics — per repo, per worktree: branch, health flags, and recovery
                   actions (reset base to trunk, delete). */}

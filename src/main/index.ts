@@ -9,6 +9,8 @@ import {
 } from './config';
 import { listDir, readFileText, writeFileText } from './fs';
 import { normalizeRepoPath, normalizedPathSet, buildCacheKey } from './paths';
+import { resolveBuildEnv } from './buildEnv';
+import { DEFAULT_BUILD_ENV } from '../shared/buildEnv';
 import {
   getBranch, getStatus, getLog, getBranches, getAheadBehind, isRepo,
   addWorktree, removeWorktree, listWorktrees, planWorktree, type GitWorktree,
@@ -291,20 +293,30 @@ function buildCacheRoot(): string | null {
 }
 
 /**
- * Build-tool env redirecting a desk's output off its worktree into a per-desk subdir of the one
- * cache root. Keyed by `<basename>-<shortHash(cwd)>` so each distinct working tree (a worktree OR a
- * base repo) gets its OWN dir — cargo takes a per-`target` lock, so one builder per dir avoids the
- * concurrent-build cache corruption a shared dir would cause; the hash discriminates same-named
- * repos. The dir is created eagerly so the var always points somewhere real. Returns `undefined`
- * (inherit the parent env) when there's no cache root or no cwd. Today this sets `CARGO_TARGET_DIR`
- * (Rust); other ecosystems lacking a clean redirect can be added here later.
+ * The build-tool env for one desk — expands the user's token-templated `buildEnv` table (default:
+ * cargo) against this desk's working tree and creates the dirs. Each value is keyed per working tree
+ * via `${worktreeKey}` (`<basename>-<shortHash(cwd)>`), so each distinct tree (a worktree OR a base
+ * repo) gets its OWN dir — cargo takes a per-`target` lock, so one builder per dir avoids the
+ * concurrent-build corruption a shared dir would cause; the hash discriminates same-named repos.
+ * Dirs under the root are created eagerly so the var always points somewhere real. Returns
+ * `undefined` (inherit the parent env) when there's no cwd or the table resolves to nothing.
  */
-function buildCacheEnvFor(cwd: string | null | undefined): Record<string, string> | undefined {
+function deskBuildEnvFor(cwd: string | null | undefined, agentId: string | null | undefined): Record<string, string> | undefined {
+  if (!cwd) return undefined;
+  const cfg = readConfig();
   const root = buildCacheRoot();
-  if (!root || !cwd) return undefined;
-  const dir = join(root, buildCacheKey(cwd));
-  try { mkdirSync(dir, { recursive: true }); } catch { /* best-effort — cargo will surface a write error */ }
-  return { CARGO_TARGET_DIR: dir };
+  const vars = {
+    buildRoot: root ?? '',
+    worktreeKey: buildCacheKey(cwd),
+    cwd,
+    agentId: agentId ?? '',
+    harnessHome: cfg.harnessHome ?? ''
+  };
+  const { env, dirs } = resolveBuildEnv(cfg.buildEnv ?? DEFAULT_BUILD_ENV, root, vars);
+  for (const dir of dirs) {
+    try { mkdirSync(dir, { recursive: true }); } catch { /* best-effort — the tool will surface a write error */ }
+  }
+  return Object.keys(env).length ? env : undefined;
 }
 
 /**
@@ -606,7 +618,7 @@ const agentToolDeps: AgentToolDeps = {
   // Redirect heavy build output (Rust `target/`, …) off the desk's worktree into the one
   // AV-excludable cache root, keyed per working tree. A native desk's bash runs in MAIN, so this
   // is the seam that reaches its cargo build (the Claude PTY path sets the same var in opts.env).
-  bashEnv: (id) => buildCacheEnvFor(hive.registry().agents[id]?.cwd),
+  bashEnv: (id) => deskBuildEnvFor(hive.registry().agents[id]?.cwd, id),
   // web_search routes through the host (provider + formatting). Free + keyless via
   // DuckDuckGo; config is read live per call so the operator's enable/disable takes
   // effect at once. Throws a clear note when disabled — the executor turns that into a
@@ -1504,7 +1516,7 @@ ipcMain.handle('pty:spawn', async (_evt, opts: SpawnOptions & { hive?: AgentMeta
   // AV-excludable cache root — so a Claude author/base-tree desk's cargo build doesn't churn
   // `target/` inside the worktree or the repo. (Native desks get the same var via `bashEnv`.)
   if (opts.hive && !opts.hive.isGod && !opts.hive.isAssistant) {
-    const buildEnv = buildCacheEnvFor(opts.cwd);
+    const buildEnv = deskBuildEnvFor(opts.cwd, opts.hive.id);
     if (buildEnv) opts.env = { ...(opts.env ?? {}), ...buildEnv };
   }
   // If the agent carries hive metadata, provision its workspace and inject the

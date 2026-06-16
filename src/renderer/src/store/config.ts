@@ -15,6 +15,13 @@ export interface ScheduledMission {
   quietThresholdMs?: number;
 }
 
+/** One token-templated per-desk build/cache env var (mirrors src/shared/buildEnv.ts BuildEnvEntry).
+ *  Structurally identical to the shared type, so values flow between them without conversion. */
+export interface BuildEnvEntry {
+  name: string;
+  value: string;
+}
+
 /** Circuit-breaker thresholds (mirrors src/main/config.ts CircuitBreakerConfig). */
 export interface CircuitBreakerConfig {
   enabled?: boolean;
@@ -31,6 +38,8 @@ export interface HarnessConfig {
   godWorkspace?: string;
   /** Single root for all desks' redirected build output (else `<harnessHome>/build-cache`). */
   buildCacheDir?: string;
+  /** Token-templated per-desk build/cache env vars (else the built-in CARGO_TARGET_DIR default). */
+  buildEnv?: BuildEnvEntry[];
   registeredRepos: string[];
   autoMode: boolean;
   defaultCommand: string;
