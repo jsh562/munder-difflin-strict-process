@@ -57,3 +57,20 @@ export function expandTokens(template: string, vars: Partial<BuildEnvVars>): str
     return v === undefined ? whole : v;
   });
 }
+
+/**
+ * Layer a per-repo `override` table ON TOP of the global `base`: a `base` entry is replaced by an
+ * `override` entry of the same `name` (override wins), and `override` entries with new names are
+ * appended. Order: base order preserved (with replacements in place), then the new override names.
+ * An empty/undefined override returns the base unchanged. Pure. Used both by the main-process
+ * resolver and the renderer's live preview, so the two never drift.
+ */
+export function mergeBuildEnv(base: BuildEnvEntry[], override?: BuildEnvEntry[]): BuildEnvEntry[] {
+  if (!override || override.length === 0) return base;
+  const byName = new Map<string, BuildEnvEntry>();
+  for (const e of override) if (e.name?.trim()) byName.set(e.name, e);
+  const out: BuildEnvEntry[] = base.map((e) => byName.get(e.name) ?? e);
+  const baseNames = new Set(base.map((e) => e.name));
+  for (const e of override) if (e.name?.trim() && !baseNames.has(e.name)) out.push(e);
+  return out;
+}

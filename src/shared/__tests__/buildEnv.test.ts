@@ -3,7 +3,7 @@
  * renderer-safe half; the main-process `resolveBuildEnv` is tested separately under src/main).
  */
 import { describe, it, expect } from 'vitest';
-import { expandTokens, DEFAULT_BUILD_ENV, BUILD_ENV_TOKENS } from '../buildEnv';
+import { expandTokens, mergeBuildEnv, DEFAULT_BUILD_ENV, BUILD_ENV_TOKENS } from '../buildEnv';
 
 describe('expandTokens', () => {
   const vars = { buildRoot: 'S:/cache', worktreeKey: 'jim-abc', cwd: 'S:/md/numrs', agentId: 'jim', harnessHome: 'S:/munderdiff' };
@@ -25,6 +25,47 @@ describe('expandTokens', () => {
 
   it('returns plain strings unchanged', () => {
     expect(expandTokens('no-tokens-here', vars)).toBe('no-tokens-here');
+  });
+});
+
+describe('mergeBuildEnv — per-repo override layered on the global base', () => {
+  const base = [
+    { name: 'CARGO_TARGET_DIR', value: '${buildRoot}/cargo/${worktreeKey}' },
+    { name: 'RUST_BACKTRACE', value: '1' }
+  ];
+
+  it('returns the base unchanged for an empty/undefined override', () => {
+    expect(mergeBuildEnv(base, undefined)).toBe(base);
+    expect(mergeBuildEnv(base, [])).toBe(base);
+  });
+
+  it('replaces a same-name entry in place (override wins) and keeps base order', () => {
+    const out = mergeBuildEnv(base, [{ name: 'CARGO_TARGET_DIR', value: 'D:/fast/${worktreeKey}' }]);
+    expect(out).toEqual([
+      { name: 'CARGO_TARGET_DIR', value: 'D:/fast/${worktreeKey}' },
+      { name: 'RUST_BACKTRACE', value: '1' }
+    ]);
+  });
+
+  it('appends override entries with new names after the base', () => {
+    const out = mergeBuildEnv(base, [{ name: 'NODE_OPTIONS', value: '--max-old-space-size=4096' }]);
+    expect(out.map((e) => e.name)).toEqual(['CARGO_TARGET_DIR', 'RUST_BACKTRACE', 'NODE_OPTIONS']);
+  });
+
+  it('handles a mix of replace + append in one override', () => {
+    const out = mergeBuildEnv(base, [
+      { name: 'RUST_BACKTRACE', value: 'full' },
+      { name: 'RUSTFLAGS', value: '-C debuginfo=0' }
+    ]);
+    expect(out).toEqual([
+      { name: 'CARGO_TARGET_DIR', value: '${buildRoot}/cargo/${worktreeKey}' },
+      { name: 'RUST_BACKTRACE', value: 'full' },
+      { name: 'RUSTFLAGS', value: '-C debuginfo=0' }
+    ]);
+  });
+
+  it('ignores blank-name override rows', () => {
+    expect(mergeBuildEnv(base, [{ name: '  ', value: 'x' }])).toEqual(base);
   });
 });
 

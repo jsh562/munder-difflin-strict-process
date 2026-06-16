@@ -6,7 +6,7 @@ import { PixelButton } from './PixelButton';
 import { Icon } from './Icon';
 import { ProviderModelPicker } from './ProviderModelPicker';
 import { isAssignmentStale } from '@shared/assignment';
-import { DEFAULT_BUILD_ENV, expandTokens, BUILD_ENV_TOKENS, type BuildEnvEntry } from '@shared/buildEnv';
+import { DEFAULT_BUILD_ENV, expandTokens, BUILD_ENV_TOKENS, type BuildEnvEntry, type BuildEnvVars } from '@shared/buildEnv';
 import { scheduleDeskRestart } from '@/lib/restartDesk';
 import { restartSigOf, deskStaleKeys, RESTART_SIG_LABELS, type RestartSig } from '@/lib/restartSig';
 
@@ -64,6 +64,42 @@ function clearLocalState(): void {
     }
     for (const k of keys) window.localStorage.removeItem(k);
   } catch { /* noop */ }
+}
+
+/** Reusable build-env row editor (name + value template + remove, with a per-row live preview and an
+ *  add button). Shared by the GLOBAL table and each PER-REPO override table. Edits flow through
+ *  `onEdit` (local, per keystroke); the config write happens on blur via `onCommit`; add/remove
+ *  persist immediately through their callbacks. */
+function BuildEnvRows({ entries, sample, onEdit, onCommit, onAdd, onRemove }: {
+  entries: BuildEnvEntry[];
+  sample: Partial<BuildEnvVars>;
+  onEdit: (i: number, patch: Partial<BuildEnvEntry>) => void;
+  onCommit: () => void;
+  onAdd: () => void;
+  onRemove: (i: number) => void;
+}) {
+  const mono: CSSProperties = { ...slackInputStyle, fontFamily: 'var(--cth-font-mono, monospace)' };
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 6, paddingLeft: 152 }}>
+      {entries.map((e, i) => (
+        <div key={i} style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <input value={e.name} placeholder="NAME" onChange={(ev) => onEdit(i, { name: ev.target.value })} onBlur={onCommit}
+              style={{ ...mono, width: 170 }} />
+            <input value={e.value} placeholder="${buildRoot}/tool/${worktreeKey}" onChange={(ev) => onEdit(i, { value: ev.target.value })} onBlur={onCommit}
+              style={{ ...mono, flex: 1 }} />
+            <PixelButton variant="ghost" size="sm" onClick={() => onRemove(i)}><Icon name="x" /></PixelButton>
+          </div>
+          {e.name.trim() !== '' && (
+            <div style={{ fontSize: 11, color: 'var(--cth-ink-500)', fontFamily: 'var(--cth-font-mono, monospace)', wordBreak: 'break-all' }}>
+              → {expandTokens(e.value, sample)}
+            </div>
+          )}
+        </div>
+      ))}
+      <div><PixelButton variant="secondary" size="sm" onClick={onAdd}><span><Icon name="plus" /> add</span></PixelButton></div>
+    </div>
+  );
 }
 
 export function SettingsModal({ config, onClose }: SettingsModalProps) {
@@ -139,6 +175,26 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
     agentId: 'jim',
     harnessHome: config.harnessHome ?? '<home>'
   };
+
+  // Per-repo build-env OVERRIDES — keyed by repo path; merged on top of the global table for a desk
+  // whose project repo matches. Edit one repo at a time (selected from the registered repos).
+  const [buildEnvByRepo, setBuildEnvByRepo] = useState<Record<string, BuildEnvEntry[]>>(config.buildEnvByRepo ?? {});
+  const [selectedRepo, setSelectedRepo] = useState<string>(config.registeredRepos?.[0] ?? '');
+  const repoEntries = (selectedRepo && buildEnvByRepo[selectedRepo]) || [];
+  /** Drop empty arrays so config stays clean (an emptied repo override disappears). */
+  const pruneRepoMap = (m: Record<string, BuildEnvEntry[]>) =>
+    Object.fromEntries(Object.entries(m).filter(([, v]) => v.length > 0));
+  const persistRepoMap = (next: Record<string, BuildEnvEntry[]>) => {
+    setBuildEnvByRepo(next);
+    void window.cth.updateConfig({ buildEnvByRepo: pruneRepoMap(next) });
+  };
+  const setRepoEntries = (entries: BuildEnvEntry[]) => persistRepoMap({ ...buildEnvByRepo, [selectedRepo]: entries });
+  const addRepoRow = () => setRepoEntries([...repoEntries, { name: '', value: '${buildRoot}/${worktreeKey}' }]);
+  const removeRepoRow = (i: number) => setRepoEntries(repoEntries.filter((_, j) => j !== i));
+  // Keystroke edits update local state only; the config is written on blur (commitRepoMap).
+  const editRepoAt = (i: number, patch: Partial<BuildEnvEntry>) =>
+    setBuildEnvByRepo((cur) => ({ ...cur, [selectedRepo]: (cur[selectedRepo] ?? []).map((e, j) => (j === i ? { ...e, ...patch } : e)) }));
+  const commitRepoMap = () => { void window.cth.updateConfig({ buildEnvByRepo: pruneRepoMap(buildEnvByRepo) }); };
 
   // Worktrees diagnostics — per-repo, per-worktree health (branch, dirty/unmerged, problem flags)
   // so the operator can SEE issues (e.g. a base tree stuck on an agent branch) and recover them.
@@ -385,7 +441,7 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
     let alive = true;
     window.cth.getConfig().then((c) => {
       if (!alive) return;
-      const cc = c as BreakerCfgView & SlackConfig & { notifications?: boolean; webSearchEnabled?: boolean; nativeBashEnabled?: boolean; sddpMode?: boolean; godWorkspace?: string; buildCacheDir?: string; buildEnv?: BuildEnvEntry[] };
+      const cc = c as BreakerCfgView & SlackConfig & { notifications?: boolean; webSearchEnabled?: boolean; nativeBashEnabled?: boolean; sddpMode?: boolean; godWorkspace?: string; buildCacheDir?: string; buildEnv?: BuildEnvEntry[]; buildEnvByRepo?: Record<string, BuildEnvEntry[]> };
       setNotifications(cc.notifications === true);
       setWebSearchEnabled(cc.webSearchEnabled === true);
       setNativeBashEnabled(cc.nativeBashEnabled === true);
@@ -393,6 +449,7 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
       setGodWorkspace(cc.godWorkspace);
       setBuildCacheDir(cc.buildCacheDir);
       setBuildEnv(cc.buildEnv ?? DEFAULT_BUILD_ENV);
+      setBuildEnvByRepo(cc.buildEnvByRepo ?? {});
       setAgentBudget(cc.costCapTokens != null ? String(cc.costCapTokens) : '');
       setVelocityCeiling(cc.circuitBreaker?.tokenVelocityPerMin != null ? String(cc.circuitBreaker.tokenVelocityPerMin) : '');
       setSlackEnabled(cc.slackEnabled ?? false);
@@ -676,35 +733,29 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
                 <span style={{ flex: 1, fontSize: 13, color: 'var(--cth-ink-500)' }}>
                   {buildEnv.length} var{buildEnv.length === 1 ? '' : 's'}
                 </span>
-                <PixelButton variant="secondary" size="sm" onClick={addBuildEnvRow}><span><Icon name="plus" /> add</span></PixelButton>
                 <PixelButton variant="secondary" size="sm" onClick={() => void resetBuildEnv()}>reset</PixelButton>
               </div>
-              <div style={subLabelStyle}>Injected into each desk's build (merged over its env). Tokens: {BUILD_ENV_TOKENS.map((t) => `\${${t}}`).join(', ')}. Values under the build cache are auto-created.</div>
-              {buildEnv.length > 0 && (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 6, paddingLeft: 152 }}>
-                  {buildEnv.map((e, i) => (
-                    <div key={i} style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                        <input
-                          value={e.name} placeholder="NAME"
-                          onChange={(ev) => editBuildEnvAt(i, { name: ev.target.value })} onBlur={commitBuildEnv}
-                          style={{ ...slackInputStyle, width: 170, fontFamily: 'var(--cth-font-mono, monospace)' }}
-                        />
-                        <input
-                          value={e.value} placeholder="${buildRoot}/tool/${worktreeKey}"
-                          onChange={(ev) => editBuildEnvAt(i, { value: ev.target.value })} onBlur={commitBuildEnv}
-                          style={{ ...slackInputStyle, flex: 1, fontFamily: 'var(--cth-font-mono, monospace)' }}
-                        />
-                        <PixelButton variant="ghost" size="sm" onClick={() => removeBuildEnvRow(i)}><Icon name="x" /></PixelButton>
-                      </div>
-                      {e.name.trim() !== '' && (
-                        <div style={{ fontSize: 11, color: 'var(--cth-ink-500)', fontFamily: 'var(--cth-font-mono, monospace)', wordBreak: 'break-all' }}>
-                          → {expandTokens(e.value, buildEnvSample)}
-                        </div>
-                      )}
-                    </div>
-                  ))}
-                </div>
+              <div style={subLabelStyle}>Any env var, injected into each desk's build (merged over its env) — not just build dirs. Tokens: {BUILD_ENV_TOKENS.map((t) => `\${${t}}`).join(', ')}. Values under the build cache are auto-created.</div>
+              <BuildEnvRows entries={buildEnv} sample={buildEnvSample} onEdit={editBuildEnvAt} onCommit={commitBuildEnv} onAdd={addBuildEnvRow} onRemove={removeBuildEnvRow} />
+
+              {/* Per-repo build-env OVERRIDES — layered on top of the global table for a desk whose
+                  project repo matches (same name wins). Edit one repo at a time. */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                <span style={{ width: 140, flexShrink: 0, color: 'var(--cth-ink-500)', fontSize: 14 }}>Per-repo env</span>
+                {projectRepos.length === 0 ? (
+                  <span style={{ flex: 1, fontSize: 13, color: 'var(--cth-ink-500)' }}>register a project repo above to add overrides</span>
+                ) : (
+                  <select value={selectedRepo} onChange={(e) => setSelectedRepo(e.target.value)}
+                    style={{ ...slackInputStyle, flex: 1, fontFamily: 'var(--cth-font-mono, monospace)' }}>
+                    {projectRepos.map((r) => (
+                      <option key={r} value={r}>{(buildEnvByRepo[r]?.length ? '• ' : '') + r}</option>
+                    ))}
+                  </select>
+                )}
+              </div>
+              <div style={subLabelStyle}>Overrides/extends the global table for desks on the selected repo (same name wins). A “•” marks a repo that has overrides. (Repo-local build config can also live in the repo's own <code>.cargo/config.toml</code> / <code>.env</code>.)</div>
+              {projectRepos.length > 0 && selectedRepo !== '' && (
+                <BuildEnvRows entries={repoEntries} sample={buildEnvSample} onEdit={editRepoAt} onCommit={commitRepoMap} onAdd={addRepoRow} onRemove={removeRepoRow} />
               )}
 
               {/* Worktrees diagnostics — per repo, per worktree: branch, health flags, and recovery

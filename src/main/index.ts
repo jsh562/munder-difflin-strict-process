@@ -9,8 +9,8 @@ import {
 } from './config';
 import { listDir, readFileText, writeFileText } from './fs';
 import { normalizeRepoPath, normalizedPathSet, buildCacheKey } from './paths';
-import { resolveBuildEnv } from './buildEnv';
-import { DEFAULT_BUILD_ENV } from '../shared/buildEnv';
+import { resolveBuildEnv, perRepoEntriesFor } from './buildEnv';
+import { DEFAULT_BUILD_ENV, mergeBuildEnv } from '../shared/buildEnv';
 import {
   getBranch, getStatus, getLog, getBranches, getAheadBehind, isRepo,
   addWorktree, removeWorktree, listWorktrees, planWorktree, type GitWorktree,
@@ -312,7 +312,10 @@ function deskBuildEnvFor(cwd: string | null | undefined, agentId: string | null 
     agentId: agentId ?? '',
     harnessHome: cfg.harnessHome ?? ''
   };
-  const { env, dirs } = resolveBuildEnv(cfg.buildEnv ?? DEFAULT_BUILD_ENV, root, vars);
+  // Global base, with this desk's per-repo override layered ON TOP (repo wins by name).
+  const base = cfg.buildEnv ?? DEFAULT_BUILD_ENV;
+  const override = perRepoEntriesFor(cfg.buildEnvByRepo, agentId ? repoForId(agentId) : null);
+  const { env, dirs } = resolveBuildEnv(mergeBuildEnv(base, override), root, vars);
   for (const dir of dirs) {
     try { mkdirSync(dir, { recursive: true }); } catch { /* best-effort — the tool will surface a write error */ }
   }

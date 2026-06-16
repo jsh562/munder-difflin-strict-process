@@ -40,6 +40,8 @@ export interface HarnessConfig {
   buildCacheDir?: string;
   /** Token-templated per-desk build/cache env vars (else the built-in CARGO_TARGET_DIR default). */
   buildEnv?: BuildEnvEntry[];
+  /** Per-repo build-env overrides (keyed by repo path) layered on the global `buildEnv`. */
+  buildEnvByRepo?: Record<string, BuildEnvEntry[]>;
   registeredRepos: string[];
   autoMode: boolean;
   defaultCommand: string;

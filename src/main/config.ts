@@ -114,6 +114,10 @@ export interface HarnessConfig {
    *  defines the parent folder once and the per-worktree structure is filled in automatically).
    *  Unset ⇒ the built-in default (`CARGO_TARGET_DIR`). See `src/shared/buildEnv.ts`. */
   buildEnv?: BuildEnvEntry[];
+  /** Per-project-repo build/env OVERRIDES, keyed by the repo path (a `registeredRepos` string;
+   *  matched case/separator-insensitively). For a desk whose project repo matches, these layer ON
+   *  TOP of the global `buildEnv` (same `name` wins). Unset ⇒ only the global table applies. */
+  buildEnvByRepo?: Record<string, BuildEnvEntry[]>;
   /** Folders the user registered during onboarding (used as quick-picks). */
   registeredRepos: string[];
   /** When true, new agents are spawned with --permission-mode bypassPermissions. */

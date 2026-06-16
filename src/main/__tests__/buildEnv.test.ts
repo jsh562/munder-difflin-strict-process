@@ -4,8 +4,10 @@
  */
 import { describe, it, expect } from 'vitest';
 import { join, resolve } from 'node:path';
-import { resolveBuildEnv } from '../buildEnv';
-import { DEFAULT_BUILD_ENV, type BuildEnvVars } from '../../shared/buildEnv';
+import { resolveBuildEnv, perRepoEntriesFor } from '../buildEnv';
+import { DEFAULT_BUILD_ENV, mergeBuildEnv, type BuildEnvVars, type BuildEnvEntry } from '../../shared/buildEnv';
+
+const win = process.platform === 'win32';
 
 const ROOT = join('/harness', 'build-cache');
 const vars = (root: string): BuildEnvVars => ({
@@ -59,5 +61,34 @@ describe('resolveBuildEnv', () => {
     expect(env.CARGO_TARGET_DIR).toBe(join(ROOT, 'cargo', 'jim-abc'));
     expect(env.SCCACHE_DIR).toBe(join(ROOT, 'sccache', 'jim-abc'));
     expect(dirs).toHaveLength(2);
+  });
+});
+
+describe('perRepoEntriesFor — normalized per-repo lookup', () => {
+  const ovr: BuildEnvEntry[] = [{ name: 'RUSTFLAGS', value: '-C debuginfo=0' }];
+  const map = { [join('/repos', 'numrs')]: ovr, [join('/repos', 'other')]: [{ name: 'X', value: 'y' }] };
+
+  it('returns undefined for an absent map, repo, or no match', () => {
+    expect(perRepoEntriesFor(undefined, join('/repos', 'numrs'))).toBeUndefined();
+    expect(perRepoEntriesFor(map, null)).toBeUndefined();
+    expect(perRepoEntriesFor(map, join('/repos', 'missing'))).toBeUndefined();
+  });
+
+  it('matches the same repo across trailing-slash / .. variants', () => {
+    expect(perRepoEntriesFor(map, join('/repos', 'numrs'))).toBe(ovr);
+    expect(perRepoEntriesFor(map, join('/repos', 'numrs') + '/')).toBe(ovr);
+    expect(perRepoEntriesFor(map, join('/repos', 'sub', '..', 'numrs'))).toBe(ovr);
+  });
+
+  it('is case-insensitive only on win32 (matches normalizeRepoPath)', () => {
+    const upper = join('/repos', 'numrs').toUpperCase();
+    if (win) expect(perRepoEntriesFor(map, upper)).toBe(ovr);
+    else expect(perRepoEntriesFor(map, upper)).toBeUndefined();
+  });
+
+  it('the override value wins when merged + resolved (layered on the global base)', () => {
+    const override = perRepoEntriesFor({ [join('/repos', 'numrs')]: [{ name: 'CARGO_TARGET_DIR', value: '${buildRoot}/special/${worktreeKey}' }] }, join('/repos', 'numrs'));
+    const { env } = resolveBuildEnv(mergeBuildEnv(DEFAULT_BUILD_ENV, override), ROOT, vars(ROOT));
+    expect(env.CARGO_TARGET_DIR).toBe(join(ROOT, 'special', 'jim-abc')); // repo override, not the default cargo/
   });
 });

@@ -6,6 +6,27 @@
  */
 import { resolve, isAbsolute, normalize, sep } from 'node:path';
 import { expandTokens, type BuildEnvEntry, type BuildEnvVars } from '../shared/buildEnv';
+import { normalizeRepoPath } from './paths';
+
+/**
+ * The per-repo override entries for a desk's project `repo` (else undefined). Keys in
+ * `buildEnvByRepo` are repo paths as the user stored them (a `registeredRepos` string); matched
+ * case/separator-insensitively against the desk's resolved repo via `normalizeRepoPath`, so a
+ * picker path and a worktree-origin path that point at the same repo still match. Small linear scan
+ * (a handful of repos). The caller layers these over the global base with `mergeBuildEnv`.
+ */
+export function perRepoEntriesFor(
+  map: Record<string, BuildEnvEntry[]> | undefined,
+  repo: string | null
+): BuildEnvEntry[] | undefined {
+  if (!map || !repo) return undefined;
+  const want = normalizeRepoPath(repo);
+  if (!want) return undefined;
+  for (const [key, entries] of Object.entries(map)) {
+    if (normalizeRepoPath(key) === want) return entries;
+  }
+  return undefined;
+}
 
 /** Is `p` the same as, or nested under, `root` (resolved)? Gates which dirs we auto-create. */
 function underRoot(p: string, root: string): boolean {
