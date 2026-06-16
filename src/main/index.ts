@@ -36,11 +36,11 @@ import { NativeRuntime } from './runtime/nativeRuntime';
 import { deniedNativeToolNames } from './runtime/toolGating';
 import { createNativeEventBridge, loadNativeEvents } from './runtime/nativeEventBridge';
 import { makeElectronWorkerTransport } from './runtime/electronWorkerTransport';
-import { runOneShotSubAgent, subAgentChildId, resolveSubAgentModel } from './runtime/subAgentRunner';
+import { makeSpawnSubAgent } from './runtime/subAgentExecutor';
 import { nativeSddpGodPrompt, nativeSddpRolePrompt } from './sddpPrompts';
 import { SddpPipeline } from './sddpPipeline';
-import { executeAgentTool, subAgentSpec, SUB_AGENT_NAMES, agentTaskBranch, analyzeCoverage, buildBugTitles, bugSignature, type AgentToolDeps, type FeatureStatus } from '@jsh562/won-agent-core';
-import { redactConfig, injectionEnvForProvider, keyPresence, setKeyInConfig, clearKeyInConfig, WEB_SEARCH_KEY_ID, NATIVE_PROVIDER_MODEL_ENV, type SafeConfig } from './credentials';
+import { executeAgentTool, agentTaskBranch, analyzeCoverage, buildBugTitles, bugSignature, type AgentToolDeps, type FeatureStatus } from '@jsh562/won-agent-core';
+import { redactConfig, injectionEnvForProvider, keyPresence, setKeyInConfig, clearKeyInConfig, WEB_SEARCH_KEY_ID, type SafeConfig } from './credentials';
 import { setSecretInConfig, clearSecretInConfig, getSecretValue, secretNames } from './secrets';
 import { searchWebDuckDuckGo } from './webSearch';
 import { resolveBashEnv, describeBashEnv } from './bashShell';
@@ -671,61 +671,22 @@ const agentToolDeps: AgentToolDeps = {
  * a `signal` so it can ABORT a step's in-flight run when the operator stops it). Inherits the
  * caller's provider+model, runs caller-scoped via `executeNativeToolFor(callerId)`, rolls the child's
  * token cost up to the caller. Never throws — returns `{ success:false }` on any guard/error.
+ *
+ * The host-agnostic body lives in `makeSpawnSubAgent` (runtime/subAgentExecutor.ts); here we inject
+ * the three host edges — the electron worker transport, the caller-scoped tool executor, and the
+ * telemetry cost rollup — over the live `agentProviderIds`/`agentModels`/`config` state. Behaviorally
+ * identical to the previous inline implementation.
  */
-async function spawnSubAgentFor(callerId: string, name: string, input: string, signal?: AbortSignal, cwdOverride?: string): Promise<{ content: string; success: boolean }> {
-  const spec = subAgentSpec(name);
-  if (!spec) return { content: `unknown sub-agent '${name}' (available: ${SUB_AGENT_NAMES.join(', ')})`, success: false };
-  const providerId = agentProviderIds.get(callerId);
-  const callerModel = agentModels.get(callerId);
-  if (!providerId || providerId === 'anthropic' || !callerModel) {
-    return { content: 'spawn_subagent requires the calling desk to run on a native (non-Claude) provider with a model assigned', success: false };
-  }
-  const credEnv = injectionEnvForProvider(readConfig(), providerId);
-  if (!credEnv) return { content: `no stored credentials for provider '${providerId}' — the operator can add a key in Settings`, success: false };
-  // Sub-agent model: the operator's `sddpSubAgentModel` override when it maps to the SAME provider as
-  // the caller (so the caller's injected key still authenticates); otherwise the caller's own model.
-  const model = resolveSubAgentModel(callerModel, readConfig().sddpSubAgentModel, providerId, deriveProviderId);
-  // The child's denied tools: its role-derived denials PLUS the hard ones (no nesting, no merge, no
-  // board mutation). Enforced by NOT advertising them + the executor wrapper below.
-  const denySet = new Set<string>([...deniedNativeToolNames(spec.roles), 'spawn_subagent', 'hive_integrate', 'hive_update_task', 'hive_add_task']);
-  const childId = subAgentChildId(callerId, name);
-  const env: Record<string, string> = {
-    ...credEnv,
-    [NATIVE_PROVIDER_MODEL_ENV]: model,
-    NATIVE_AGENT_SUBAGENT_PROMPT: spec.systemPrompt,
-    NATIVE_AGENT_ENV_NOTE: describeBashEnv(),
-    NATIVE_AGENT_DENY_TOOLS: [...denySet].join(','),
-    NATIVE_AGENT_MAX_TURNS: '2',
-    NATIVE_AGENT_MAX_HOPS: '12',
-    NATIVE_AGENT_TURN_BUDGET_MS: '120000'
-  };
-  return runOneShotSubAgent({
-    callerId,
-    childId,
-    input,
-    signal,
-    transportFactory: () => makeElectronWorkerTransport({ agentId: childId, maxOldSpaceMb: 512, env }),
-    executeTool: async (req) => {
-      if (denySet.has(req.toolName)) return { content: `a sub-agent may not call ${req.toolName}`, success: false };
-      return executeNativeToolFor(callerId, req, cwdOverride);
-    },
-    // Roll the child's token cost up to the caller (the sub-run is visible as the caller's
-    // spawn_subagent tool call + result; we don't forward the raw child stream under a synthetic id).
-    onEvent: (event) => {
-      if (event.kind !== 'token-usage') return;
-      try {
-        telemetry.ingestNativeUsage({
-          agentId: callerId,
-          sessionId: event.sessionId ?? '',
-          providerName: deriveProviderId(event.model ?? undefined) ?? providerId,
-          requestModel: event.model ?? model,
-          responseModel: event.model ?? null,
-          tokens: { input: event.input, output: event.output, cacheRead: event.cacheRead, cacheCreation: event.cacheCreation }
-        });
-      } catch { /* best-effort cost rollup */ }
-    }
-  });
-}
+const spawnSubAgentFor = makeSpawnSubAgent({
+  providerOf: (id) => agentProviderIds.get(id),
+  modelOf: (id) => agentModels.get(id),
+  credentialEnvFor: (providerId) => injectionEnvForProvider(readConfig(), providerId),
+  subAgentModelOverride: () => readConfig().sddpSubAgentModel,
+  envNote: describeBashEnv,
+  transportFactory: (childId, env) => makeElectronWorkerTransport({ agentId: childId, maxOldSpaceMb: 512, env }),
+  executeTool: (callerId, req, cwdOverride) => executeNativeToolFor(callerId, req, cwdOverride),
+  onUsage: (usage) => telemetry.ingestNativeUsage(usage)
+});
 
 // The orchestrator ROLE injected into a NATIVE god's system prompt (Michael on a
 // non-Claude provider). The Claude god gets its role via `--append-system-prompt`

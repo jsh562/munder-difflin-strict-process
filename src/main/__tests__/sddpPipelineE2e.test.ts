@@ -171,10 +171,17 @@ function setupE2E(opts: E2EOpts = {}) {
     tasks = tasks.map((t) => (t.id === 'epic-1' && t.milestones ? { ...t, milestones: t.milestones.map((m) => (m.key === key ? { ...m, control } : m)) } : t));
   };
   const closeBugCards = () => { tasks = tasks.map((t) => (/\[BUG/i.test(t.title) && t.status !== 'done' ? { ...t, status: 'done' as const } : t)); };
+  const trace = !!process.env.SDDP_E2E_TRACE;       // set SDDP_E2E_TRACE=1 for a per-milestone step trace
   const drive = async ({ until = () => ms('qc') === 'done', answerClarify = false, maxIters = 40 }: { until?: () => boolean; answerClarify?: boolean; maxIters?: number } = {}) => {
+    let last = '';
     for (let i = 0; i < maxIters; i++) {
       await pipeline.advanceFeature(repo, '00001');
       if (answerClarify && ms('clarify') === 'active' && asks.length > 0) doAdvance('clarify');
+      if (trace) {
+        const active = tasks[0].milestones!.find((m) => m.status === 'active');
+        const cur = active ? `${active.key}:${active.status}` : 'complete';
+        if (cur !== last) { console.log(`  ✓ ${cur}`); last = cur; }
+      }
       const hasImpl = tasks.some((t) => t.feature === '00001' && t.id !== 'epic-1' && !(t.milestones?.length) && !/\[BUG/i.test(t.title));
       if (hasImpl && !existsSync(abs('00001', '.completed'))) writeFileSync(abs('00001', '.completed'), '');
       if (until()) return true;
