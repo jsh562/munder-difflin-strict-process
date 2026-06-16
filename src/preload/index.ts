@@ -169,6 +169,8 @@ export interface HarnessConfig {
   /** Per-floor spec-driven (SDDP) mode: desks follow Specify→…→QC→Integrate; planner/qc
    *  roles + feature-phase banner + phase gates activate. OFF by default. */
   sddpMode?: boolean;
+  /** SDDP policy knobs (QC strictness / coverage target / max checklist files / max QC iterations). */
+  sddpConfig?: { qcStrictness?: 'minimal' | 'standard' | 'strict'; coverageTarget?: number; maxChecklist?: number; maxQcIterations?: number };
   slackEnabled?: boolean;
   slackSigningSecret?: string;
   slackBotToken?: string;

@@ -227,6 +227,17 @@ export interface HarnessConfig {
    *  only when the override resolves to the SAME provider as the caller (a cross-provider override
    *  is ignored so the caller's key still works). Absent ⇒ sub-agents run on the caller's model. */
   sddpSubAgentModel?: string;
+  /** SDDP policy knobs (mirrors sddp27's `.github/sddp-config.md`). `qcStrictness` selects the
+   *  required QC categories (minimal=build/test; standard=+lint; strict=+security/coverage);
+   *  `coverageTarget` is the % the QC auditor enforces; `maxChecklist` caps how many checklist files
+   *  the checklist step authors; `maxQcIterations` bounds the implement↔QC bug loop before findings are
+   *  deferred. All optional with built-in defaults. */
+  sddpConfig?: {
+    qcStrictness?: 'minimal' | 'standard' | 'strict';
+    coverageTarget?: number;
+    maxChecklist?: number;
+    maxQcIterations?: number;
+  };
 
   // ─── Memory reflection (the janitor's condense half) ───────────────────────
   /** Master toggle for the in-process MemoryReflector. Default on. */

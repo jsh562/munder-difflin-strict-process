@@ -383,6 +383,12 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
     try { await window.cth.updateConfig({ sddpMode: next }); }
     catch { setSddpMode(!next); useStore.getState().setSddpMode(!next); /* revert on failure */ }
   };
+  // SDDP policy knobs (QC strictness / coverage / max checklist / max QC iterations) — consumed by the
+  // host engine's QC + bug-loop phases. Persisted as a whole `sddpConfig` object.
+  type SddpCfg = { qcStrictness?: 'minimal' | 'standard' | 'strict'; coverageTarget?: number; maxChecklist?: number; maxQcIterations?: number };
+  const [sddpConfig, setSddpConfig] = useState<SddpCfg>((config as HarnessConfig & { sddpConfig?: SddpCfg }).sddpConfig ?? {});
+  const patchSddpConfig = (patch: SddpCfg) => { const nextCfg = { ...sddpConfig, ...patch }; setSddpConfig(nextCfg); void window.cth.updateConfig({ sddpConfig: nextCfg } as Partial<HarnessConfig>); };
+  const numOrUndef = (v: string): number | undefined => (v.trim() === '' ? undefined : Number(v));
 
   // ─── "Restart required" detection ────────────────────────────────────────────
   // The restart-required settings ([[restartSig]]) are baked into a desk at spawn, so a change
@@ -527,11 +533,12 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
     let alive = true;
     window.cth.getConfig().then((c) => {
       if (!alive) return;
-      const cc = c as BreakerCfgView & SlackConfig & { notifications?: boolean; webSearchEnabled?: boolean; nativeBashEnabled?: boolean; sddpMode?: boolean; godWorkspace?: string; buildCacheDir?: string; deskEnv?: DeskEnvEntry[]; deskEnvByRepo?: Record<string, DeskEnvEntry[]>; deskEnvByAgent?: Record<string, DeskEnvEntry[]>; runtimeEnv?: DeskEnvEntry[]; secretNames?: string[] };
+      const cc = c as BreakerCfgView & SlackConfig & { notifications?: boolean; webSearchEnabled?: boolean; nativeBashEnabled?: boolean; sddpMode?: boolean; sddpConfig?: SddpCfg; godWorkspace?: string; buildCacheDir?: string; deskEnv?: DeskEnvEntry[]; deskEnvByRepo?: Record<string, DeskEnvEntry[]>; deskEnvByAgent?: Record<string, DeskEnvEntry[]>; runtimeEnv?: DeskEnvEntry[]; secretNames?: string[] };
       setNotifications(cc.notifications === true);
       setWebSearchEnabled(cc.webSearchEnabled === true);
       setNativeBashEnabled(cc.nativeBashEnabled === true);
       setSddpMode(cc.sddpMode === true);
+      setSddpConfig(cc.sddpConfig ?? {});
       setGodWorkspace(cc.godWorkspace);
       setBuildCacheDir(cc.buildCacheDir);
       setDeskEnv(cc.deskEnv ?? DEFAULT_DESK_ENV);
@@ -1251,6 +1258,36 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
                   {sddpMode ? 'on' : 'off'}
                 </PixelButton>
               </div>
+
+              {/* SDDP policy knobs (used by the host QC + bug-loop phases). */}
+              {sddpMode && (
+                <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 10, paddingLeft: 8 }}>
+                  <label style={{ fontSize: 12, color: 'var(--cth-ink-500)', display: 'inline-flex', gap: 4, alignItems: 'center' }}>
+                    QC strictness
+                    <select value={sddpConfig.qcStrictness ?? 'standard'} onChange={(e) => patchSddpConfig({ qcStrictness: e.target.value as SddpCfg['qcStrictness'] })}
+                      style={{ ...slackInputStyle, width: 110 }}>
+                      <option value="minimal">minimal</option>
+                      <option value="standard">standard</option>
+                      <option value="strict">strict</option>
+                    </select>
+                  </label>
+                  <label style={{ fontSize: 12, color: 'var(--cth-ink-500)', display: 'inline-flex', gap: 4, alignItems: 'center' }}>
+                    Coverage %
+                    <input type="number" value={sddpConfig.coverageTarget ?? ''} placeholder="—" onChange={(e) => patchSddpConfig({ coverageTarget: numOrUndef(e.target.value) })}
+                      style={{ ...slackInputStyle, width: 64 }} />
+                  </label>
+                  <label style={{ fontSize: 12, color: 'var(--cth-ink-500)', display: 'inline-flex', gap: 4, alignItems: 'center' }}>
+                    Max checklists
+                    <input type="number" value={sddpConfig.maxChecklist ?? ''} placeholder="3" onChange={(e) => patchSddpConfig({ maxChecklist: numOrUndef(e.target.value) })}
+                      style={{ ...slackInputStyle, width: 56 }} />
+                  </label>
+                  <label style={{ fontSize: 12, color: 'var(--cth-ink-500)', display: 'inline-flex', gap: 4, alignItems: 'center' }}>
+                    Max QC iterations
+                    <input type="number" value={sddpConfig.maxQcIterations ?? ''} placeholder="10" onChange={(e) => patchSddpConfig({ maxQcIterations: numOrUndef(e.target.value) })}
+                      style={{ ...slackInputStyle, width: 56 }} />
+                  </label>
+                </div>
+              )}
 
               <div style={{ height: 2, background: 'var(--cth-ink-300)' }} />
 
