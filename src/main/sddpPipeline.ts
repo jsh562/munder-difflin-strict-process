@@ -14,7 +14,7 @@
  * de-duped escalation when there's no usable owner desk or a step's artifact never lands. Never
  * throws into the caller (the hive write path is fire-and-forget into `schedule`).
  */
-import { milestoneDriver, templateForStep, type HiveTask, type FeatureMilestone } from '@jsh562/won-agent-core';
+import { milestoneDriver, templateForStep, parseProjectPlanEpics, featureFolderForEpic, type HiveTask, type FeatureMilestone, type ParsedEpic } from '@jsh562/won-agent-core';
 
 /** What the engine is doing for a feature's active step (the per-step monitor surfaced to the UI). */
 export type StepState = 'running' | 'waiting' | 'paused' | 'stopped' | 'manual' | 'blocked' | 'done';
@@ -89,16 +89,39 @@ export interface SddpPipelineDeps {
   /** Count of OPEN (not-done) bug cards for the feature (title carries `[BUG`). The QC loop WAITS while
    *  any are open (workers are fixing them) and only re-runs QC once they're all closed. (P5.) */
   openBugCards?(epic: HiveTask): number;
+  /** BOOTSTRAP (before-Specify): read the repo's `specs/project-plan.md` body (the epic backlog a
+   *  bootstrapped repo already has), or null when absent. Backs `seedFeaturesFromPlan`. */
+  projectPlanText?(repo: string | null): string | null;
+  /** BOOTSTRAP: create a feature EPIC card (carrying `defaultMilestones()`) for a parsed plan epic, under
+   *  the derived `feature` folder, with the epic's description as the feature request. Mirrors
+   *  `seedImplementCards` (the host owns the card write + numbering). */
+  seedFeatureEpic?(repo: string | null, epic: ParsedEpic, feature: string): void;
   /** Optional diagnostic log. */
   log?(message: string): void;
   /** Debounce window for `schedule` (ms); default 1500. */
   debounceMs?: number;
 }
 
+/** The host steps that should be GROUNDED in the project-level bootstrap docs (PRD/SAD/DOD/plan/
+ *  governance). Authoring/design steps consult them; clarify (questions-only) and tasks (mechanical,
+ *  derived from spec+plan) do not. */
+const GROUNDED_STEPS = new Set(['spec', 'research', 'data-model', 'contracts', 'adrs', 'plan']);
+
+/** The PROJECT-LEVEL bootstrap docs a grounded planning step should consult — repo-root `specs/*.md`
+ *  + `project-instructions.md` (NOT under the feature folder; see `.claude/rules/sddp-bootstrap.md`).
+ *  The sub-agent reads whichever exist (a missing read is harmless), so a bootstrapped repo's PRD/SAD/
+ *  DOD/plan/governance actually inform the feature artifacts instead of being ignored. */
+function projectContextLine(): string {
+  return 'GROUND this in the PROJECT CONTEXT — read any that exist before authoring: '
+    + 'specs/prd.md (product scope + CAP-### capabilities), specs/sad.md (architecture + ADR-### decisions), '
+    + 'specs/dod.md (deployment/ops), specs/project-plan.md (this epic\'s place + dependencies), '
+    + 'project-instructions.md (governance). Honor their constraints and cite the PRD/SAD ids you implement.';
+}
+
 /** Build the input handed to a host step's sub-agent — the deterministic `specs/<feature>/…` paths
  *  each specialist prompt expects, PLUS the step's structure template (when it has one — the engine
- *  supplies templates as data rather than baking them into prompts). `ctx.request` carries the
- *  feature request for the `spec` step. */
+ *  supplies templates as data rather than baking them into prompts), PLUS (for grounded steps) a
+ *  pointer to the project-level bootstrap docs. `ctx.request` carries the feature request for `spec`. */
 export function buildStepInput(key: string, feature: string, ctx?: { request?: string }): string {
   const dir = `specs/${feature}`;
   let task: string;
@@ -133,6 +156,9 @@ export function buildStepInput(key: string, feature: string, ctx?: { request?: s
     default:
       task = `Feature folder ${dir}/.`;
   }
+  // Bootstrap-aware: a grounded planning step also consults the project-level docs (PRD/SAD/DOD/plan/
+  // governance) when the repo has been bootstrapped — see projectContextLine.
+  if (GROUNDED_STEPS.has(key)) task = `${task}\n\n${projectContextLine()}`;
   const template = templateForStep(key);
   return template ? `${task}\n\nAuthor into THIS structure (fill each section; replace inapplicable sections with "N/A — <reason>"):\n${template}` : task;
 }
@@ -176,6 +202,36 @@ export class SddpPipeline {
       this.debounce.delete(key);
       void this.advanceFeature(repo, feature);
     }, ms));
+  }
+
+  /** BOOTSTRAP (before-Specify) — turn a bootstrapped repo's `specs/project-plan.md` into feature EPIC
+   *  cards: read the plan, parse its PENDING epics, and seed one epic card per epic not already carded
+   *  (matched by its `E###` id). Idempotent (re-running only creates missing epics); inert when SDDP is
+   *  off, the deps are absent, or there is no plan. Returns the count created. Public so the host can call
+   *  it on SDDP-enable / a board tick, and tests can await it. Never throws. */
+  seedFeaturesFromPlan(repo: string | null): number {
+    if (!this.deps.enabled() || !this.deps.projectPlanText || !this.deps.seedFeatureEpic) return 0;
+    let created = 0;
+    try {
+      const text = this.deps.projectPlanText(repo);
+      if (!text) return 0;
+      const epics = parseProjectPlanEpics(text);
+      if (epics.length === 0) return 0;
+      const epicIdOf = (t: HiveTask): string => `${t.description ?? ''} ${t.title ?? ''}`.match(/\bE\d+\b/)?.[0] ?? '';
+      const carded = new Set(
+        this.deps.listTasks().filter((t) => Array.isArray(t.milestones) && t.milestones.length > 0).map(epicIdOf).filter(Boolean)
+      );
+      for (const epic of epics) {
+        if (carded.has(epic.epicId)) continue;       // already has an epic card — skip (idempotent)
+        const seq = parseInt(epic.epicId.replace(/\D/g, ''), 10) || (created + 1);
+        const feature = featureFolderForEpic(epic.title, seq);
+        try { this.deps.seedFeatureEpic(repo, epic, feature); created++; carded.add(epic.epicId); }
+        catch (e) { this.deps.log?.(`[sddp-pipeline] seedFeatureEpic(${epic.epicId}) failed: ${e instanceof Error ? e.message : String(e)}`); }
+      }
+    } catch (e) {
+      this.deps.log?.(`[sddp-pipeline] seedFeaturesFromPlan failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    return created;
   }
 
   /** Drive the feature's active host milestone one notch (run its sub-agent → gate → advance).

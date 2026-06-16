@@ -34,7 +34,7 @@ import { makeSpawnSubAgent } from '../runtime/subAgentExecutor';
 import {
   executeAgentTool, runAgentLoop, AGENT_TOOL_CATALOG, defaultMilestones, advanceMilestones,
   analyzeCoverage, agentTaskBranch, buildBugTitles, bugSignature, makeDeepseekAdapter, makeMinimaxAdapter,
-  SUB_AGENT_NAMES, subAgentSpec, roleAuthorsCode,
+  SUB_AGENT_NAMES, subAgentSpec, roleAuthorsCode, epicCardDescription,
   type AgentToolDeps, type HiveTask, type HiveMessage, type FeatureStatus,
   type ProviderCall, type ProviderTurn, type ToolResult, type ByteStream, type FetchLike, type FetchResponseLike
 } from '@jsh562/won-agent-core';
@@ -50,7 +50,7 @@ afterEach(() => { for (const r of roots.splice(0)) { try { rmSync(r, { recursive
 interface ToolLogEntry { agent: string; toolName: string; input: unknown; content: string; success: boolean }
 
 /** The mutable flags a case flips to drive a branch (mirrors the E2E's E2EOpts). */
-interface FsState { qcPass: boolean; autopilot: boolean; uncovered: boolean; skipOptional: boolean; conflict: boolean }
+interface FsState { qcPass: boolean; autopilot: boolean; uncovered: boolean; skipOptional: boolean; conflict: boolean; bootstrap: boolean }
 
 const USAGE = { input: 80, output: 16, cacheRead: 0, cacheCreation: 0 };
 
@@ -165,15 +165,19 @@ function baseDeps(repo: string): AgentToolDeps {
 /** The faked model's turns for each specialist — its realistic READ-then-author sequence (matching its
  *  subAgents.ts prompt). Tool hops carry no text (text-deltas accumulate into the runner's final
  *  content); only the last turn carries the final text + `endOfTurn:true`. */
-function subAgentTurns(name: string, state: FsState): ProviderTurn[] {
+function subAgentTurns(name: string, state: FsState, feature = '00001'): ProviderTurn[] {
   let seq = 0;
   const hop = (toolName: string, toolInput: unknown): ProviderTurn =>
     ({ toolUses: [{ toolName, toolInput, toolCallId: `${name}-${++seq}` }], usage: USAGE, endOfTurn: false });
   const done = (text: string): ProviderTurn => ({ text, toolUses: [], usage: USAGE, endOfTurn: true });
-  const F = 'specs/00001';
+  const F = `specs/${feature}`;
+  // Bootstrap-aware reads: when the repo is bootstrapped, the grounded authors first read the project
+  // docs (specs/prd.md / specs/sad.md / specs/dod.md — repo-root level), mirroring the bootstrap-aware
+  // buildStepInput. Empty in non-bootstrap mode (the prior behavior).
+  const ground = (...docs: string[]): ProviderTurn[] => (state.bootstrap ? docs.map((d) => hop('read_file', { path: d })) : []);
   switch (name) {
     case 'spec-author':
-      return [hop('write_file', { path: `${F}/spec.md`, content: '# Spec\nFR-001: a\nFR-002: b\n' }), done('spec drafted')];
+      return [...ground('specs/prd.md', 'specs/sad.md'), hop('write_file', { path: `${F}/spec.md`, content: '# Spec\nFR-001: a\nFR-002: b\n' }), done('spec drafted')];
     case 'requirements-scanner':
       return [hop('read_file', { path: `${F}/spec.md` }), done('Q1: scope boundaries? Q2: error handling?')];
     case 'technical-researcher':
@@ -189,7 +193,7 @@ function subAgentTurns(name: string, state: FsState): ProviderTurn[] {
       return state.skipOptional ? [done('N/A — no significant decisions')]
         : [hop('write_file', { path: `${F}/adrs/0001-x.md`, content: '# ADR-0001\n' }), done('adr recorded')];
     case 'plan-author':
-      return [hop('read_file', { path: `${F}/spec.md` }), hop('list_dir', { path: F }), hop('write_file', { path: `${F}/plan.md`, content: '# Plan\n' }), done('planned')];
+      return [...ground('specs/sad.md', 'specs/dod.md'), hop('read_file', { path: `${F}/spec.md` }), hop('list_dir', { path: F }), hop('write_file', { path: `${F}/plan.md`, content: '# Plan\n' }), done('planned')];
     case 'test-planner':
       return [hop('read_file', { path: `${F}/spec.md` }), hop('write_file', { path: `${F}/checklists/q.md`, content: '- [ ] CHK001 ok?\n' }), done('checklist authored')];
     case 'test-evaluator':
@@ -220,7 +224,8 @@ function setupFullStack(opts: Partial<FsState> & { providerFor?: (name: string) 
     autopilot: opts.autopilot !== false,
     uncovered: !!opts.uncovered,
     skipOptional: !!opts.skipOptional,
-    conflict: !!opts.conflict
+    conflict: !!opts.conflict,
+    bootstrap: !!opts.bootstrap
   };
   const root = mkdtempSync(join(tmpdir(), 'sddp-fs-'));
   roots.push(root);
@@ -232,6 +237,17 @@ function setupFullStack(opts: Partial<FsState> & { providerFor?: (name: string) 
   writeFileSync(join(repo, 'README.md'), '# scratch\n');
   git('add', '.'); git('commit', '-m', 'init');
   if (state.conflict) { writeFileSync(join(repo, 'shared.txt'), 'base\n'); git('add', 'shared.txt'); git('commit', '-m', 'base'); }
+  // Bootstrapped repo: the upstream docs (init + PRD + system design + devops + project plan) already
+  // exist + committed, but no per-feature SDD work has been done. The plan lists one pending epic (E001).
+  if (state.bootstrap) {
+    mkdirSync(join(repo, 'specs'), { recursive: true });
+    writeFileSync(join(repo, 'project-instructions.md'), '# Project Instructions\nGovernance: every feature ships with tests.\n');
+    writeFileSync(join(repo, 'specs', 'prd.md'), '# PRD\nCAP-015: the product provides a native provider runtime.\n');
+    writeFileSync(join(repo, 'specs', 'sad.md'), '# System Architecture\nADR-0001: normalize provider events onto one bus.\n');
+    writeFileSync(join(repo, 'specs', 'dod.md'), '# Deployment & Ops\nShip as an Electron desktop app.\n');
+    writeFileSync(join(repo, 'specs', 'project-plan.md'), '# Project Implementation Plan\n\n## Epic Checklist\n\n- [ ] E001 [P1] [TECHNICAL] {SAD:ADR-0001}{PRD:CAP-015} Provider runtime and event bus — port + normalized AgentEvent\n');
+    git('add', '.'); git('commit', '-m', 'bootstrap: init + prd + sad + dod + project-plan');
+  }
 
   const abs = (feature: string, rel: string) => join(repo, 'specs', feature, rel);
   const read = (feature: string, rel: string) => { const p = abs(feature, rel); return existsSync(p) ? readFileSync(p, 'utf8') : null; };
@@ -240,7 +256,7 @@ function setupFullStack(opts: Partial<FsState> & { providerFor?: (name: string) 
 
   // Per-sub-agent turn overrides (the focused hive/web case sets one directly).
   const turnsOverride = new Map<string, ProviderTurn[]>();
-  const turnsFor = (name: string): ProviderTurn[] => turnsOverride.get(name) ?? subAgentTurns(name, state);
+  const turnsFor = (name: string): ProviderTurn[] => turnsOverride.get(name) ?? subAgentTurns(name, state, FEATURE());
   const setTurns = (name: string, turns: ProviderTurn[]) => turnsOverride.set(name, turns);
 
   // The REAL toolkit deps over the temp repo. SDDP mode + repoFor anchor the specs/ redirect to the base
@@ -283,11 +299,17 @@ function setupFullStack(opts: Partial<FsState> & { providerFor?: (name: string) 
     onUsage: () => { usageEvents++; }
   });
 
-  let tasks: HiveTask[] = [...ledger.tasks.map((t) => ({ ...t, status: 'doing' as const, milestones: defaultMilestones() }))];
+  // Non-bootstrap: pre-seed the epic (feature '00001'). Bootstrap: start empty — seedFeaturesFromPlan
+  // creates the epic from the project plan (with a derived feature folder).
+  let tasks: HiveTask[] = state.bootstrap ? [] : ledger.tasks.map((t) => ({ ...t, status: 'doing' as const, milestones: defaultMilestones() }));
+  // The active feature epic (the only milestone-bearing card) + its feature folder — resolved
+  // dynamically so the harness works for both the fixed '00001' and an auto-derived feature.
+  const epicCard = () => tasks.find((t) => Array.isArray(t.milestones) && t.milestones.length > 0);
+  const FEATURE = () => epicCard()?.feature ?? '00001';
   const escalations: string[] = [];
   const asks: string[] = [];
   const doAdvance = (key: string) => {
-    const i = tasks.findIndex((t) => t.id === 'epic-1');
+    const i = tasks.findIndex((t) => Array.isArray(t.milestones) && t.milestones.length > 0);
     if (i < 0 || !tasks[i].milestones) return;
     const adv = advanceMilestones(tasks[i].milestones!, key);
     if (adv) tasks = tasks.map((t, j) => (j === i ? { ...t, milestones: adv } : t));
@@ -320,6 +342,7 @@ function setupFullStack(opts: Partial<FsState> & { providerFor?: (name: string) 
     advanceMilestone: (_epicId, key) => doAdvance(key),
     seedImplementCards: () => {
       const cids = ['c1', 'c2'];
+      const feature = FEATURE();
       for (const cid of cids) {
         const br = branchOf(cid);
         git('checkout', '-b', br, 'main');
@@ -328,16 +351,18 @@ function setupFullStack(opts: Partial<FsState> & { providerFor?: (name: string) 
         git('commit', '-m', `work ${cid}`);
         git('checkout', 'main');
       }
-      tasks = [...tasks, ...cids.map((cid) => ({ id: cid, title: `T-${cid}`, assignee: 'worker', status: 'todo' as const, dependsOn: [], project: repo, branch: branchOf(cid), feature: '00001', priority: 0, createdAt: '' }))];
+      tasks = [...tasks, ...cids.map((cid) => ({ id: cid, title: `T-${cid}`, assignee: 'worker', status: 'todo' as const, dependsOn: [], project: repo, branch: branchOf(cid), feature, priority: 0, createdAt: '' }))];
       return cids.length;
     },
     escalate: (_f, m) => escalations.push(m),
     askHuman: (_f, q) => asks.push(q),
     spawnSubAgent: (caller, name, input, signal) => spawn(caller, name, input, signal),
     prepareQcTree: async () => {
-      const branches = [...new Set(tasks.filter((t) => t.feature === '00001' && t.id !== 'epic-1' && t.branch && !/\[BUG/i.test(t.title)).map((t) => t.branch!))];
+      const feature = FEATURE();
+      const epicId = epicCard()?.id;
+      const branches = [...new Set(tasks.filter((t) => t.feature === feature && t.id !== epicId && t.branch && !/\[BUG/i.test(t.title)).map((t) => t.branch!))];
       const base = await repoTrunk(repo);
-      const path = join(root, 'qc-worktrees', '00001');
+      const path = join(root, 'qc-worktrees', feature.replace(/[\\/]/g, '_'));
       const res = await gitPrepareQcTree(repo, path, base, branches);
       return { ok: res.ok, path: res.ok ? path : null, conflicts: res.conflicts };
     },
@@ -345,33 +370,40 @@ function setupFullStack(opts: Partial<FsState> & { providerFor?: (name: string) 
     spawnSubAgentInTree: (caller, name, input, treePath, signal) => spawn(caller, name, input, signal, treePath),
     sddpPolicy: () => ({ qcStrictness: 'standard', maxQcIterations: 10 }),
     seedBugCards: (_epic, report, attempt) => {
+      const feature = FEATURE();
       const found = report.split('\n').map((l) => l.trim()).filter((l) => /\[BUG:/i.test(l));
       const findings = found.length ? found : ['[BUG:ERROR] QC failed — see qc-report.md'];
-      const priorSigs = new Set(tasks.filter((t) => t.feature === '00001' && /\[BUG/i.test(t.title)).map((t) => bugSignature(t.title)));
+      const priorSigs = new Set(tasks.filter((t) => t.feature === feature && /\[BUG/i.test(t.title)).map((t) => bugSignature(t.title)));
       const titles = buildBugTitles(findings, priorSigs, attempt, 10);
-      tasks = [...tasks, ...titles.map((title, i) => ({ id: `bug-${tasks.length + i}`, title, assignee: 'worker', status: 'todo' as const, dependsOn: [], project: repo, feature: '00001', priority: 1, createdAt: '' }))];
+      tasks = [...tasks, ...titles.map((title, i) => ({ id: `bug-${tasks.length + i}`, title, assignee: 'worker', status: 'todo' as const, dependsOn: [], project: repo, feature, priority: 1, createdAt: '' }))];
       return titles.length;
     },
-    openBugCards: () => tasks.filter((t) => t.feature === '00001' && t.status !== 'done' && /\[BUG/i.test(t.title)).length,
+    openBugCards: () => tasks.filter((t) => t.feature === FEATURE() && t.status !== 'done' && /\[BUG/i.test(t.title)).length,
+    // BOOTSTRAP: read the repo's project plan + seed a feature epic per pending epic (auto-derive).
+    projectPlanText: () => { const p = join(repo, 'specs', 'project-plan.md'); return existsSync(p) ? readFileSync(p, 'utf8') : null; },
+    seedFeatureEpic: (_r, epic, feature) => {
+      tasks = [...tasks, { id: `epic-${epic.epicId}`, title: `${epic.epicId} ${epic.title}`, description: epicCardDescription(epic), assignee: 'owner', status: 'doing' as const, dependsOn: [], project: repo, feature, milestones: defaultMilestones(), priority: 0, createdAt: '' }];
+    },
     debounceMs: 0
   };
 
   const pipeline = new SddpPipeline(deps);
-  const ms = (key: string) => tasks[0].milestones!.find((m) => m.key === key)!.status;
+  const ms = (key: string) => epicCard()!.milestones!.find((m) => m.key === key)!.status;
   const closeBugCards = () => { tasks = tasks.map((t) => (/\[BUG/i.test(t.title) && t.status !== 'done' ? { ...t, status: 'done' as const } : t)); };
   const trace = !!process.env.SDDP_E2E_TRACE;
   const drive = async ({ until = () => ms('qc') === 'done', answerClarify = false, maxIters = 40 }: { until?: () => boolean; answerClarify?: boolean; maxIters?: number } = {}) => {
     let last = '';
+    const feature = FEATURE();
     for (let i = 0; i < maxIters; i++) {
-      await pipeline.advanceFeature(repo, '00001');
+      await pipeline.advanceFeature(repo, feature);
       if (answerClarify && ms('clarify') === 'active' && asks.length > 0) doAdvance('clarify');
       if (trace) {
-        const active = tasks[0].milestones!.find((m) => m.status === 'active');
+        const active = epicCard()?.milestones!.find((m) => m.status === 'active');
         const cur = active ? `${active.key}:${active.status}` : 'complete';
         if (cur !== last) { console.log(`  ✓ ${cur}`); last = cur; }
       }
-      const hasImpl = tasks.some((t) => t.feature === '00001' && t.id !== 'epic-1' && !(t.milestones?.length) && !/\[BUG/i.test(t.title));
-      if (hasImpl && !existsSync(abs('00001', '.completed'))) writeFileSync(abs('00001', '.completed'), '');
+      const hasImpl = tasks.some((t) => t.feature === feature && !(t.milestones?.length) && !/\[BUG/i.test(t.title));
+      if (hasImpl && !existsSync(abs(feature, '.completed'))) writeFileSync(abs(feature, '.completed'), '');
       if (until()) return true;
     }
     return false;
@@ -379,7 +411,7 @@ function setupFullStack(opts: Partial<FsState> & { providerFor?: (name: string) 
 
   return {
     pipeline, root, repo, state, abs, read, write, ms, drive, closeBugCards, setTurns, spawn,
-    getTasks: () => tasks, operatorAdvance: doAdvance,
+    getTasks: () => tasks, operatorAdvance: doAdvance, feature: FEATURE,
     escalations, asks, forwarded, toolLog, eventLog, usage: () => usageEvents
   };
 }
@@ -693,6 +725,39 @@ describe('SDDP engine — full-stack composition (real runner + real loop + real
         expect(entry!.content).toMatch(/a sub-agent may not call/);
       }
     }
+  });
+
+  it('17. BOOTSTRAPPED repo: the engine auto-derives the epic from specs/project-plan.md, then runs specify→qc hands-off while the sub-agents read the project docs', async () => {
+    const h = setupFullStack({ bootstrap: true });
+    // The repo is only bootstrapped (init + prd + sad + dod + project-plan committed) — no epic yet.
+    expect(h.getTasks().some((t) => t.milestones?.length)).toBe(false);
+
+    // BEFORE-Specify: read the FINISHED project plan and auto-create the feature epic (this is the new
+    // step — it consumes the plan, it does NOT re-run projectplan).
+    const created = h.pipeline.seedFeaturesFromPlan(h.repo);
+    expect(created).toBe(1);
+    const epic = h.getTasks().find((t) => t.milestones?.length)!;
+    expect(epic.feature).toBe('00001-provider-runtime-and-event-bus'); // derived from the plan's E001 title
+    expect(epic.description).toMatch(/\{PRD:CAP-015\}/);                // carries the epic's PRD/SAD refs
+    expect(epic.description).toMatch(/\{SAD:ADR-0001\}/);
+
+    // Re-running is idempotent — the epic is already carded, so no duplicate is created.
+    expect(h.pipeline.seedFeaturesFromPlan(h.repo)).toBe(0);
+
+    // Run specify → clarify → plan → checklist → tasks → analyze → implement → qc hands-off (autopilot ON).
+    expect(await h.drive()).toBe(true);
+    expect(h.getTasks().find((t) => t.milestones?.length)!.milestones!.every((m) => m.status === 'done')).toBe(true);
+    expect(h.escalations).toHaveLength(0); // minimal human intervention held the whole way
+
+    // The bootstrap docs were CONSUMED (read via the real toolkit), not merely present:
+    const readByAgent = (agent: string, path: string) => h.toolLog.some((e) => e.agent === agent && e.toolName === 'read_file' && (e.input as { path?: string })?.path === path && e.success);
+    expect(readByAgent('spec-author', 'specs/prd.md')).toBe(true);   // spec grounded in the PRD
+    expect(readByAgent('spec-author', 'specs/sad.md')).toBe(true);   // …and the system design
+    expect(readByAgent('plan-author', 'specs/sad.md')).toBe(true);   // plan grounded in the architecture
+
+    // The feature workspace was authored under the DERIVED folder, and QC passed.
+    expect(h.read(h.feature(), 'spec.md')).toMatch(/FR-001/);
+    expect(existsSync(h.abs(h.feature(), '.qc-passed'))).toBe(true);
   });
 });
 

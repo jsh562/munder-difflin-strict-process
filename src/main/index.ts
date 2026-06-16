@@ -39,7 +39,7 @@ import { makeElectronWorkerTransport } from './runtime/electronWorkerTransport';
 import { makeSpawnSubAgent } from './runtime/subAgentExecutor';
 import { nativeSddpGodPrompt, nativeSddpRolePrompt } from './sddpPrompts';
 import { SddpPipeline } from './sddpPipeline';
-import { executeAgentTool, agentTaskBranch, analyzeCoverage, buildBugTitles, bugSignature, type AgentToolDeps, type FeatureStatus } from '@jsh562/won-agent-core';
+import { executeAgentTool, agentTaskBranch, analyzeCoverage, buildBugTitles, bugSignature, defaultMilestones, epicCardDescription, type AgentToolDeps, type FeatureStatus } from '@jsh562/won-agent-core';
 import { redactConfig, injectionEnvForProvider, keyPresence, setKeyInConfig, clearKeyInConfig, WEB_SEARCH_KEY_ID, type SafeConfig } from './credentials';
 import { setSecretInConfig, clearSecretInConfig, getSecretValue, secretNames } from './secrets';
 import { searchWebDuckDuckGo } from './webSearch';
@@ -1085,10 +1085,52 @@ const sddpPipeline = new SddpPipeline({
     try { hive.send({ to: 'god', act: 'query', needs_human: true, subject: `Clarify — ${feature}`, body: `Feature "${feature}" needs clarification before planning. Answer these, fold them into specs/${feature}/spec.md (## Clarifications), then advance the clarify milestone (hive_update_task advanceMilestone:'clarify'):\n\n${questions}` }, 'system'); }
     catch (e) { console.error('[sddp-pipeline] askHuman failed:', e); }
   },
+  // BOOTSTRAP (before-Specify): read a bootstrapped repo's already-written project plan.
+  projectPlanText: (repo) => {
+    if (!repo) return null;
+    const p = join(repo, 'specs', 'project-plan.md');
+    if (!existsSync(p)) return null;
+    try { return readFileSync(p, 'utf8'); } catch { return null; }
+  },
+  // BOOTSTRAP: seed one feature EPIC card (with the full milestone checklist) for a pending plan epic,
+  // owned by a usable planner desk when one exists (the engine runs the phase specialists AS it). The
+  // description carries the epic's intent + PRD/SAD refs so the bootstrap-aware spec step grounds it.
+  // Mirrors seedImplementCards (host owns the card write). Idempotency is enforced upstream by the
+  // engine (skips epics already carded by their E### id).
+  seedFeatureEpic: (repo, epic, feature) => {
+    const ledger = hive.tasks() as { tasks?: HiveTask[] } | undefined;
+    const existing = Array.isArray(ledger?.tasks) ? ledger!.tasks : [];
+    const owner = usableDesksForRole('planner')[0];
+    const card: HiveTask = {
+      id: `epic-${Date.now()}-${existing.length}`,
+      title: `${epic.epicId} ${epic.title}`.trim(),
+      description: epicCardDescription(epic),
+      assignee: owner,
+      status: 'doing',
+      dependsOn: [],
+      project: owner ? (repoForId(owner) ?? repo ?? undefined) : (repo ?? undefined),
+      feature,
+      milestones: defaultMilestones(),
+      priority: epic.priority === 'P1' ? 0 : epic.priority === 'P3' ? 2 : 1,
+      createdAt: new Date().toISOString()
+    };
+    hive.writeTasks([...existing, card]);
+  },
   log: (m) => console.log(m)
 });
-// The hive fires this per feature on every board change (fire-and-forget); the engine debounces.
-hive.setPipelineTrigger((repo, feature) => sddpPipeline.schedule(repo, feature));
+// BOOTSTRAP auto-seed (thin trigger): turn each registered repo's `specs/project-plan.md` into feature
+// epic cards when SDDP mode is on. Idempotent (the engine skips already-carded epics), so it's safe to
+// call on enable, on board activity, and at startup. The god can still create epics too.
+function seedAllFeaturesFromPlan(): void {
+  if (readConfig().sddpMode !== true) return;
+  for (const repo of new Set([...(readConfig().registeredRepos ?? []), ...worktreeOrigins.values()])) {
+    try { sddpPipeline.seedFeaturesFromPlan(repo); } catch (e) { console.error('[sddp-pipeline] seedAllFeaturesFromPlan failed:', e); }
+  }
+}
+// The hive fires this per feature on every board change (fire-and-forget); the engine debounces. Also
+// (idempotently) seed any pending plan epics for the repo, so a bootstrapped repo's backlog fills in as
+// soon as there's board activity (the startup + enable passes cover a cold repo with no activity yet).
+hive.setPipelineTrigger((repo, feature) => { sddpPipeline.seedFeaturesFromPlan(repo); sddpPipeline.schedule(repo, feature); });
 
 /** Keep the system from suspending the harness while agents are running.
  *  Windows Modern Standby suspends desktop apps (and their child `claude`
@@ -1878,7 +1920,12 @@ ipcMain.handle('terminal:openAtFolder', async (_evt, cwd: unknown) => {
 // only presence (providerKeyPresence). Keys live in config.json + a worker's
 // spawn env, never anywhere the renderer can read.
 ipcMain.handle('config:get', (): SafeConfig => redactConfig(readConfig()));
-ipcMain.handle('config:update', (_evt, patch: Partial<HarnessConfig>) => writeConfig(patch));
+ipcMain.handle('config:update', (_evt, patch: Partial<HarnessConfig>) => {
+  writeConfig(patch);
+  // Turning SDDP mode on (or adding repos while it's on) → auto-seed feature epics from each
+  // bootstrapped repo's project plan, so a hands-off run starts without the operator creating cards.
+  if (patch.sddpMode === true || (patch.registeredRepos && readConfig().sddpMode === true)) seedAllFeaturesFromPlan();
+});
 
 // E004 — provider credentials. Set/clear validate against the E002 registry; the
 // renderer only ever learns presence, never values.
@@ -2455,6 +2502,9 @@ app.whenReady().then(() => {
   try { persist.open(); } catch (e) { console.error('[db] open failed:', e); }
   // Bootstrap the hive (if harnessHome is configured) and start the message router.
   bootstrapHiveServices();
+  // If SDDP mode is already on at boot, auto-seed feature epics from each bootstrapped repo's project
+  // plan (idempotent) — so a cold, already-bootstrapped repo's backlog is picked up without any action.
+  try { seedAllFeaturesFromPlan(); } catch (e) { console.error('[sddp-pipeline] startup seed failed:', e); }
   createWindow();
   // Auto-start the Slack webhook server when configured. Best-effort: a tunnel
   // failure (offline) is logged, not fatal. The tunnel URL is ephemeral and
