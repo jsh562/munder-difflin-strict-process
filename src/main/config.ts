@@ -2,7 +2,7 @@ import { app } from 'electron';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
-import type { BuildEnvEntry } from '../shared/buildEnv';
+import type { DeskEnvEntry } from '../shared/deskEnv';
 
 /** A recurring auto-dispatched mission fired on an interval by the scheduler. */
 export interface ScheduledMission {
@@ -109,15 +109,19 @@ export interface HarnessConfig {
    *  so heavy/churning build trees stay OUT of the worktrees and the repo — the operator excludes
    *  this single folder from antivirus. Unset ⇒ auto-derived `<harnessHome>/build-cache`. */
   buildCacheDir?: string;
-  /** Per-desk build/cache env vars, injected into each desk's build environment. Each value is a
-   *  TEMPLATE with `${buildRoot}`/`${worktreeKey}`/… tokens the host expands per desk (so the user
-   *  defines the parent folder once and the per-worktree structure is filled in automatically).
-   *  Unset ⇒ the built-in default (`CARGO_TARGET_DIR`). See `src/shared/buildEnv.ts`. */
-  buildEnv?: BuildEnvEntry[];
-  /** Per-project-repo build/env OVERRIDES, keyed by the repo path (a `registeredRepos` string;
-   *  matched case/separator-insensitively). For a desk whose project repo matches, these layer ON
-   *  TOP of the global `buildEnv` (same `name` wins). Unset ⇒ only the global table applies. */
-  buildEnvByRepo?: Record<string, BuildEnvEntry[]>;
+  /** Per-desk env vars (GLOBAL base), injected into each desk's environment. Each value is a TEMPLATE
+   *  with `${buildRoot}`/`${worktreeKey}`/`${cwd}`/`${agentId}`/`${harnessHome}` + `${env:NAME}` tokens
+   *  the host expands per desk (so the user defines the parent folder once and the per-worktree
+   *  structure is filled in automatically). General — any var, not just build dirs. Unset ⇒ the
+   *  built-in default (`CARGO_TARGET_DIR`). See `src/shared/deskEnv.ts`. */
+  deskEnv?: DeskEnvEntry[];
+  /** Per-project-repo env OVERRIDES, keyed by the repo path (a `registeredRepos` string; matched
+   *  case/separator-insensitively). For a desk whose project repo matches, these layer ON TOP of the
+   *  global `deskEnv` (same `name` wins). Unset ⇒ only the global table applies. */
+  deskEnvByRepo?: Record<string, DeskEnvEntry[]>;
+  /** Per-agent env OVERRIDES, keyed by EXACT agent id. Layered ON TOP of global + per-repo for that
+   *  desk (most specific wins). Unset ⇒ only the global + per-repo tables apply. */
+  deskEnvByAgent?: Record<string, DeskEnvEntry[]>;
   /** Folders the user registered during onboarding (used as quick-picks). */
   registeredRepos: string[];
   /** When true, new agents are spawned with --permission-mode bypassPermissions. */
@@ -263,13 +267,24 @@ function configPath(): string {
   return join(app.getPath('userData'), 'config.json');
 }
 
+/** Migrate legacy keys in place so older configs keep working. `buildEnv`/`buildEnvByRepo` were
+ *  renamed to `deskEnv`/`deskEnvByRepo` (the table is general, not build-only) — surface the old
+ *  values under the new keys when the new ones are absent. New writes use the new keys; the stale old
+ *  keys are harmless (ignored). */
+function migrateConfig(cfg: HarnessConfig): HarnessConfig {
+  const legacy = cfg as HarnessConfig & { buildEnv?: DeskEnvEntry[]; buildEnvByRepo?: Record<string, DeskEnvEntry[]> };
+  if (cfg.deskEnv === undefined && legacy.buildEnv !== undefined) cfg.deskEnv = legacy.buildEnv;
+  if (cfg.deskEnvByRepo === undefined && legacy.buildEnvByRepo !== undefined) cfg.deskEnvByRepo = legacy.buildEnvByRepo;
+  return cfg;
+}
+
 export function readConfig(): HarnessConfig {
   const p = configPath();
   if (!existsSync(p)) return { ...DEFAULTS };
   try {
     const raw = readFileSync(p, 'utf8');
     const parsed = JSON.parse(raw);
-    return { ...DEFAULTS, ...parsed };
+    return migrateConfig({ ...DEFAULTS, ...parsed });
   } catch {
     return { ...DEFAULTS };
   }

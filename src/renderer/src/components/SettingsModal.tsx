@@ -6,7 +6,7 @@ import { PixelButton } from './PixelButton';
 import { Icon } from './Icon';
 import { ProviderModelPicker } from './ProviderModelPicker';
 import { isAssignmentStale } from '@shared/assignment';
-import { DEFAULT_BUILD_ENV, expandTokens, BUILD_ENV_TOKENS, type BuildEnvEntry, type BuildEnvVars } from '@shared/buildEnv';
+import { DEFAULT_DESK_ENV, expandTokens, DESK_ENV_TOKENS, type DeskEnvEntry, type DeskEnvVars } from '@shared/deskEnv';
 import { scheduleDeskRestart } from '@/lib/restartDesk';
 import { restartSigOf, deskStaleKeys, RESTART_SIG_LABELS, type RestartSig } from '@/lib/restartSig';
 
@@ -66,38 +66,63 @@ function clearLocalState(): void {
   } catch { /* noop */ }
 }
 
-/** Reusable build-env row editor (name + value template + remove, with a per-row live preview and an
- *  add button). Shared by the GLOBAL table and each PER-REPO override table. Edits flow through
- *  `onEdit` (local, per keystroke); the config write happens on blur via `onCommit`; add/remove
- *  persist immediately through their callbacks. */
-function BuildEnvRows({ entries, sample, onEdit, onCommit, onAdd, onRemove }: {
-  entries: BuildEnvEntry[];
-  sample: Partial<BuildEnvVars>;
-  onEdit: (i: number, patch: Partial<BuildEnvEntry>) => void;
+/** Reusable desk-env row editor (name + value template + remove, with a per-row live preview, an
+ *  "· created" marker when the value resolves to an auto-created build dir, token-insert chips, and an
+ *  add button). Shared by the GLOBAL, PER-REPO, and PER-AGENT tables. Edits flow through `onEdit`
+ *  (local, per keystroke); the config write happens on blur via `onCommit`; add/remove persist
+ *  immediately. `buildRoot` (display root) drives the "created" marker. */
+function DeskEnvRows({ entries, sample, buildRoot, onEdit, onCommit, onAdd, onRemove }: {
+  entries: DeskEnvEntry[];
+  sample: Partial<DeskEnvVars>;
+  buildRoot: string;
+  onEdit: (i: number, patch: Partial<DeskEnvEntry>) => void;
   onCommit: () => void;
   onAdd: () => void;
   onRemove: (i: number) => void;
 }) {
+  const [focused, setFocused] = useState(0);
   const mono: CSSProperties = { ...slackInputStyle, fontFamily: 'var(--cth-font-mono, monospace)' };
+  const chipStyle: CSSProperties = {
+    padding: '1px 5px', fontSize: 10, lineHeight: '15px', cursor: 'pointer',
+    background: 'var(--cth-cream-300)', boxShadow: 'inset 0 0 0 1px var(--cth-ink-300)',
+    color: 'var(--cth-ink-900)', fontFamily: 'var(--cth-font-mono, monospace)', border: 'none'
+  };
+  // Insert a token into the value of the most-recently-focused row (clamped to a real row).
+  const insert = (tok: string) => {
+    const i = Math.min(focused, entries.length - 1);
+    if (i < 0) return;
+    onEdit(i, { value: (entries[i]?.value ?? '') + '${' + tok + '}' });
+    onCommit();
+  };
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 6, paddingLeft: 152 }}>
-      {entries.map((e, i) => (
-        <div key={i} style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-            <input value={e.name} placeholder="NAME" onChange={(ev) => onEdit(i, { name: ev.target.value })} onBlur={onCommit}
-              style={{ ...mono, width: 170 }} />
-            <input value={e.value} placeholder="${buildRoot}/tool/${worktreeKey}" onChange={(ev) => onEdit(i, { value: ev.target.value })} onBlur={onCommit}
-              style={{ ...mono, flex: 1 }} />
-            <PixelButton variant="ghost" size="sm" onClick={() => onRemove(i)}><Icon name="x" /></PixelButton>
-          </div>
-          {e.name.trim() !== '' && (
-            <div style={{ fontSize: 11, color: 'var(--cth-ink-500)', fontFamily: 'var(--cth-font-mono, monospace)', wordBreak: 'break-all' }}>
-              → {expandTokens(e.value, sample)}
+      {entries.map((e, i) => {
+        const resolved = expandTokens(e.value, sample);
+        const created = !!buildRoot && resolved.startsWith(buildRoot);
+        return (
+          <div key={i} style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <input value={e.name} placeholder="NAME" onChange={(ev) => onEdit(i, { name: ev.target.value })} onBlur={onCommit} onFocus={() => setFocused(i)}
+                style={{ ...mono, width: 170 }} />
+              <input value={e.value} placeholder="${buildRoot}/tool/${worktreeKey}" onChange={(ev) => onEdit(i, { value: ev.target.value })} onBlur={onCommit} onFocus={() => setFocused(i)}
+                style={{ ...mono, flex: 1 }} />
+              <PixelButton variant="ghost" size="sm" onClick={() => onRemove(i)}><Icon name="x" /></PixelButton>
             </div>
-          )}
-        </div>
-      ))}
-      <div><PixelButton variant="secondary" size="sm" onClick={onAdd}><span><Icon name="plus" /> add</span></PixelButton></div>
+            {e.name.trim() !== '' && (
+              <div style={{ fontSize: 11, color: 'var(--cth-ink-500)', fontFamily: 'var(--cth-font-mono, monospace)', wordBreak: 'break-all' }}>
+                → {resolved}{created && <span style={{ color: 'var(--cth-sage, var(--cth-ink-700))' }}> · created</span>}
+              </div>
+            )}
+          </div>
+        );
+      })}
+      <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', alignItems: 'center' }}>
+        <PixelButton variant="secondary" size="sm" onClick={onAdd}><span><Icon name="plus" /> add</span></PixelButton>
+        <span style={{ fontSize: 10, color: 'var(--cth-ink-500)' }}>insert:</span>
+        {[...DESK_ENV_TOKENS, 'env:'].map((t) => (
+          <button key={t} type="button" style={chipStyle} onClick={() => insert(t)}>{'${' + t + '}'}</button>
+        ))}
+      </div>
     </div>
   );
 }
@@ -149,26 +174,26 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
   const buildRootDisplay = (buildCacheDir
     ?? (config.harnessHome ? `${config.harnessHome}${config.harnessHome.includes('\\') ? '\\' : '/'}build-cache` : '<home>/build-cache'));
 
-  // Build-env table — token-templated env vars injected into each desk's build. Seeded from config,
-  // else the built-in default so the user sees + can edit it. Persisted as the whole array.
-  const [buildEnv, setBuildEnv] = useState<BuildEnvEntry[]>(config.buildEnv ?? DEFAULT_BUILD_ENV);
-  const persistBuildEnv = (next: BuildEnvEntry[]) => {
-    setBuildEnv(next);
-    void window.cth.updateConfig({ buildEnv: next });
+  // Desk-env table (GLOBAL base) — token-templated env vars injected into each desk. Seeded from
+  // config, else the built-in default so the user sees + can edit it. Persisted as the whole array.
+  const [deskEnv, setDeskEnv] = useState<DeskEnvEntry[]>(config.deskEnv ?? DEFAULT_DESK_ENV);
+  const persistDeskEnv = (next: DeskEnvEntry[]) => {
+    setDeskEnv(next);
+    void window.cth.updateConfig({ deskEnv: next });
   };
-  const addBuildEnvRow = () => persistBuildEnv([...buildEnv, { name: '', value: '${buildRoot}/${worktreeKey}' }]);
-  // Edits update local state per keystroke; the config is written on blur (commitBuildEnv) to avoid
+  const addDeskEnvRow = () => persistDeskEnv([...deskEnv, { name: '', value: '${buildRoot}/${worktreeKey}' }]);
+  // Edits update local state per keystroke; the config is written on blur (commitDeskEnv) to avoid
   // a file write per character. Add/remove/reset persist immediately.
-  const editBuildEnvAt = (i: number, patch: Partial<BuildEnvEntry>) =>
-    setBuildEnv((cur) => cur.map((e, j) => (j === i ? { ...e, ...patch } : e)));
-  const commitBuildEnv = () => { void window.cth.updateConfig({ buildEnv }); };
-  const removeBuildEnvRow = (i: number) => persistBuildEnv(buildEnv.filter((_, j) => j !== i));
-  const resetBuildEnv = async () => {
-    setBuildEnv(DEFAULT_BUILD_ENV);
-    await window.cth.updateConfig({ buildEnv: undefined }); // back to the built-in default
+  const editDeskEnvAt = (i: number, patch: Partial<DeskEnvEntry>) =>
+    setDeskEnv((cur) => cur.map((e, j) => (j === i ? { ...e, ...patch } : e)));
+  const commitDeskEnv = () => { void window.cth.updateConfig({ deskEnv }); };
+  const removeDeskEnvRow = (i: number) => persistDeskEnv(deskEnv.filter((_, j) => j !== i));
+  const resetDeskEnv = async () => {
+    setDeskEnv(DEFAULT_DESK_ENV);
+    await window.cth.updateConfig({ deskEnv: undefined }); // back to the built-in default
   };
   /** Sample vars for the per-row live preview (shows where a value resolves for a worktree desk). */
-  const buildEnvSample = {
+  const deskEnvSample = {
     buildRoot: buildRootDisplay,
     worktreeKey: 'jim-3f2a1b',
     cwd: 'S:/md/numrs',
@@ -176,25 +201,42 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
     harnessHome: config.harnessHome ?? '<home>'
   };
 
-  // Per-repo build-env OVERRIDES — keyed by repo path; merged on top of the global table for a desk
-  // whose project repo matches. Edit one repo at a time (selected from the registered repos).
-  const [buildEnvByRepo, setBuildEnvByRepo] = useState<Record<string, BuildEnvEntry[]>>(config.buildEnvByRepo ?? {});
+  // Per-repo env OVERRIDES — keyed by repo path; merged on top of the global table for a desk whose
+  // project repo matches. Edit one repo at a time (selected from the registered repos).
+  const [deskEnvByRepo, setDeskEnvByRepo] = useState<Record<string, DeskEnvEntry[]>>(config.deskEnvByRepo ?? {});
   const [selectedRepo, setSelectedRepo] = useState<string>(config.registeredRepos?.[0] ?? '');
-  const repoEntries = (selectedRepo && buildEnvByRepo[selectedRepo]) || [];
-  /** Drop empty arrays so config stays clean (an emptied repo override disappears). */
-  const pruneRepoMap = (m: Record<string, BuildEnvEntry[]>) =>
+  const repoEntries = (selectedRepo && deskEnvByRepo[selectedRepo]) || [];
+  /** Drop empty arrays so config stays clean (an emptied override disappears). */
+  const pruneEnvMap = (m: Record<string, DeskEnvEntry[]>) =>
     Object.fromEntries(Object.entries(m).filter(([, v]) => v.length > 0));
-  const persistRepoMap = (next: Record<string, BuildEnvEntry[]>) => {
-    setBuildEnvByRepo(next);
-    void window.cth.updateConfig({ buildEnvByRepo: pruneRepoMap(next) });
+  const persistRepoMap = (next: Record<string, DeskEnvEntry[]>) => {
+    setDeskEnvByRepo(next);
+    void window.cth.updateConfig({ deskEnvByRepo: pruneEnvMap(next) });
   };
-  const setRepoEntries = (entries: BuildEnvEntry[]) => persistRepoMap({ ...buildEnvByRepo, [selectedRepo]: entries });
+  const setRepoEntries = (entries: DeskEnvEntry[]) => persistRepoMap({ ...deskEnvByRepo, [selectedRepo]: entries });
   const addRepoRow = () => setRepoEntries([...repoEntries, { name: '', value: '${buildRoot}/${worktreeKey}' }]);
   const removeRepoRow = (i: number) => setRepoEntries(repoEntries.filter((_, j) => j !== i));
-  // Keystroke edits update local state only; the config is written on blur (commitRepoMap).
-  const editRepoAt = (i: number, patch: Partial<BuildEnvEntry>) =>
-    setBuildEnvByRepo((cur) => ({ ...cur, [selectedRepo]: (cur[selectedRepo] ?? []).map((e, j) => (j === i ? { ...e, ...patch } : e)) }));
-  const commitRepoMap = () => { void window.cth.updateConfig({ buildEnvByRepo: pruneRepoMap(buildEnvByRepo) }); };
+  const editRepoAt = (i: number, patch: Partial<DeskEnvEntry>) =>
+    setDeskEnvByRepo((cur) => ({ ...cur, [selectedRepo]: (cur[selectedRepo] ?? []).map((e, j) => (j === i ? { ...e, ...patch } : e)) }));
+  const commitRepoMap = () => { void window.cth.updateConfig({ deskEnvByRepo: pruneEnvMap(deskEnvByRepo) }); };
+
+  // Per-agent env OVERRIDES — keyed by agent id; merged on top of global + per-repo for that desk.
+  // Edit one desk at a time (selected from the live fleet).
+  const fleetAgents = useStore((s) => s.agents);
+  const deskChoices = fleetAgents.filter((a) => !a.isGod && !a.isAssistant);
+  const [deskEnvByAgent, setDeskEnvByAgent] = useState<Record<string, DeskEnvEntry[]>>(config.deskEnvByAgent ?? {});
+  const [selectedAgent, setSelectedAgent] = useState<string>(deskChoices[0]?.id ?? '');
+  const agentEntries = (selectedAgent && deskEnvByAgent[selectedAgent]) || [];
+  const persistAgentMap = (next: Record<string, DeskEnvEntry[]>) => {
+    setDeskEnvByAgent(next);
+    void window.cth.updateConfig({ deskEnvByAgent: pruneEnvMap(next) });
+  };
+  const setAgentEntries = (entries: DeskEnvEntry[]) => persistAgentMap({ ...deskEnvByAgent, [selectedAgent]: entries });
+  const addAgentRow = () => setAgentEntries([...agentEntries, { name: '', value: '' }]);
+  const removeAgentRow = (i: number) => setAgentEntries(agentEntries.filter((_, j) => j !== i));
+  const editAgentAt = (i: number, patch: Partial<DeskEnvEntry>) =>
+    setDeskEnvByAgent((cur) => ({ ...cur, [selectedAgent]: (cur[selectedAgent] ?? []).map((e, j) => (j === i ? { ...e, ...patch } : e)) }));
+  const commitAgentMap = () => { void window.cth.updateConfig({ deskEnvByAgent: pruneEnvMap(deskEnvByAgent) }); };
 
   // Worktrees diagnostics — per-repo, per-worktree health (branch, dirty/unmerged, problem flags)
   // so the operator can SEE issues (e.g. a base tree stuck on an agent branch) and recover them.
@@ -441,15 +483,16 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
     let alive = true;
     window.cth.getConfig().then((c) => {
       if (!alive) return;
-      const cc = c as BreakerCfgView & SlackConfig & { notifications?: boolean; webSearchEnabled?: boolean; nativeBashEnabled?: boolean; sddpMode?: boolean; godWorkspace?: string; buildCacheDir?: string; buildEnv?: BuildEnvEntry[]; buildEnvByRepo?: Record<string, BuildEnvEntry[]> };
+      const cc = c as BreakerCfgView & SlackConfig & { notifications?: boolean; webSearchEnabled?: boolean; nativeBashEnabled?: boolean; sddpMode?: boolean; godWorkspace?: string; buildCacheDir?: string; deskEnv?: DeskEnvEntry[]; deskEnvByRepo?: Record<string, DeskEnvEntry[]>; deskEnvByAgent?: Record<string, DeskEnvEntry[]> };
       setNotifications(cc.notifications === true);
       setWebSearchEnabled(cc.webSearchEnabled === true);
       setNativeBashEnabled(cc.nativeBashEnabled === true);
       setSddpMode(cc.sddpMode === true);
       setGodWorkspace(cc.godWorkspace);
       setBuildCacheDir(cc.buildCacheDir);
-      setBuildEnv(cc.buildEnv ?? DEFAULT_BUILD_ENV);
-      setBuildEnvByRepo(cc.buildEnvByRepo ?? {});
+      setDeskEnv(cc.deskEnv ?? DEFAULT_DESK_ENV);
+      setDeskEnvByRepo(cc.deskEnvByRepo ?? {});
+      setDeskEnvByAgent(cc.deskEnvByAgent ?? {});
       setAgentBudget(cc.costCapTokens != null ? String(cc.costCapTokens) : '');
       setVelocityCeiling(cc.circuitBreaker?.tokenVelocityPerMin != null ? String(cc.circuitBreaker.tokenVelocityPerMin) : '');
       setSlackEnabled(cc.slackEnabled ?? false);
@@ -727,19 +770,19 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
               </div>
               <div style={subLabelStyle}>One parent folder for every desk's build output (a Rust <code>target/</code>, …) — kept out of the worktrees and the repo. Per-worktree subfolders are created automatically; exclude this single folder from antivirus.</div>
 
-              {/* Build-env table — token-templated env vars injected into each desk's build env. */}
+              {/* Desk-env table (GLOBAL) — token-templated env vars injected into every desk. */}
               <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                <span style={{ width: 140, flexShrink: 0, color: 'var(--cth-ink-500)', fontSize: 14 }}>Build env</span>
+                <span style={{ width: 140, flexShrink: 0, color: 'var(--cth-ink-500)', fontSize: 14 }}>Desk env</span>
                 <span style={{ flex: 1, fontSize: 13, color: 'var(--cth-ink-500)' }}>
-                  {buildEnv.length} var{buildEnv.length === 1 ? '' : 's'}
+                  {deskEnv.length} var{deskEnv.length === 1 ? '' : 's'}
                 </span>
-                <PixelButton variant="secondary" size="sm" onClick={() => void resetBuildEnv()}>reset</PixelButton>
+                <PixelButton variant="secondary" size="sm" onClick={() => void resetDeskEnv()}>reset</PixelButton>
               </div>
-              <div style={subLabelStyle}>Any env var, injected into each desk's build (merged over its env) — not just build dirs. Tokens: {BUILD_ENV_TOKENS.map((t) => `\${${t}}`).join(', ')}. Values under the build cache are auto-created.</div>
-              <BuildEnvRows entries={buildEnv} sample={buildEnvSample} onEdit={editBuildEnvAt} onCommit={commitBuildEnv} onAdd={addBuildEnvRow} onRemove={removeBuildEnvRow} />
+              <div style={subLabelStyle}>Any env var, injected into each desk (merged over its env) — not just build dirs. Tokens: {DESK_ENV_TOKENS.map((t) => `\${${t}}`).join(', ')}, and <code>${'{'}env:NAME{'}'}</code> for an existing var (e.g. <code>PATH=/extra:${'{'}env:PATH{'}'}</code>). Values under the build cache show “· created”.</div>
+              <DeskEnvRows entries={deskEnv} sample={deskEnvSample} buildRoot={buildRootDisplay} onEdit={editDeskEnvAt} onCommit={commitDeskEnv} onAdd={addDeskEnvRow} onRemove={removeDeskEnvRow} />
 
-              {/* Per-repo build-env OVERRIDES — layered on top of the global table for a desk whose
-                  project repo matches (same name wins). Edit one repo at a time. */}
+              {/* Per-repo env OVERRIDES — layered on top of the global table for a desk whose project
+                  repo matches (same name wins). Edit one repo at a time. */}
               <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
                 <span style={{ width: 140, flexShrink: 0, color: 'var(--cth-ink-500)', fontSize: 14 }}>Per-repo env</span>
                 {projectRepos.length === 0 ? (
@@ -748,14 +791,34 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
                   <select value={selectedRepo} onChange={(e) => setSelectedRepo(e.target.value)}
                     style={{ ...slackInputStyle, flex: 1, fontFamily: 'var(--cth-font-mono, monospace)' }}>
                     {projectRepos.map((r) => (
-                      <option key={r} value={r}>{(buildEnvByRepo[r]?.length ? '• ' : '') + r}</option>
+                      <option key={r} value={r}>{(deskEnvByRepo[r]?.length ? '• ' : '') + r}</option>
                     ))}
                   </select>
                 )}
               </div>
               <div style={subLabelStyle}>Overrides/extends the global table for desks on the selected repo (same name wins). A “•” marks a repo that has overrides. (Repo-local build config can also live in the repo's own <code>.cargo/config.toml</code> / <code>.env</code>.)</div>
               {projectRepos.length > 0 && selectedRepo !== '' && (
-                <BuildEnvRows entries={repoEntries} sample={buildEnvSample} onEdit={editRepoAt} onCommit={commitRepoMap} onAdd={addRepoRow} onRemove={removeRepoRow} />
+                <DeskEnvRows entries={repoEntries} sample={deskEnvSample} buildRoot={buildRootDisplay} onEdit={editRepoAt} onCommit={commitRepoMap} onAdd={addRepoRow} onRemove={removeRepoRow} />
+              )}
+
+              {/* Per-agent env OVERRIDES — layered on top of global + per-repo for the selected desk
+                  (most specific wins). Edit one desk at a time. */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                <span style={{ width: 140, flexShrink: 0, color: 'var(--cth-ink-500)', fontSize: 14 }}>Per-agent env</span>
+                {deskChoices.length === 0 ? (
+                  <span style={{ flex: 1, fontSize: 13, color: 'var(--cth-ink-500)' }}>no desks on the floor yet</span>
+                ) : (
+                  <select value={selectedAgent} onChange={(e) => setSelectedAgent(e.target.value)}
+                    style={{ ...slackInputStyle, flex: 1, fontFamily: 'var(--cth-font-mono, monospace)' }}>
+                    {deskChoices.map((a) => (
+                      <option key={a.id} value={a.id}>{(deskEnvByAgent[a.id]?.length ? '• ' : '') + a.name + ' · ' + a.id}</option>
+                    ))}
+                  </select>
+                )}
+              </div>
+              <div style={subLabelStyle}>Overrides/extends global + per-repo for the selected desk (same name wins). A “•” marks a desk that has overrides.</div>
+              {deskChoices.length > 0 && selectedAgent !== '' && (
+                <DeskEnvRows entries={agentEntries} sample={deskEnvSample} buildRoot={buildRootDisplay} onEdit={editAgentAt} onCommit={commitAgentMap} onAdd={addAgentRow} onRemove={removeAgentRow} />
               )}
 
               {/* Worktrees diagnostics — per repo, per worktree: branch, health flags, and recovery

@@ -15,9 +15,9 @@ export interface ScheduledMission {
   quietThresholdMs?: number;
 }
 
-/** One token-templated per-desk build/cache env var (mirrors src/shared/buildEnv.ts BuildEnvEntry).
+/** One token-templated per-desk env var (mirrors src/shared/deskEnv.ts DeskEnvEntry).
  *  Structurally identical to the shared type, so values flow between them without conversion. */
-export interface BuildEnvEntry {
+export interface DeskEnvEntry {
   name: string;
   value: string;
 }
@@ -38,10 +38,12 @@ export interface HarnessConfig {
   godWorkspace?: string;
   /** Single root for all desks' redirected build output (else `<harnessHome>/build-cache`). */
   buildCacheDir?: string;
-  /** Token-templated per-desk build/cache env vars (else the built-in CARGO_TARGET_DIR default). */
-  buildEnv?: BuildEnvEntry[];
-  /** Per-repo build-env overrides (keyed by repo path) layered on the global `buildEnv`. */
-  buildEnvByRepo?: Record<string, BuildEnvEntry[]>;
+  /** Token-templated per-desk env vars (GLOBAL base; else the built-in CARGO_TARGET_DIR default). */
+  deskEnv?: DeskEnvEntry[];
+  /** Per-repo env overrides (keyed by repo path) layered on the global `deskEnv`. */
+  deskEnvByRepo?: Record<string, DeskEnvEntry[]>;
+  /** Per-agent env overrides (keyed by agent id) layered on global + per-repo. */
+  deskEnvByAgent?: Record<string, DeskEnvEntry[]>;
   registeredRepos: string[];
   autoMode: boolean;
   defaultCommand: string;
