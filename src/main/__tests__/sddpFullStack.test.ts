@@ -29,13 +29,13 @@ import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { SddpPipeline, type SddpPipelineDeps } from '../sddpPipeline';
-import { prepareQcTree as gitPrepareQcTree, repoTrunk } from '../git';
+import { prepareQcTree as gitPrepareQcTree, repoTrunk, mergeBranch } from '../git';
 import { makeSpawnSubAgent } from '../runtime/subAgentExecutor';
 import {
   executeAgentTool, runAgentLoop, AGENT_TOOL_CATALOG, defaultMilestones, advanceMilestones,
-  analyzeCoverage, agentTaskBranch, buildBugTitles, bugSignature,
+  analyzeCoverage, agentTaskBranch, buildBugTitles, bugSignature, makeDeepseekAdapter,
   type AgentToolDeps, type HiveTask, type HiveMessage, type FeatureStatus,
-  type ProviderCall, type ProviderTurn, type ToolResult
+  type ProviderCall, type ProviderTurn, type ToolResult, type ByteStream, type FetchLike, type FetchResponseLike
 } from '@jsh562/won-agent-core';
 import type { WorkerTransport } from '../runtime/nativeAgentWorker';
 import type { WorkerCommand, WorkerMessage } from '../../shared/workerProtocol';
@@ -61,6 +61,28 @@ function makeScriptedProvider(turns: ProviderTurn[]): ProviderCall {
   return async () => turns[Math.min(i++, turns.length - 1)];
 }
 
+// ── DeepSeek wire-level harness (for the real-adapter composed case) — mirrors deepseekAdapter.test.ts.
+/** A ByteStream that yields the given UTF-8 chunks (an OpenAI-compatible SSE body). */
+function streamOf(chunks: string[]): ByteStream {
+  const enc = new TextEncoder();
+  let i = 0;
+  return { getReader() { return { async read() { return i < chunks.length ? { done: false, value: enc.encode(chunks[i++]) } : { done: true }; } }; } };
+}
+/** One SSE `data:` line carrying a JSON chunk (DeepSeek/OpenAI streaming shape). */
+function sse(obj: unknown): string { return `data: ${JSON.stringify(obj)}\n\n`; }
+/** A 200 streaming response wrapping a fabricated SSE body. */
+function okResponse(body: ByteStream): FetchResponseLike {
+  return { ok: true, status: 200, body, headers: { get: () => null }, text: async () => '' };
+}
+/** A mocked `fetch` that returns a queue of canned SSE responses (one per provider round) and records
+ *  each request — so a test can drive the REAL adapter with no socket. */
+function mockFetch(responses: FetchResponseLike[]): { fetch: FetchLike; requests: { url: string; body: unknown }[] } {
+  const requests: { url: string; body: unknown }[] = [];
+  let n = 0;
+  const fetch: FetchLike = async (url, init) => { requests.push({ url, body: JSON.parse(init.body) }); return responses[Math.min(n++, responses.length - 1)]; };
+  return { fetch, requests };
+}
+
 /**
  * A WorkerTransport that runs the REAL `runAgentLoop` in-process (no electron/utilityProcess) for one
  * sub-agent turn. It bridges the worker protocol to the loop: the loop's `executeTool` emits a
@@ -69,8 +91,8 @@ function makeScriptedProvider(turns: ProviderTurn[]): ProviderCall {
  * messages. `requestDrain` answers `block:false` directly (one-shot — the runner kills on `stop`
  * before a protocol drain could round-trip; the drain-message path stays covered by stopDrain.test.ts).
  */
-function realLoopTransport(opts: { name: string; env: Record<string, string>; turns: ProviderTurn[]; toolLog: ToolLogEntry[]; eventLog: AgentEvent[] }): WorkerTransport {
-  const { name, env, turns, toolLog, eventLog } = opts;
+function realLoopTransport(opts: { name: string; env: Record<string, string>; providerCall: ProviderCall; toolLog: ToolLogEntry[]; eventLog: AgentEvent[] }): WorkerTransport {
+  const { name, env, providerCall, toolLog, eventLog } = opts;
   let msgCb: ((m: WorkerMessage) => void) | null = null;
   let exitCb: ((c: number) => void) | null = null;
   let callSeq = 0;
@@ -83,7 +105,7 @@ function realLoopTransport(opts: { name: string; env: Record<string, string>; tu
           agentId: name,
           sessionId: 's',
           model: env.NATIVE_PROVIDER_MODEL ?? 'deepseek-chat',
-          providerCall: makeScriptedProvider(turns),
+          providerCall,
           executeTool: (use) => new Promise<ToolResult>((resolve) => {
             pending.set(use.toolCallId, { resolve, toolName: use.toolName, input: use.toolInput });
             emit({ type: 'toolRequest', callId: ++callSeq, toolCallId: use.toolCallId, toolName: use.toolName, toolInput: use.toolInput });
@@ -106,6 +128,33 @@ function realLoopTransport(opts: { name: string; env: Record<string, string>; tu
     onMessage: (cb) => { msgCb = cb; },
     onExit: (cb) => { exitCb = cb; },
     kill: () => { exitCb?.(0); }
+  };
+}
+
+/** Minimal REAL toolkit deps over a temp repo (SDDP mode + repoFor anchor the specs/ redirect to the
+ *  base repo; caller-role gates permissive). `setupFullStack` enriches memory/tasks/featureStatus; the
+ *  integrator case overrides canIntegrate/integrate. */
+function baseDeps(repo: string): AgentToolDeps {
+  return {
+    enabled: () => true,
+    memory: () => '',
+    send: (partial, from = 'system') => ({ id: 'm1', from, to: String(partial.to), act: 'inform' } as unknown as HiveMessage),
+    tasks: () => ({ tasks: [] }),
+    writeTasks: () => { /* no ledger by default */ },
+    roster: () => [],
+    isGod: () => false,
+    canIntegrate: () => false,
+    canReview: () => false,
+    appendMemory: () => { /* no memory by default */ },
+    resolveCwd: () => repo,
+    readRoots: () => [repo],
+    repoFor: () => repo,
+    sddpMode: () => true,
+    bashEnabled: () => true,
+    canEditCode: () => true,
+    canWriteFiles: () => true,
+    searchWeb: async (q) => `results for "${q}": [1] example.com`,
+    featureStatus: (_r, feature): FeatureStatus => ({ feature, hasSpec: false, hasClarifications: false, hasPlan: false, hasTasks: false, completed: false, qcPassed: false })
   };
 }
 
@@ -161,7 +210,7 @@ function subAgentTurns(name: string, state: FsState): ProviderTurn[] {
 
 /** A throwaway git repo + the engine wired to the REAL spawn → REAL loop → REAL toolkit composition.
  *  `opts` flips the same branch flags the E2E uses; `setTurns` overrides one sub-agent's faked turns. */
-function setupFullStack(opts: Partial<FsState> = {}) {
+function setupFullStack(opts: Partial<FsState> & { providerFor?: (name: string) => ProviderCall | null } = {}) {
   const state: FsState = {
     qcPass: opts.qcPass !== false,
     autopilot: opts.autopilot !== false,
@@ -198,24 +247,11 @@ function setupFullStack(opts: Partial<FsState> = {}) {
   const mem = new Map<string, string>();
   const ledger = { tasks: [{ id: 'epic-1', title: 'Feature 00001', assignee: 'owner', status: 'doing', dependsOn: [], project: repo, feature: '00001', priority: 0, createdAt: '' }] as HiveTask[] };
   const baseToolDeps: AgentToolDeps = {
-    enabled: () => true,
+    ...baseDeps(repo),
     memory: (id) => mem.get(id) ?? '',
-    send: (partial, from = 'system') => ({ id: 'm1', from, to: String(partial.to), act: 'inform' } as unknown as HiveMessage),
     tasks: () => ledger,
     writeTasks: (t) => { ledger.tasks = t; },
-    roster: () => [],
-    isGod: () => false,
-    canIntegrate: () => false,
-    canReview: () => false,
     appendMemory: (id, text) => mem.set(id, (mem.get(id) ?? '') + '\n' + text),
-    resolveCwd: () => repo,
-    readRoots: () => [repo],
-    repoFor: () => repo,
-    sddpMode: () => true,
-    bashEnabled: () => true,
-    canEditCode: () => true,
-    canWriteFiles: () => true,
-    searchWeb: async (q) => `results for "${q}": [1] example.com`,
     featureStatus: (_r, feature): FeatureStatus => ({ feature, hasSpec: existsSync(abs(feature, 'spec.md')), hasClarifications: false, hasPlan: existsSync(abs(feature, 'plan.md')), hasTasks: existsSync(abs(feature, 'tasks.md')), completed: existsSync(abs(feature, '.completed')), qcPassed: existsSync(abs(feature, '.qc-passed')) })
   };
   const forwarded: string[] = [];        // tool names that REACHED the real toolkit (passed the deny-list)
@@ -238,7 +274,7 @@ function setupFullStack(opts: Partial<FsState> = {}) {
     credentialEnvFor: () => ({ NATIVE_PROVIDER_API_KEY: 'test-key', NATIVE_PROVIDER_ID: 'deepseek' }),
     subAgentModelOverride: () => undefined,
     envNote: () => '',
-    transportFactory: (_childId, env, name) => realLoopTransport({ name, env, turns: turnsFor(name), toolLog, eventLog }),
+    transportFactory: (_childId, env, name) => realLoopTransport({ name, env, providerCall: opts.providerFor?.(name) ?? makeScriptedProvider(turnsFor(name)), toolLog, eventLog }),
     executeTool,
     onUsage: () => { usageEvents++; }
   });
@@ -488,5 +524,90 @@ describe('SDDP engine — full-stack composition (real runner + real loop + real
     for (const t of ['list_dir', 'hive_read_memory', 'hive_list_tasks', 'hive_feature_status', 'write_memory', 'web_search']) expect(ran(t)).toBe(true);
     expect(h.toolLog.find((e) => e.toolName === 'web_search')!.content).toMatch(/results for/);
     expect(h.toolLog.find((e) => e.toolName === 'hive_feature_status')!.content).toMatch(/phase/i);
+  });
+
+  it('10. real tool FAILURES + self-correction: the loop feeds genuine execution failures back (not deny-list refusals) and a later hop recovers', async () => {
+    const h = setupFullStack();
+    // A sub-agent that hits three REAL execution failures, then recovers with a valid write.
+    h.setTurns('plan-author', [
+      { toolUses: [{ toolName: 'read_file', toolInput: { path: 'specs/00001/does-not-exist.md' }, toolCallId: 'f-1' }], usage: USAGE, endOfTurn: false },
+      { toolUses: [{ toolName: 'bash', toolInput: { command: 'node -e "process.exit(1)"' }, toolCallId: 'f-2' }], usage: USAGE, endOfTurn: false },
+      { toolUses: [{ toolName: 'write_file', toolInput: { path: '../../escape.txt', content: 'nope' }, toolCallId: 'f-3' }], usage: USAGE, endOfTurn: false },
+      { toolUses: [{ toolName: 'write_file', toolInput: { path: 'specs/00001/plan.md', content: '# Plan\n' }, toolCallId: 'f-4' }], usage: USAGE, endOfTurn: false },
+      { text: 'recovered', toolUses: [], usage: USAGE, endOfTurn: true }
+    ]);
+
+    const res = await h.spawn('owner', 'plan-author', 'go');
+    expect(res.success).toBe(true);
+
+    // Each failure is a GENUINE execution failure (success:false, NOT a deny-list refusal) — the real
+    // toolkit ran and rejected it, and the loop kept going past each one.
+    const genuineFailures = h.toolLog.filter((e) => !e.success && !/a sub-agent may not call/.test(e.content));
+    expect(genuineFailures.map((e) => e.toolName).sort()).toEqual(['bash', 'read_file', 'write_file']);
+    expect(genuineFailures.find((e) => e.toolName === 'write_file')!.content).toMatch(/outside your working directory/);
+    // …and the recovery write actually landed via the real toolkit.
+    expect(h.toolLog.some((e) => e.toolName === 'write_file' && e.success)).toBe(true);
+    expect(h.read('00001', 'plan.md')).toMatch(/# Plan/);
+    expect(existsSync(join(h.repo, 'escape.txt'))).toBe(false); // the sandbox escape never wrote
+  });
+
+  it('11. the REAL DeepSeek adapter at the wire level, composed: a mocked SSE stream drives a real tool call through loop → toolkit → fs', async () => {
+    // Round 1: the model returns a write_file tool call. Round 2: a final text + stop.
+    const round1 = okResponse(streamOf([
+      sse({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'tc1', type: 'function', function: { name: 'write_file', arguments: JSON.stringify({ path: 'specs/00001/spec.md', content: '# Spec\nFR-001: a\n' }) } }] } }] }),
+      sse({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }),
+      sse({ choices: [], usage: { prompt_tokens: 30, completion_tokens: 12 } }),
+      'data: [DONE]\n\n'
+    ]));
+    const round2 = okResponse(streamOf([
+      sse({ choices: [{ index: 0, delta: { content: 'spec drafted' } }] }),
+      sse({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }),
+      sse({ choices: [], usage: { prompt_tokens: 40, completion_tokens: 6 } }),
+      'data: [DONE]\n\n'
+    ]));
+    const { fetch, requests } = mockFetch([round1, round2]);
+    const h = setupFullStack({
+      providerFor: (name) => name === 'spec-author'
+        ? makeDeepseekAdapter({ fetch, apiKey: 'sk-test-secret', endpoint: 'https://api.deepseek.com/v1', model: 'deepseek-chat' })
+        : null
+    });
+
+    const res = await h.spawn('owner', 'spec-author', 'draft the spec');
+    expect(res.success).toBe(true);
+
+    // The REAL adapter hit the (mocked) wire: an authenticated request whose body carried the tool catalog.
+    expect(requests.length).toBeGreaterThanOrEqual(1);
+    expect(requests[0].url).toMatch(/deepseek/);
+    expect(JSON.stringify(requests[0].body)).toMatch(/write_file/); // the advertised tool catalog
+    // The adapter parsed the SSE tool call and the loop executed it through the REAL toolkit → fs.
+    expect(h.toolLog.some((e) => e.toolName === 'write_file' && e.success)).toBe(true);
+    expect(h.read('00001', 'spec.md')).toMatch(/FR-001/);
+  });
+
+  it('12. integrator real merge: hive_integrate runs a real git merge into trunk after .qc-passed; a non-integrator is refused', async () => {
+    const h = setupFullStack();
+    expect(await h.drive()).toBe(true); // happy path → .qc-passed + the two implement branches exist
+    expect(existsSync(h.abs('00001', '.qc-passed'))).toBe(true);
+    const branches = h.getTasks().filter((t) => t.branch && t.id !== 'epic-1' && !/\[BUG/i.test(t.title)).map((t) => t.branch!);
+    expect(branches.length).toBe(2);
+
+    // The integrator desk (canIntegrate) calls hive_integrate → the real `integrate` dep runs git merge.
+    const integratorDeps: AgentToolDeps = {
+      ...baseDeps(h.repo), canIntegrate: () => true,
+      integrate: async (repo, branch, apply) => { if (!apply) return { content: `preview ${branch}`, success: true }; const r = await mergeBranch(repo, branch); return { content: r.ok ? `merged ${branch}` : r.error, success: r.ok }; }
+    };
+    for (const branch of branches) {
+      const r = await executeAgentTool(integratorDeps, 'integrator', { toolName: 'hive_integrate', toolInput: { repo: h.repo, branch, apply: true } });
+      expect(r.success).toBe(true);
+    }
+    // The real merge landed the implement files on trunk.
+    expect(existsSync(join(h.repo, 'c1.txt'))).toBe(true);
+    expect(existsSync(join(h.repo, 'c2.txt'))).toBe(true);
+
+    // The GATE composes: a NON-integrator calling hive_integrate is refused by the toolkit.
+    const nonIntegrator: AgentToolDeps = { ...baseDeps(h.repo), canIntegrate: () => false, integrate: async () => ({ content: 'merged', success: true }) };
+    const denied = await executeAgentTool(nonIntegrator, 'worker', { toolName: 'hive_integrate', toolInput: { repo: h.repo, branch: branches[0], apply: true } });
+    expect(denied.success).toBe(false);
+    expect(denied.content).toMatch(/do not hold the integrator role/);
   });
 });

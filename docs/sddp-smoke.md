@@ -6,18 +6,49 @@ different layers.
 ## 1. Automated (no app, no API, nothing permanent)
 
 ```
-npm run test:run -- sddpPipelineE2e
+npm run test:e2e        # both suites, one ✓ line per case  (SDDP_E2E_TRACE=1 for a per-milestone trace)
 ```
 
-`src/main/__tests__/sddpPipelineE2e.test.ts` runs the **real** engine + **real** `git.ts`
-(`prepareQcTree` does an actual `git worktree add` + merges) + **real** fs against a throwaway
-`git init` repo in the OS temp dir, driven by a scripted provider that writes the artifacts a
-sub-agent would. It drives `spec→clarify→…→analyze→implement→host-QC`, asserts `.qc-passed` lands and
-the implement branches really merge, then deletes the temp dir. Deterministic, free, repeatable.
+Two complementary suites run against a throwaway `git init` repo in the OS temp dir, then delete it.
+Deterministic, free, repeatable.
 
-**Covers:** engine orchestration, real git worktree merge, fs gating, `analyzeCoverage`, the checklist
-gate, the QC FAIL/bug-loop path. **Does NOT cover:** the live model, the native worker, the sub-agent
-**cwd-override**, IPC/UI — that's what the live sandbox below is for.
+- **`src/main/__tests__/sddpPipelineE2e.test.ts`** (12 cases) — the engine over **real** `git.ts`
+  (`prepareQcTree` does an actual `git worktree add` + merges) + **real** fs, driven by a COARSE
+  scripted provider (each sub-agent just writes the artifact it would). Broad + fast: it sweeps every
+  engine branch (happy → integrate, merge-conflict, the bug loop with `[RECURRING]`, analyze-CRITICAL,
+  optional-skip, clarify autopilot-OFF, the control paused/manual/stopped + idempotent + in-flight-lock
+  paths).
+- **`src/main/__tests__/sddpFullStack.test.ts`** (12 cases) — the FULL composed stack with **only the
+  provider faked**: engine → `makeSpawnSubAgent` (deny-list + cwd-override) → `runOneShotSubAgent` →
+  `NativeAgentWorker` → the **real `runAgentLoop`** → the **real toolkit** (`executeAgentTool`) → real
+  fs/git. Each specialist READS before it authors, so the real read/write/edit/bash/grep/hive/web/memory
+  paths run composed; the QC sub-agents' bash + write run cwd-OVERRIDDEN into the merged worktree; a
+  genuine tool failure is fed back and the loop recovers; one case drives the **real DeepSeek adapter**
+  over a mocked SSE stream (request-build + SSE parse composed, only the socket faked); one case runs the
+  integrator's **real `hive_integrate` git merge** into trunk.
+
+**Together they cover:** engine orchestration, real git worktree merge + integrate, fs gating,
+`analyzeCoverage`, the checklist gate, the QC FAIL/bug-loop path, the real agentic loop (turn/hop caps +
+usage rollup), the deny-list, the cwd-override, the toolkit read/write/bash/grep/hive/web paths, the
+DeepSeek adapter wire-level, and tool-failure recovery.
+
+### What no automated test can cover (the ceiling)
+
+Three things are deliberately out of the automated suites' reach — exercise them in the live sandbox
+(section 2). They are the boundary, not coverage holes:
+
+- **The native worker process (electron).** `src/main/runtime/worker/agentWorker.ts` is coupled to the
+  electron `utilityProcess` IPC seam (`process.parentPort`), and is the only place that selects the real
+  provider from the spawn env (`selectAdapter(process.env)`). vitest can't provide a utilityProcess, so
+  the composed test runs the loop **in-process** instead — the real child-process + its IPC round-trip
+  (tool calls / drain) are sandbox-only.
+- **The god creating the epic + the worker→reviewer→integrator choreography.** Both suites hand-seed the
+  feature EPIC card. The god (Michael) decomposing a request and calling `hive_add_task {epic:true}`, and
+  the notifier pinging a reviewer/integrator as cards move `doing → review → integrate → done`, need live
+  desks on the real hive — they aren't driven by either test.
+- **Whether the prompts actually work.** The scripted/stub provider IGNORES each sub-agent's
+  `systemPrompt` and replays canned turns. So nothing automated verifies that a specialist's prompt
+  *elicits* the right tool use from a real model — only a live model does. This is the irreducible one.
 
 ## 2. Live disposable sandbox (real DeepSeek desk, throwaway state)
 
