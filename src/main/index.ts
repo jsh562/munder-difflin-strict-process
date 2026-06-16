@@ -1,7 +1,7 @@
 import { app, BrowserWindow, clipboard, dialog, ipcMain, powerSaveBlocker, screen, shell, Notification } from 'electron';
 import { spawn } from 'node:child_process';
-import { rmSync, existsSync, readFileSync, readdirSync, statSync, cpSync, mkdirSync } from 'node:fs';
-import { join, resolve, sep, relative, isAbsolute } from 'node:path';
+import { rmSync, existsSync, readFileSync, readdirSync, statSync, cpSync, mkdirSync, writeFileSync } from 'node:fs';
+import { join, resolve, sep, relative, isAbsolute, dirname } from 'node:path';
 import { PtyManager, type SpawnOptions } from './pty';
 import {
   readConfig, writeConfig, resetConfig, ensureHarnessHome, ensureClaudePermissionsAccepted,
@@ -38,7 +38,7 @@ import { makeElectronWorkerTransport } from './runtime/electronWorkerTransport';
 import { runOneShotSubAgent, subAgentChildId, resolveSubAgentModel } from './runtime/subAgentRunner';
 import { nativeSddpGodPrompt, nativeSddpRolePrompt } from './sddpPrompts';
 import { SddpPipeline } from './sddpPipeline';
-import { executeAgentTool, subAgentSpec, SUB_AGENT_NAMES, agentTaskBranch, type AgentToolDeps, type FeatureStatus } from '@jsh562/won-agent-core';
+import { executeAgentTool, subAgentSpec, SUB_AGENT_NAMES, agentTaskBranch, analyzeCoverage, type AgentToolDeps, type FeatureStatus } from '@jsh562/won-agent-core';
 import { redactConfig, injectionEnvForProvider, keyPresence, setKeyInConfig, clearKeyInConfig, WEB_SEARCH_KEY_ID, NATIVE_PROVIDER_MODEL_ENV, type SafeConfig } from './credentials';
 import { setSecretInConfig, clearSecretInConfig, getSecretValue, secretNames } from './secrets';
 import { searchWebDuckDuckGo } from './webSearch';
@@ -920,6 +920,19 @@ function desksForRole(role: AgentRole): string[] {
   return Object.values(agents).filter((a) => a.archived !== true && (a.roles ?? []).includes(role)).map((a) => a.id);
 }
 
+/** Safe absolute path of a `specs/<feature>/<relPath>` artifact (sanitized feature segment + no dir
+ *  traversal), or null. Shared by the engine's analyze read/write deps (mirrors featureArtifactExists). */
+function featureFilePath(repo: string | null, feature: string, relPath: string): string | null {
+  if (!repo) return null;
+  const safe = feature.replace(/[\\/]/g, '_').trim();
+  if (!safe || safe === '.' || safe === '..') return null;
+  const base = join(repo, 'specs', safe);
+  const target = join(base, relPath);
+  const rel = relative(base, target);
+  if (rel.startsWith('..') || isAbsolute(rel)) return null; // no escaping the feature dir
+  return target;
+}
+
 // Host-driven SDDP engine — when the floor is in SDDP mode, it DRIVES the sub-agents per phase
 // (the milestone checklist is the program; this is the interpreter). It runs each host-driven
 // milestone's specialist AS the feature epic's owner desk (inheriting its provider/model + holding
@@ -985,6 +998,27 @@ const sddpPipeline = new SddpPipeline({
     const next = [...tasks];
     next[idx] = { ...next[idx], assignee: deskId, project: repoForId(deskId) ?? next[idx].project };
     hive.writeTasks(next);
+  },
+  // ANALYZE deps — mechanical requirement→task coverage (pure check in won-agent-core) + read/write of
+  // the analysis report. All path-safe to specs/<feature>/ (no traversal), like featureArtifactExists.
+  analyzeFeature: (repo, feature) => {
+    const read = (rel: string): string => {
+      const p = featureFilePath(repo, feature, rel);
+      if (!p || !existsSync(p)) return '';
+      try { return readFileSync(p, 'utf8'); } catch { return ''; }
+    };
+    return { uncovered: analyzeCoverage(read('spec.md'), read('tasks.md')).uncovered };
+  },
+  featureArtifactText: (repo, feature, relPath) => {
+    const p = featureFilePath(repo, feature, relPath);
+    if (!p || !existsSync(p)) return null;
+    try { return readFileSync(p, 'utf8'); } catch { return null; }
+  },
+  writeFeatureArtifact: (repo, feature, relPath, content) => {
+    const p = featureFilePath(repo, feature, relPath);
+    if (!p) return;
+    try { mkdirSync(dirname(p), { recursive: true }); writeFileSync(p, content, 'utf8'); }
+    catch (e) { console.error('[sddp-pipeline] writeFeatureArtifact failed:', e); }
   },
   escalate: (feature, message) => {
     try { hive.send({ to: 'god', act: 'request', needs_human: true, subject: `SDDP pipeline — ${feature}`, body: message }, 'system'); }

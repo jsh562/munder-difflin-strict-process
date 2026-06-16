@@ -59,6 +59,14 @@ export interface SddpPipelineDeps {
   findDeskForRole?(role: string): string | null;
   /** Assign a card to a desk (writeTasks the assignee). (P5b — epic→planner, implement→workers.) */
   assignCard?(cardId: string, deskId: string): void;
+  /** ANALYZE mechanical coverage: requirement ids in spec.md with NO task in tasks.md (CRITICAL). The
+   *  host reads the files; the pure check lives in `analyzeCoverage` (won-agent-core). */
+  analyzeFeature?(repo: string | null, feature: string): { uncovered: string[] };
+  /** Read a `specs/<feature>/` text artifact (e.g. the analysis report), or null when absent. */
+  featureArtifactText?(repo: string | null, feature: string, relPath: string): string | null;
+  /** Write a `specs/<feature>/` text artifact (the engine authors `analysis-report.md` from the
+   *  mechanical findings + the validators' output). */
+  writeFeatureArtifact?(repo: string | null, feature: string, relPath: string, content: string): void;
   /** Optional diagnostic log. */
   log?(message: string): void;
   /** Debounce window for `schedule` (ms); default 1500. */
@@ -184,6 +192,14 @@ export class SddpPipeline {
         return;
       }
 
+      // ANALYZE step: a host-run MULTI-agent path (mechanical coverage in code + policy-auditor +
+      // spec-validator), gated on CRITICAL findings. Special-cased like Clarify (no single subAgent).
+      if (active.key === 'analyze') {
+        const ownerId = this.resolveOwner(epic, feature, active.key);
+        if (ownerId) await this.runAnalyze(epic, active, ownerId);
+        return;
+      }
+
       if (milestoneDriver(active) !== 'host' || !active.subAgent) {
         // DESK/DISTRIBUTED step (implement/qc): the engine FEEDS (seeds implement cards) + TRACKS
         // (advances the pill when the distributed flow's marker lands) — it does not run the work.
@@ -281,6 +297,73 @@ export class SddpPipeline {
     } finally {
       this.inflight.delete(lockKey);
     }
+  }
+
+  /** Run the ANALYZE milestone (host-driven, multi-agent). The MECHANICAL half (requirement→task
+   *  coverage) is computed in code; the JUDGMENT half (policy compliance vs project-instructions.md,
+   *  spec quality) is the `policy-auditor` + `spec-validator` sub-agents. The engine assembles
+   *  `analysis-report.md` (frontmatter `critical: <n>`) and GATES: any CRITICAL (an uncovered
+   *  requirement, or a policy FAIL) holds + escalates unless autopilot; else it advances. Re-run by
+   *  deleting the report (or flipping the step to manual). */
+  private async runAnalyze(epic: HiveTask, active: FeatureMilestone, ownerId: string): Promise<void> {
+    const feature = epic.feature!;
+    const repo = this.deps.repoForEpic(epic);
+    const lockKey = `${feature}::${active.key}`;
+    if (this.inflight.has(lockKey)) return;
+
+    // If a report already exists, gate on its frontmatter `critical:` (don't re-spawn — re-run by
+    // deleting the report). Otherwise produce one.
+    const existing = this.deps.featureArtifactText?.(repo, feature, 'analysis-report.md') ?? null;
+    if (existing !== null) { this.gateOnAnalysis(epic, active, existing); return; }
+
+    this.inflight.add(lockKey);
+    const ac = new AbortController();
+    this.aborters.set(lockKey, ac);
+    this.setStatus(feature, active.key, 'running');
+    try {
+      // (1) mechanical coverage (code, no LLM).
+      const uncovered = this.deps.analyzeFeature?.(repo, feature).uncovered ?? [];
+      // (2) judgment (the registered validators the engine now actually runs).
+      const dir = `specs/${feature}`;
+      const policy = await this.deps.spawnSubAgent(ownerId, 'policy-auditor',
+        `Feature folder ${dir}/. Audit ${dir}/spec.md + ${dir}/plan.md against project-instructions.md. Return a verdict line "VERDICT: PASS" or "VERDICT: FAIL" then the violations.`, ac.signal);
+      if (ac.signal.aborted) { this.setStatus(feature, active.key, 'stopped'); return; }
+      const spec = await this.deps.spawnSubAgent(ownerId, 'spec-validator',
+        `Feature folder ${dir}/. Score ${dir}/spec.md for quality/readiness. Return a verdict line "VERDICT: PASS" or "VERDICT: FAIL" then the findings.`, ac.signal);
+      if (ac.signal.aborted) { this.setStatus(feature, active.key, 'stopped'); return; }
+
+      const policyFail = /VERDICT:\s*FAIL/i.test(policy.content);
+      const critical = uncovered.length + (policyFail ? 1 : 0);
+      const report = this.renderAnalysis(critical, uncovered, policy.content, spec.content);
+      this.deps.writeFeatureArtifact?.(repo, feature, 'analysis-report.md', report);
+      this.gateOnAnalysis(epic, active, report);
+    } finally {
+      this.inflight.delete(lockKey);
+      this.aborters.delete(lockKey);
+    }
+  }
+
+  /** Assemble the analysis-report.md body from the mechanical + judgment findings. */
+  private renderAnalysis(critical: number, uncovered: string[], policy: string, spec: string): string {
+    const coverage = uncovered.length
+      ? uncovered.map((r) => `| cov-${r} | coverage | CRITICAL | tasks.md | requirement ${r} has no task | add a task carrying ${r} |`).join('\n')
+      : '| — | coverage | — | — | every requirement maps to a task | — |';
+    return `---\ncritical: ${critical}\n---\n# Analysis Report\n\n## Coverage (mechanical)\n| ID | Category | Severity | Location | Summary | Recommendation |\n|----|----------|----------|----------|---------|----------------|\n${coverage}\n\n## Policy (project-instructions.md)\n${policy.trim() || '(no output)'}\n\n## Spec quality\n${spec.trim() || '(no output)'}\n`;
+  }
+
+  /** GATE on a (possibly pre-existing) analysis report: read its `critical:` frontmatter; >0 holds +
+   *  escalates (unless autopilot, which advances with a note); 0 advances. */
+  private gateOnAnalysis(epic: HiveTask, active: FeatureMilestone, report: string): void {
+    const feature = epic.feature!;
+    const m = report.match(/^\s*critical:\s*(\d+)/im);
+    const critical = m ? parseInt(m[1], 10) : 0;
+    if (critical > 0 && !this.deps.autopilot()) {
+      this.setStatus(feature, active.key, 'blocked', `${critical} CRITICAL finding(s) in analysis-report.md`);
+      this.escalateOnce(feature, `SDDP Analyze: ${critical} CRITICAL finding(s) for '${feature}' (see specs/${feature}/analysis-report.md — e.g. requirements with no task). Resolve them, then delete the report to re-analyze (or set Analyze to manual to skip).`);
+      return;
+    }
+    this.escalated.delete(feature);
+    this.deps.advanceMilestone(epic.id, active.key);
   }
 
   /** FEED + TRACK a distributed step (implement/qc). The engine does not run the work — workers /

@@ -25,7 +25,8 @@ function mkPipeline() {
   const asks: { feature: string; questions: string }[] = [];
   const seeds: string[] = [];                     // epic ids the engine asked to seed cards for
   const assigns: { cardId: string; deskId: string }[] = [];
-  const state = { enabled: true, ownerUsable: true, autopilot: false, seedCount: 2, plannerDesk: null as string | null };
+  const artifactText = new Map<string, string>(); // `${feature}/${rel}` → text (analyze read/write)
+  const state = { enabled: true, ownerUsable: true, autopilot: false, seedCount: 2, plannerDesk: null as string | null, uncovered: [] as string[], policyVerdict: 'PASS' as 'PASS' | 'FAIL' };
   let onSpawn: (name: string) => void = () => {}; // simulate what a sub-agent writes
   let gate: Promise<void> | null = null;          // optional latch to hold a spawn open (lock test)
 
@@ -40,8 +41,12 @@ function mkPipeline() {
       spawns.push({ caller, name, input, signal });
       if (gate) await gate;
       onSpawn(name);
-      return { content: 'ok', success: true };
+      const content = name === 'policy-auditor' ? `VERDICT: ${state.policyVerdict}` : 'ok';
+      return { content, success: true };
     },
+    analyzeFeature: () => ({ uncovered: state.uncovered }),
+    featureArtifactText: (_r, feature, rel) => artifactText.get(`${feature}/${rel}`) ?? null,
+    writeFeatureArtifact: (_r, feature, rel, content) => { artifactText.set(`${feature}/${rel}`, content); artifacts.add(`${feature}/${rel}`); },
     findDeskForRole: (role) => (role === 'planner' ? state.plannerDesk : null),
     assignCard: (cardId, deskId) => { assigns.push({ cardId, deskId }); },
     advanceMilestone: (epicId, key) => {
@@ -63,7 +68,7 @@ function mkPipeline() {
   };
   const pipeline = new SddpPipeline(deps);
   return {
-    pipeline, artifacts, spawns, escalations, asks, seeds, assigns, state,
+    pipeline, artifacts, spawns, escalations, asks, seeds, assigns, state, artifactText,
     setTasks: (t: HiveTask[]) => { tasks = t; },
     getTasks: () => tasks,
     setOnSpawn: (fn: (name: string) => void) => { onSpawn = fn; },
@@ -334,5 +339,68 @@ describe('buildStepInput', () => {
     expect(buildStepInput('tasks', '00001')).toMatch(/Author into THIS structure/);
     // data-model carries its format inline in the sub-agent prompt → no template appended
     expect(buildStepInput('data-model', '00001')).not.toMatch(/Author into THIS structure/);
+  });
+});
+
+describe('SddpPipeline — Analyze (host-driven, multi-agent + CRITICAL gate)', () => {
+  it('runs policy-auditor + spec-validator, writes a clean report, and advances when nothing is CRITICAL', async () => {
+    const h = mkPipeline();
+    h.state.uncovered = []; h.state.policyVerdict = 'PASS';
+    h.setTasks([epicWith('analyze')]);
+
+    await h.pipeline.advanceFeature('S:/repo', '00001');
+
+    expect(h.spawns.map((s) => s.name).sort()).toEqual(['policy-auditor', 'spec-validator']);
+    expect(h.artifactText.get('00001/analysis-report.md')).toMatch(/critical:\s*0/);
+    expect(milestone(h.getTasks()[0], 'analyze').status).toBe('done');
+    expect(milestone(h.getTasks()[0], 'implement').status).toBe('active');
+    expect(h.escalations).toHaveLength(0);
+  });
+
+  it('HOLDS + escalates on an uncovered requirement (mechanical CRITICAL), does not advance', async () => {
+    const h = mkPipeline();
+    h.state.uncovered = ['FR-003']; h.state.policyVerdict = 'PASS';
+    h.setTasks([epicWith('analyze')]);
+
+    await h.pipeline.advanceFeature('S:/repo', '00001');
+
+    expect(h.artifactText.get('00001/analysis-report.md')).toMatch(/critical:\s*1/);
+    expect(milestone(h.getTasks()[0], 'analyze').status).toBe('active'); // held
+    expect(h.escalations).toHaveLength(1);
+  });
+
+  it('HOLDS on a policy-auditor FAIL verdict', async () => {
+    const h = mkPipeline();
+    h.state.uncovered = []; h.state.policyVerdict = 'FAIL';
+    h.setTasks([epicWith('analyze')]);
+
+    await h.pipeline.advanceFeature('S:/repo', '00001');
+
+    expect(h.artifactText.get('00001/analysis-report.md')).toMatch(/critical:\s*1/);
+    expect(milestone(h.getTasks()[0], 'analyze').status).toBe('active');
+    expect(h.escalations).toHaveLength(1);
+  });
+
+  it('autopilot advances despite CRITICAL findings', async () => {
+    const h = mkPipeline();
+    h.state.autopilot = true; h.state.uncovered = ['FR-003']; h.state.policyVerdict = 'FAIL';
+    h.setTasks([epicWith('analyze')]);
+
+    await h.pipeline.advanceFeature('S:/repo', '00001');
+
+    expect(milestone(h.getTasks()[0], 'analyze').status).toBe('done');
+    expect(milestone(h.getTasks()[0], 'implement').status).toBe('active');
+  });
+
+  it('a pre-existing report gates WITHOUT re-running the validators', async () => {
+    const h = mkPipeline();
+    h.artifactText.set('00001/analysis-report.md', '---\ncritical: 2\n---\n# stale');
+    h.setTasks([epicWith('analyze')]);
+
+    await h.pipeline.advanceFeature('S:/repo', '00001');
+
+    expect(h.spawns).toHaveLength(0);                                   // no re-spawn
+    expect(milestone(h.getTasks()[0], 'analyze').status).toBe('active'); // held on its critical:2
+    expect(h.escalations).toHaveLength(1);
   });
 });
