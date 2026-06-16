@@ -21,13 +21,14 @@ function underRoot(p: string, root: string): boolean {
  * as a managed build dir — normalized to platform separators and collected for creation; every OTHER
  * value (PATH lists, flags, external paths) is set RAW (never normalized — so a `${env:PATH}` list
  * isn't mangled). Rules: blank-`name` rows skipped; with `root` null, a row whose RAW value references
- * `${buildRoot}` is skipped (can't resolve). `envLookup` backs the `${env:NAME}` token.
+ * `${buildRoot}` is skipped (can't resolve). `lookup` backs the prefixed `${env:NAME}`/`${secret:NAME}`
+ * tokens (the host wires it to `process.env` + the secret vault).
  */
 export function resolveDeskEnv(
   entries: DeskEnvEntry[],
   root: string | null,
   vars: DeskEnvVars,
-  envLookup?: (name: string) => string | undefined
+  lookup?: (prefix: string, name: string) => string | undefined
 ): { env: Record<string, string>; dirs: string[] } {
   const env: Record<string, string> = {};
   const dirs: string[] = [];
@@ -35,7 +36,7 @@ export function resolveDeskEnv(
     const name = entry.name?.trim();
     if (!name) continue;
     if (!root && /\$\{buildRoot\}/.test(entry.value)) continue; // can't resolve without a root
-    const expanded = expandTokens(entry.value, vars, envLookup);
+    const expanded = expandTokens(entry.value, vars, lookup);
     if (root && isAbsolute(expanded) && underRoot(expanded, root)) {
       const dir = normalize(expanded); // managed build dir → clean platform separators + auto-create
       env[name] = dir;

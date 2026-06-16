@@ -51,21 +51,24 @@ export const DEFAULT_DESK_ENV: DeskEnvEntry[] = [
 ];
 
 /**
- * Expand `${token}` placeholders in a template. A `${env:NAME}` token resolves via `envLookup(NAME)`
- * (the host passes `process.env`); the named tokens resolve via `vars`. UNKNOWN `${x}` are left
- * intact (a literal a user wants passed through survives, and a typo stays visible). Deterministic +
- * pure (the only outside read is the injected `envLookup`). The renderer omits `envLookup`, so a
- * preview shows `${env:…}` literally rather than the main process's environment.
+ * Expand `${token}` placeholders in a template. A PREFIXED token `${prefix:name}` (e.g. `${env:PATH}`,
+ * `${secret:GH_TOKEN}`) resolves via `lookup(prefix, name)` — the host wires this to `process.env` +
+ * the secret vault (main only). The named tokens (`buildRoot`, …) resolve via `vars`. UNKNOWN tokens
+ * (no `vars` entry / no `lookup` / lookup returns undefined) are left intact, so a literal survives and
+ * a typo stays visible. Deterministic + pure (the only outside reads are via the injected `lookup`).
+ * The renderer omits `lookup`, so a preview shows `${env:…}`/`${secret:…}` literally — values never
+ * cross IPC.
  */
 export function expandTokens(
   template: string,
   vars: Partial<DeskEnvVars>,
-  envLookup?: (name: string) => string | undefined
+  lookup?: (prefix: string, name: string) => string | undefined
 ): string {
   return template.replace(/\$\{([^}]+)\}/g, (whole, raw: string) => {
     const token = raw.trim();
-    if (token.startsWith('env:')) {
-      const v = envLookup?.(token.slice(4));
+    const colon = token.indexOf(':');
+    if (colon > 0) {
+      const v = lookup?.(token.slice(0, colon), token.slice(colon + 1));
       return v === undefined ? whole : v;
     }
     const v = (vars as Record<string, string | undefined>)[token];

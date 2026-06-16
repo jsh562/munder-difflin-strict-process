@@ -24,8 +24,28 @@ import {
   AGENT_TOOL_CATALOG,
   NATIVE_AGENT_PREAMBLE
 } from '@jsh562/won-agent-core';
+import { fetch as undiciFetch, ProxyAgent } from 'undici';
 import type { ToolSpec, ToolUseRequest } from '../../../shared/providerCall';
 import type { WorkerCommand, WorkerMessage } from '../../../shared/workerProtocol';
+
+/**
+ * Build the `fetch` for `selectAdapter` honoring a proxy from the spawn env (Runtime env →
+ * HTTPS_PROXY/HTTP_PROXY). Node's GLOBAL fetch ignores those, so when a proxy is set we route the
+ * native model call through undici's OWN fetch with a `ProxyAgent` dispatcher (the clean seam — no
+ * `setGlobalDispatcher` gotcha). Custom CA needs no code: `NODE_EXTRA_CA_CERTS` is read by Node at
+ * process start (it's in the spawn env) and applies to undici's TLS too. Returns undefined when no
+ * proxy is configured (selectAdapter then uses the global fetch). Best-effort: a bad URL falls back.
+ */
+function proxyFetchFromEnv(env: NodeJS.ProcessEnv): ((url: string, init: unknown) => Promise<unknown>) | undefined {
+  const url = (env.HTTPS_PROXY ?? env.https_proxy ?? env.HTTP_PROXY ?? env.http_proxy ?? '').trim();
+  if (!url) return undefined;
+  try {
+    const dispatcher = new ProxyAgent(url);
+    return (u: string, init: unknown) => undiciFetch(u, { ...(init as Record<string, unknown>), dispatcher });
+  } catch {
+    return undefined; // bad proxy URL ⇒ leave the global fetch (the call may still work / fail clearly)
+  }
+}
 
 interface ParentPortLike {
   on(ev: 'message', cb: (e: { data: WorkerCommand }) => void): void;
@@ -49,7 +69,8 @@ if (parentPort) {
   // Select the real provider from the injected env (AD-002 / FR-008). This is the
   // single place provider selection reads `process.env`; null ⇒ no native provider
   // assigned, so the stub keeps existing behavior/tests working unchanged.
-  const adapter = selectAdapter(process.env);
+  const proxyFetch = proxyFetchFromEnv(process.env);
+  const adapter = selectAdapter(process.env, proxyFetch ? { fetch: proxyFetch as never } : {});
   const providerCall = adapter ?? makeStubProvider();
   const isNative = adapter !== null;
   const model = (process.env[NATIVE_PROVIDER_MODEL_ENV] ?? '').trim() || null;

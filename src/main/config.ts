@@ -190,6 +190,15 @@ export interface HarnessConfig {
    *  the git hive, transcripts, or telemetry; injected only into a native worker's
    *  spawn env. A future OS-keychain backend swaps in behind the injection seam. */
   providerKeys?: Record<string, string>;
+  /** Secret vault — named secret values referenced from env tables via `${secret:NAME}`. Encrypted at
+   *  rest (`safeStorage`, `enc:`/`raw:` prefixed). NEVER sent to the renderer (redacted to names only);
+   *  decrypted in main and injected into a desk's env. See `src/main/secrets.ts`. */
+  secrets?: Record<string, string>;
+  /** Runtime env (GLOBAL) — vars for the agent's OWN model + network calls (proxy / custom CA), e.g.
+   *  `HTTPS_PROXY`, `NO_PROXY`, `NODE_EXTRA_CA_CERTS`. Injected into the native worker process, the
+   *  Claude PTY, and bash (so git/curl honor them too). Values may use `${env:NAME}`/`${secret:NAME}`.
+   *  Distinct from `deskEnv` (which is for what desks RUN). */
+  runtimeEnv?: DeskEnvEntry[];
   /** Opt-in: allow native (DeepSeek/Minimax) desks to run the `bash` tool. OFF by
    *  default — a native desk gets filesystem/search/memory tools unconditionally,
    *  but shell execution stays gated until the operator turns this on (the toolkit

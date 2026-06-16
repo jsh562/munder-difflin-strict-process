@@ -40,6 +40,7 @@ import { nativeSddpGodPrompt, nativeSddpRolePrompt } from './sddpPrompts';
 import { SddpPipeline } from './sddpPipeline';
 import { executeAgentTool, subAgentSpec, SUB_AGENT_NAMES, agentTaskBranch, type AgentToolDeps, type FeatureStatus } from '@jsh562/won-agent-core';
 import { redactConfig, injectionEnvForProvider, keyPresence, setKeyInConfig, clearKeyInConfig, WEB_SEARCH_KEY_ID, NATIVE_PROVIDER_MODEL_ENV, type SafeConfig } from './credentials';
+import { setSecretInConfig, clearSecretInConfig, getSecretValue, secretNames } from './secrets';
 import { searchWebDuckDuckGo } from './webSearch';
 import { resolveBashEnv, describeBashEnv } from './bashShell';
 import { listProviders } from '../shared/providerRegistry';
@@ -292,15 +293,34 @@ function buildCacheRoot(): string | null {
   return cfg.harnessHome ? join(cfg.harnessHome, 'build-cache') : null;
 }
 
+/** Resolve a prefixed env token: `${env:NAME}` → the host's `process.env`; `${secret:NAME}` → the
+ *  decrypted vault (main only). Backs both the `deskEnv` and `runtimeEnv` tables. Missing → '' so a
+ *  reference never leaves a literal `${…}` in the value (the Settings editor flags unknown secrets). */
+function tokenLookup(prefix: string, name: string): string | undefined {
+  if (prefix === 'env') return process.env[name] ?? '';
+  if (prefix === 'secret') return getSecretValue(readConfig(), name) ?? '';
+  return undefined;
+}
+
+/** The GLOBAL runtime env (proxy / custom CA) — vars for the agent's OWN model + network calls,
+ *  resolved with the token lookup. No path tokens (root=null). Injected into the worker process, the
+ *  Claude PTY, and bash. Empty when unset. */
+function runtimeEnvResolved(): Record<string, string> {
+  const cfg = readConfig();
+  if (!cfg.runtimeEnv || cfg.runtimeEnv.length === 0) return {};
+  const vars = { buildRoot: '', worktreeKey: '', cwd: '', agentId: '', harnessHome: cfg.harnessHome ?? '' };
+  return resolveDeskEnv(cfg.runtimeEnv, null, vars, tokenLookup).env;
+}
+
 /**
  * The env for one desk — expands the user's token-templated `deskEnv` table (default: cargo) against
  * this desk's working tree, LAYERED global → per-repo → per-agent (most specific wins), and creates
  * the managed build dirs. A `${worktreeKey}` value (`<basename>-<shortHash(cwd)>`) keys each distinct
  * tree (a worktree OR a base repo) to its OWN dir — cargo takes a per-`target` lock, so one builder
  * per dir avoids the concurrent-build corruption a shared dir would cause; the hash discriminates
- * same-named repos. `${env:NAME}` resolves against the host's `process.env` (safe PATH-append). Dirs
- * under the root are created eagerly. Returns `undefined` (inherit the parent env) when there's no
- * cwd or the table resolves to nothing.
+ * same-named repos. `${env:NAME}`/`${secret:NAME}` resolve via `tokenLookup`. Dirs under the root are
+ * created eagerly. Returns `undefined` (inherit the parent env) when there's no cwd or the table
+ * resolves to nothing.
  */
 function deskEnvFor(cwd: string | null | undefined, agentId: string | null | undefined): Record<string, string> | undefined {
   if (!cwd) return undefined;
@@ -318,7 +338,7 @@ function deskEnvFor(cwd: string | null | undefined, agentId: string | null | und
   const repoOvr = perRepoDeskEnv(cfg.deskEnvByRepo, agentId ? repoForId(agentId) : null);
   const agentOvr = perAgentDeskEnv(cfg.deskEnvByAgent, agentId);
   const entries = mergeDeskEnv(mergeDeskEnv(base, repoOvr), agentOvr);
-  const { env, dirs } = resolveDeskEnv(entries, root, vars, (n) => process.env[n] ?? '');
+  const { env, dirs } = resolveDeskEnv(entries, root, vars, tokenLookup);
   for (const dir of dirs) {
     try { mkdirSync(dir, { recursive: true }); } catch { /* best-effort — the tool will surface a write error */ }
   }
@@ -624,7 +644,11 @@ const agentToolDeps: AgentToolDeps = {
   // Redirect heavy build output (Rust `target/`, …) off the desk's worktree into the one
   // AV-excludable cache root, keyed per working tree. A native desk's bash runs in MAIN, so this
   // is the seam that reaches its cargo build (the Claude PTY path sets the same var in opts.env).
-  bashEnv: (id) => deskEnvFor(hive.registry().agents[id]?.cwd, id),
+  bashEnv: (id) => {
+    // bash gets the desk table PLUS the runtime env (so git/curl honor proxy/CA too).
+    const merged = { ...runtimeEnvResolved(), ...(deskEnvFor(hive.registry().agents[id]?.cwd, id) ?? {}) };
+    return Object.keys(merged).length ? merged : undefined;
+  },
   // web_search routes through the host (provider + formatting). Free + keyless via
   // DuckDuckGo; config is read live per call so the operator's enable/disable takes
   // effect at once. Throws a clear note when disabled — the executor turns that into a
@@ -827,7 +851,9 @@ const nativeRuntime = new NativeRuntime({
   // INTEGRATOR preamble for a dedicated (non-god) integrator desk. Identity + roles come
   // from the hive registry (set at ensureAgent / setRoles).
   workerEnv: (id) => {
-    const env: Record<string, string> = { NATIVE_AGENT_ENV_NOTE: describeBashEnv() };
+    // Runtime env (proxy / custom CA) first, so the worker PROCESS — which makes the model API call —
+    // inherits HTTPS_PROXY / NODE_EXTRA_CA_CERTS / … (the worker also wires undici's ProxyAgent from it).
+    const env: Record<string, string> = { ...runtimeEnvResolved(), NATIVE_AGENT_ENV_NOTE: describeBashEnv() };
     const agent = hive.registry().agents[id];
     const roles = agent?.roles ?? [];
     // SDDP mode is a WHOLESALE switch: when on, desks get the spec-driven preamble set
@@ -1522,8 +1548,9 @@ ipcMain.handle('pty:spawn', async (_evt, opts: SpawnOptions & { hive?: AgentMeta
   // AV-excludable cache root — so a Claude author/base-tree desk's cargo build doesn't churn
   // `target/` inside the worktree or the repo. (Native desks get the same var via `bashEnv`.)
   if (opts.hive && !opts.hive.isGod && !opts.hive.isAssistant) {
-    const deskEnv = deskEnvFor(opts.cwd, opts.hive.id);
-    if (deskEnv) opts.env = { ...(opts.env ?? {}), ...deskEnv };
+    // Claude desk gets the runtime env (proxy/CA for the Claude CLI's own calls) + the desk table.
+    const envAdds = { ...runtimeEnvResolved(), ...(deskEnvFor(opts.cwd, opts.hive.id) ?? {}) };
+    if (Object.keys(envAdds).length) opts.env = { ...(opts.env ?? {}), ...envAdds };
   }
   // If the agent carries hive metadata, provision its workspace and inject the
   // identity + protocol (extra --append-system-prompt args + AGENT_* env).
@@ -1783,6 +1810,26 @@ ipcMain.handle('credentials:clear', (_evt, providerId: unknown) => {
   return { ok: true };
 });
 ipcMain.handle('credentials:presence', () => keyPresence(readConfig(), [...listProviders().map((p) => p.id), WEB_SEARCH_KEY_ID]));
+
+// Secret vault — named secrets referenced from env tables via ${secret:NAME}. Encrypted at rest
+// (safeStorage); the renderer only ever learns the NAMES, never the values (mirrors credentials).
+ipcMain.handle('secrets:list', () => secretNames(readConfig()));
+ipcMain.handle('secrets:set', (_evt, name: unknown, value: unknown) => {
+  if (typeof name !== 'string' || !name.trim() || name.includes('}') || typeof value !== 'string' || !value) {
+    return { ok: false, error: 'invalid name or value' };
+  }
+  try {
+    writeConfig({ secrets: setSecretInConfig(readConfig(), name.trim(), value).secrets });
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+});
+ipcMain.handle('secrets:clear', (_evt, name: unknown) => {
+  if (typeof name !== 'string') return { ok: false, error: 'invalid' };
+  writeConfig({ secrets: clearSecretInConfig(readConfig(), name).secrets });
+  return { ok: true };
+});
 ipcMain.handle('config:ensureHome', (_evt, path: unknown) => {
   if (typeof path !== 'string' || path.length === 0) return { ok: false, error: 'invalid path' };
   return ensureHarnessHome(path);

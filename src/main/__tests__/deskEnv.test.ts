@@ -35,10 +35,17 @@ describe('resolveDeskEnv', () => {
     expect(dirs).toHaveLength(0);
   });
 
-  it('expands ${env:NAME} via the lookup and sets a PATH list RAW (not normalized, not a dir)', () => {
-    const look = (n: string) => (n === 'PATH' ? '/usr/bin:/bin' : '');
-    const { env, dirs } = resolveDeskEnv([{ name: 'PATH', value: '/extra:${env:PATH}' }], ROOT, vars(ROOT), look);
+  it('expands ${env:NAME}/${secret:NAME} via the (prefix,name) lookup; PATH list set RAW (not a dir)', () => {
+    const look = (prefix: string, name: string) =>
+      prefix === 'env' && name === 'PATH' ? '/usr/bin:/bin'
+      : prefix === 'secret' && name === 'TOKEN' ? 'sekret'
+      : '';
+    const { env, dirs } = resolveDeskEnv(
+      [{ name: 'PATH', value: '/extra:${env:PATH}' }, { name: 'AUTH', value: 'Bearer ${secret:TOKEN}' }],
+      ROOT, vars(ROOT), look
+    );
     expect(env.PATH).toBe('/extra:/usr/bin:/bin'); // verbatim — separators untouched
+    expect(env.AUTH).toBe('Bearer sekret');        // secret resolved
     expect(dirs).toHaveLength(0);
   });
 

@@ -44,6 +44,10 @@ export interface HarnessConfig {
   deskEnvByRepo?: Record<string, DeskEnvEntry[]>;
   /** Per-agent env overrides (keyed by agent id) layered on global + per-repo. */
   deskEnvByAgent?: Record<string, DeskEnvEntry[]>;
+  /** Runtime env (global) — proxy / custom CA for the agent's own model + network calls. */
+  runtimeEnv?: DeskEnvEntry[];
+  /** Secret-vault NAMES from `config:get` (values never cross the bridge). */
+  secretNames?: string[];
   registeredRepos: string[];
   autoMode: boolean;
   defaultCommand: string;

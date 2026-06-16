@@ -24,10 +24,12 @@ export const NATIVE_PROVIDER_MODEL_ENV = 'NATIVE_PROVIDER_MODEL';
  *  `getKeyFromConfig(cfg, WEB_SEARCH_KEY_ID)`. */
 export const WEB_SEARCH_KEY_ID = 'web-search';
 
-/** HarnessConfig with provider key VALUES removed — the only shape sent to the
- *  renderer (TR-008). Presence (has-key per provider) is exposed instead. */
-export type SafeConfig = Omit<HarnessConfig, 'providerKeys'> & {
+/** HarnessConfig with all secret VALUES removed — the only shape sent to the renderer (TR-008).
+ *  Provider-key presence (has-key per provider) and the secret-vault NAMES (never values) are exposed
+ *  instead. */
+export type SafeConfig = Omit<HarnessConfig, 'providerKeys' | 'secrets'> & {
   providerKeyPresence: Record<string, boolean>;
+  secretNames: string[];
 };
 
 /** Set a provider's key. Rejects an unknown provider id (TR-002). Pure: returns a
@@ -73,14 +75,16 @@ export function injectionEnvForProvider(cfg: HarnessConfig, providerId: string):
   return { [NATIVE_PROVIDER_KEY_ENV]: key, [NATIVE_PROVIDER_ID_ENV]: providerId };
 }
 
-/** Strip provider key VALUES from a config before it crosses to the renderer
- *  (TR-008); expose presence only. */
+/** Strip all secret VALUES from a config before it crosses to the renderer (TR-008): provider keys
+ *  → presence only; the secret vault → NAMES only (never the encrypted blobs). */
 export function redactConfig(cfg: HarnessConfig): SafeConfig {
   const providerKeyPresence: Record<string, boolean> = {};
   for (const [id, value] of Object.entries(cfg.providerKeys ?? {})) {
     providerKeyPresence[id] = Boolean(value);
   }
-  const rest: Omit<HarnessConfig, 'providerKeys'> & { providerKeys?: Record<string, string> } = { ...cfg };
+  const secretNames = Object.keys(cfg.secrets ?? {});
+  const rest: Omit<HarnessConfig, 'providerKeys' | 'secrets'> & { providerKeys?: Record<string, string>; secrets?: Record<string, string> } = { ...cfg };
   delete rest.providerKeys;
-  return { ...rest, providerKeyPresence };
+  delete rest.secrets;
+  return { ...rest, providerKeyPresence, secretNames };
 }

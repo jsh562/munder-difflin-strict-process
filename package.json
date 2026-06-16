@@ -4,7 +4,9 @@
   "private": true,
   "description": "Local multi-agent harness for Claude Code: autonomous agents that message, route, and remember — coordinated by a GOD orchestrator and visualized as avatars at work.",
   "main": "out/main/index.js",
-  "workspaces": ["packages/*"],
+  "workspaces": [
+    "packages/*"
+  ],
   "author": "Chaitanya Giri",
   "homepage": "https://munderdiffl.in/",
   "repository": {
@@ -29,7 +31,6 @@
     "dist:linux": "npm run build && electron-builder --linux"
   },
   "dependencies": {
-    "@jsh562/won-agent-core": "github:jsh562/won-agent-core",
     "@codemirror/lang-css": "^6.3.1",
     "@codemirror/lang-html": "^6.4.11",
     "@codemirror/lang-javascript": "^6.2.5",
@@ -40,6 +41,7 @@
     "@codemirror/language": "^6.12.3",
     "@codemirror/state": "^6.6.0",
     "@codemirror/view": "^6.43.0",
+    "@jsh562/won-agent-core": "github:jsh562/won-agent-core",
     "@lezer/highlight": "^1.2.3",
     "@uiw/react-codemirror": "^4.25.10",
     "@xterm/addon-fit": "^0.10.0",
@@ -53,6 +55,7 @@
     "pixi.js": "^8.5.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
+    "undici": "^6.24.1",
     "zustand": "^4.5.5"
   },
   "devDependencies": {

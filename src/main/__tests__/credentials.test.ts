@@ -81,6 +81,15 @@ describe('SC-004 — non-leakage', () => {
     expect(JSON.stringify(safe)).not.toContain(SECRET);
   });
 
+  it('redactConfig strips the secret VAULT too (values out, names only)', () => {
+    const c = { ...cfg(), secrets: { GH_TOKEN: 'enc:abc123', DB_PASS: 'raw:hunter2' } } as HarnessConfig;
+    const safe = redactConfig(c);
+    expect('secrets' in safe).toBe(false);
+    expect(safe.secretNames.sort()).toEqual(['DB_PASS', 'GH_TOKEN']);
+    expect(JSON.stringify(safe)).not.toContain('hunter2');
+    expect(JSON.stringify(safe)).not.toContain('enc:abc123');
+  });
+
   it('credentials.ts imports no hive/telemetry/transcript/electron module (boundary)', () => {
     const src = readFileSync(resolve(process.cwd(), 'src/main/credentials.ts'), 'utf8');
     const imports = src.split('\n').filter((l) => /^\s*import\b/.test(l));

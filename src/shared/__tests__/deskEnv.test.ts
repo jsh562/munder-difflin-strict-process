@@ -24,15 +24,19 @@ describe('expandTokens', () => {
     expect(expandTokens('${buildRoot}/x', { worktreeKey: 'k' })).toBe('${buildRoot}/x'); // buildRoot absent ⇒ left intact
   });
 
-  it('resolves ${env:NAME} via the injected lookup (safe PATH-append)', () => {
-    const look = (n: string) => (n === 'PATH' ? '/usr/bin' : undefined);
-    expect(expandTokens('/extra:${env:PATH}', vars, look)).toBe('/extra:/usr/bin');
-    expect(expandTokens('${buildRoot}/x:${env:PATH}', vars, look)).toBe('S:/cache/x:/usr/bin');
+  it('resolves prefixed ${env:NAME}/${secret:NAME} via the (prefix,name) lookup', () => {
+    const look = (prefix: string, name: string) =>
+      prefix === 'env' && name === 'PATH' ? '/usr/bin'
+      : prefix === 'secret' && name === 'GH_TOKEN' ? 'ghp_xyz'
+      : undefined;
+    expect(expandTokens('/extra:${env:PATH}', vars, look)).toBe('/extra:/usr/bin'); // safe PATH-append
+    expect(expandTokens('Bearer ${secret:GH_TOKEN}', vars, look)).toBe('Bearer ghp_xyz');
+    expect(expandTokens('${buildRoot}/x:${env:PATH}', vars, look)).toBe('S:/cache/x:/usr/bin'); // mixed
   });
 
-  it('leaves ${env:NAME} intact when no lookup (renderer preview) or the var is absent', () => {
+  it('leaves a prefixed token intact when no lookup (renderer preview) or it resolves undefined', () => {
     expect(expandTokens('/extra:${env:PATH}', vars)).toBe('/extra:${env:PATH}'); // no lookup → literal
-    expect(expandTokens('${env:NOPE}', vars, () => undefined)).toBe('${env:NOPE}'); // absent → literal
+    expect(expandTokens('${secret:NOPE}', vars, () => undefined)).toBe('${secret:NOPE}'); // unknown → literal
   });
 
   it('returns plain strings unchanged', () => {

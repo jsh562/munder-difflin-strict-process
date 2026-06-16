@@ -147,6 +147,8 @@ export interface HarnessConfig {
   deskEnvByRepo?: Record<string, DeskEnvEntry[]>;
   /** Per-agent env overrides (keyed by agent id) layered on global + per-repo. */
   deskEnvByAgent?: Record<string, DeskEnvEntry[]>;
+  /** Runtime env (global) — proxy / custom CA for the agent's own model + network calls. */
+  runtimeEnv?: DeskEnvEntry[];
   registeredRepos: string[];
   autoMode: boolean;
   defaultCommand: string;
@@ -182,6 +184,8 @@ export interface HarnessConfig {
   /** E004 — redacted presence map (true ⇒ a key is stored) the renderer receives
    *  from `config:get`. Raw provider keys never cross the bridge. */
   providerKeyPresence?: Record<string, boolean>;
+  /** Secret-vault NAMES the renderer receives from `config:get` (values never cross the bridge). */
+  secretNames?: string[];
 }
 
 export interface MemoryStatus {
@@ -441,6 +445,15 @@ const api = {
       ipcRenderer.invoke('credentials:clear', providerId),
     presence: (): Promise<Record<string, boolean>> =>
       ipcRenderer.invoke('credentials:presence')
+  },
+  /** Named secret vault. Set/clear travel renderer→main; the renderer only ever learns the NAMES
+   *  (`list`), never the values — referenced from env tables via `${secret:NAME}`. */
+  secrets: {
+    list: (): Promise<string[]> => ipcRenderer.invoke('secrets:list'),
+    set: (name: string, value: string): Promise<{ ok: boolean; error?: string }> =>
+      ipcRenderer.invoke('secrets:set', name, value),
+    clear: (name: string): Promise<{ ok: boolean; error?: string }> =>
+      ipcRenderer.invoke('secrets:clear', name)
   },
 
   // ─── Filesystem (sandboxed to cwd) ───────────────────────────────────────

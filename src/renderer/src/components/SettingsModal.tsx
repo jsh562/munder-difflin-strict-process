@@ -71,7 +71,7 @@ function clearLocalState(): void {
  *  add button). Shared by the GLOBAL, PER-REPO, and PER-AGENT tables. Edits flow through `onEdit`
  *  (local, per keystroke); the config write happens on blur via `onCommit`; add/remove persist
  *  immediately. `buildRoot` (display root) drives the "created" marker. */
-function DeskEnvRows({ entries, sample, buildRoot, onEdit, onCommit, onAdd, onRemove }: {
+function DeskEnvRows({ entries, sample, buildRoot, onEdit, onCommit, onAdd, onRemove, tokenChips, showCreated = true, secretNames = [] }: {
   entries: DeskEnvEntry[];
   sample: Partial<DeskEnvVars>;
   buildRoot: string;
@@ -79,8 +79,12 @@ function DeskEnvRows({ entries, sample, buildRoot, onEdit, onCommit, onAdd, onRe
   onCommit: () => void;
   onAdd: () => void;
   onRemove: (i: number) => void;
+  tokenChips?: string[];
+  showCreated?: boolean;
+  secretNames?: string[];
 }) {
   const [focused, setFocused] = useState(0);
+  const chips = tokenChips ?? [...DESK_ENV_TOKENS, 'env:', 'secret:'];
   const mono: CSSProperties = { ...slackInputStyle, fontFamily: 'var(--cth-font-mono, monospace)' };
   const chipStyle: CSSProperties = {
     padding: '1px 5px', fontSize: 10, lineHeight: '15px', cursor: 'pointer',
@@ -94,23 +98,34 @@ function DeskEnvRows({ entries, sample, buildRoot, onEdit, onCommit, onAdd, onRe
     onEdit(i, { value: (entries[i]?.value ?? '') + '${' + tok + '}' });
     onCommit();
   };
+  // A ${secret:NAME} reference whose NAME isn't in the vault — flag it (the value would resolve empty).
+  const unknownSecret = (value: string): string | null => {
+    for (const m of value.matchAll(/\$\{secret:([^}]+)\}/g)) {
+      const n = m[1].trim();
+      if (!secretNames.includes(n)) return n;
+    }
+    return null;
+  };
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 6, paddingLeft: 152 }}>
       {entries.map((e, i) => {
         const resolved = expandTokens(e.value, sample);
-        const created = !!buildRoot && resolved.startsWith(buildRoot);
+        const created = showCreated && !!buildRoot && resolved.startsWith(buildRoot);
+        const missing = unknownSecret(e.value);
         return (
           <div key={i} style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
               <input value={e.name} placeholder="NAME" onChange={(ev) => onEdit(i, { name: ev.target.value })} onBlur={onCommit} onFocus={() => setFocused(i)}
                 style={{ ...mono, width: 170 }} />
-              <input value={e.value} placeholder="${buildRoot}/tool/${worktreeKey}" onChange={(ev) => onEdit(i, { value: ev.target.value })} onBlur={onCommit} onFocus={() => setFocused(i)}
+              <input value={e.value} placeholder="value or ${secret:NAME}" onChange={(ev) => onEdit(i, { value: ev.target.value })} onBlur={onCommit} onFocus={() => setFocused(i)}
                 style={{ ...mono, flex: 1 }} />
               <PixelButton variant="ghost" size="sm" onClick={() => onRemove(i)}><Icon name="x" /></PixelButton>
             </div>
             {e.name.trim() !== '' && (
               <div style={{ fontSize: 11, color: 'var(--cth-ink-500)', fontFamily: 'var(--cth-font-mono, monospace)', wordBreak: 'break-all' }}>
-                → {resolved}{created && <span style={{ color: 'var(--cth-sage, var(--cth-ink-700))' }}> · created</span>}
+                → {resolved}
+                {created && <span style={{ color: 'var(--cth-sage, var(--cth-ink-700))' }}> · created</span>}
+                {missing && <span style={{ color: 'var(--cth-coral)' }}> · unknown secret “{missing}”</span>}
               </div>
             )}
           </div>
@@ -119,7 +134,7 @@ function DeskEnvRows({ entries, sample, buildRoot, onEdit, onCommit, onAdd, onRe
       <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', alignItems: 'center' }}>
         <PixelButton variant="secondary" size="sm" onClick={onAdd}><span><Icon name="plus" /> add</span></PixelButton>
         <span style={{ fontSize: 10, color: 'var(--cth-ink-500)' }}>insert:</span>
-        {[...DESK_ENV_TOKENS, 'env:'].map((t) => (
+        {chips.map((t) => (
           <button key={t} type="button" style={chipStyle} onClick={() => insert(t)}>{'${' + t + '}'}</button>
         ))}
       </div>
@@ -237,6 +252,35 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
   const editAgentAt = (i: number, patch: Partial<DeskEnvEntry>) =>
     setDeskEnvByAgent((cur) => ({ ...cur, [selectedAgent]: (cur[selectedAgent] ?? []).map((e, j) => (j === i ? { ...e, ...patch } : e)) }));
   const commitAgentMap = () => { void window.cth.updateConfig({ deskEnvByAgent: pruneEnvMap(deskEnvByAgent) }); };
+
+  // Runtime env (GLOBAL) — proxy / custom CA for the agent's OWN model + network calls.
+  const [runtimeEnv, setRuntimeEnv] = useState<DeskEnvEntry[]>(config.runtimeEnv ?? []);
+  const persistRuntimeEnv = (next: DeskEnvEntry[]) => { setRuntimeEnv(next); void window.cth.updateConfig({ runtimeEnv: next }); };
+  const addRuntimeRow = () => persistRuntimeEnv([...runtimeEnv, { name: '', value: '' }]);
+  const editRuntimeAt = (i: number, patch: Partial<DeskEnvEntry>) =>
+    setRuntimeEnv((cur) => cur.map((e, j) => (j === i ? { ...e, ...patch } : e)));
+  const commitRuntimeEnv = () => { void window.cth.updateConfig({ runtimeEnv }); };
+  const removeRuntimeRow = (i: number) => persistRuntimeEnv(runtimeEnv.filter((_, j) => j !== i));
+
+  // Secret vault — named, masked, encrypted at rest; renderer learns NAMES only. Referenced anywhere
+  // via ${secret:NAME}. Mirrors the provider-key flow (set/clear write-only; list = presence).
+  const [secretVaultNames, setSecretVaultNames] = useState<string[]>(config.secretNames ?? []);
+  const [secretDraftName, setSecretDraftName] = useState('');
+  const [secretDraftValue, setSecretDraftValue] = useState('');
+  const [secretNote, setSecretNote] = useState('');
+  const refreshSecrets = () => window.cth.secrets.list().then(setSecretVaultNames).catch(() => { /* keep last */ });
+  const saveSecret = async () => {
+    const name = secretDraftName.trim();
+    if (!name || !secretDraftValue) return;
+    const res = await window.cth.secrets.set(name, secretDraftValue);
+    if (res.ok) { setSecretDraftName(''); setSecretDraftValue(''); setSecretNote(`saved “${name}”`); refreshSecrets(); }
+    else setSecretNote(res.error ?? 'failed');
+  };
+  const removeSecret = async (name: string) => {
+    await window.cth.secrets.clear(name);
+    setSecretNote(`cleared “${name}”`);
+    refreshSecrets();
+  };
 
   // Worktrees diagnostics — per-repo, per-worktree health (branch, dirty/unmerged, problem flags)
   // so the operator can SEE issues (e.g. a base tree stuck on an agent branch) and recover them.
@@ -483,7 +527,7 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
     let alive = true;
     window.cth.getConfig().then((c) => {
       if (!alive) return;
-      const cc = c as BreakerCfgView & SlackConfig & { notifications?: boolean; webSearchEnabled?: boolean; nativeBashEnabled?: boolean; sddpMode?: boolean; godWorkspace?: string; buildCacheDir?: string; deskEnv?: DeskEnvEntry[]; deskEnvByRepo?: Record<string, DeskEnvEntry[]>; deskEnvByAgent?: Record<string, DeskEnvEntry[]> };
+      const cc = c as BreakerCfgView & SlackConfig & { notifications?: boolean; webSearchEnabled?: boolean; nativeBashEnabled?: boolean; sddpMode?: boolean; godWorkspace?: string; buildCacheDir?: string; deskEnv?: DeskEnvEntry[]; deskEnvByRepo?: Record<string, DeskEnvEntry[]>; deskEnvByAgent?: Record<string, DeskEnvEntry[]>; runtimeEnv?: DeskEnvEntry[]; secretNames?: string[] };
       setNotifications(cc.notifications === true);
       setWebSearchEnabled(cc.webSearchEnabled === true);
       setNativeBashEnabled(cc.nativeBashEnabled === true);
@@ -493,6 +537,8 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
       setDeskEnv(cc.deskEnv ?? DEFAULT_DESK_ENV);
       setDeskEnvByRepo(cc.deskEnvByRepo ?? {});
       setDeskEnvByAgent(cc.deskEnvByAgent ?? {});
+      setRuntimeEnv(cc.runtimeEnv ?? []);
+      if (cc.secretNames) setSecretVaultNames(cc.secretNames);
       setAgentBudget(cc.costCapTokens != null ? String(cc.costCapTokens) : '');
       setVelocityCeiling(cc.circuitBreaker?.tokenVelocityPerMin != null ? String(cc.circuitBreaker.tokenVelocityPerMin) : '');
       setSlackEnabled(cc.slackEnabled ?? false);
@@ -505,6 +551,7 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
       setFleetDefault(dm.length ? dm : undefined);
     }).catch(() => { /* keep prop-seeded values */ });
     window.cth.credentials.presence().then((p) => { if (alive) setKeyPresence(p); }).catch(() => { /* none */ });
+    window.cth.secrets.list().then((n) => { if (alive) setSecretVaultNames(n); }).catch(() => { /* none */ });
     return () => { alive = false; };
   }, []);
 
@@ -770,6 +817,33 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
               </div>
               <div style={subLabelStyle}>One parent folder for every desk's build output (a Rust <code>target/</code>, …) — kept out of the worktrees and the repo. Per-worktree subfolders are created automatically; exclude this single folder from antivirus.</div>
 
+              {/* Secret vault — named masked values, encrypted at rest, referenced via ${secret:NAME}.
+                  Values never leave main (renderer learns names only); mirrors the provider-key flow. */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                <span style={{ width: 140, flexShrink: 0, color: 'var(--cth-ink-500)', fontSize: 14 }}>Secrets</span>
+                <span style={{ flex: 1, fontSize: 13, color: 'var(--cth-ink-500)' }}>
+                  {secretVaultNames.length === 0 ? 'none' : `${secretVaultNames.length} secret${secretVaultNames.length === 1 ? '' : 's'}`}
+                </span>
+              </div>
+              <div style={subLabelStyle}>Named secrets, encrypted at rest (<code>safeStorage</code>) — values never leave the main process. Reference anywhere with <code>${'{'}secret:NAME{'}'}</code>.</div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6, paddingLeft: 152 }}>
+                {secretVaultNames.map((n) => (
+                  <div key={n} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 }}>
+                    <span style={{ flex: 1, fontFamily: 'var(--cth-font-mono, monospace)', color: 'var(--cth-ink-900)' }}>{n}</span>
+                    <span style={{ fontSize: 11, color: 'var(--cth-ink-500)' }}>•••• set</span>
+                    <PixelButton variant="ghost" size="sm" onClick={() => void removeSecret(n)}><Icon name="x" /></PixelButton>
+                  </div>
+                ))}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <input value={secretDraftName} placeholder="NAME" onChange={(e) => setSecretDraftName(e.target.value)}
+                    style={{ ...slackInputStyle, width: 170, fontFamily: 'var(--cth-font-mono, monospace)' }} />
+                  <input type="password" value={secretDraftValue} placeholder="value (hidden)" onChange={(e) => setSecretDraftValue(e.target.value)}
+                    style={{ ...slackInputStyle, flex: 1, fontFamily: 'var(--cth-font-mono, monospace)' }} />
+                  <PixelButton variant="secondary" size="sm" onClick={() => void saveSecret()} disabled={!secretDraftName.trim() || !secretDraftValue}>set</PixelButton>
+                </div>
+                {secretNote && <div style={{ fontSize: 11, color: 'var(--cth-ink-500)' }}>{secretNote}</div>}
+              </div>
+
               {/* Desk-env table (GLOBAL) — token-templated env vars injected into every desk. */}
               <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
                 <span style={{ width: 140, flexShrink: 0, color: 'var(--cth-ink-500)', fontSize: 14 }}>Desk env</span>
@@ -779,7 +853,7 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
                 <PixelButton variant="secondary" size="sm" onClick={() => void resetDeskEnv()}>reset</PixelButton>
               </div>
               <div style={subLabelStyle}>Any env var, injected into each desk (merged over its env) — not just build dirs. Tokens: {DESK_ENV_TOKENS.map((t) => `\${${t}}`).join(', ')}, and <code>${'{'}env:NAME{'}'}</code> for an existing var (e.g. <code>PATH=/extra:${'{'}env:PATH{'}'}</code>). Values under the build cache show “· created”.</div>
-              <DeskEnvRows entries={deskEnv} sample={deskEnvSample} buildRoot={buildRootDisplay} onEdit={editDeskEnvAt} onCommit={commitDeskEnv} onAdd={addDeskEnvRow} onRemove={removeDeskEnvRow} />
+              <DeskEnvRows entries={deskEnv} sample={deskEnvSample} buildRoot={buildRootDisplay} secretNames={secretVaultNames} onEdit={editDeskEnvAt} onCommit={commitDeskEnv} onAdd={addDeskEnvRow} onRemove={removeDeskEnvRow} />
 
               {/* Per-repo env OVERRIDES — layered on top of the global table for a desk whose project
                   repo matches (same name wins). Edit one repo at a time. */}
@@ -798,7 +872,7 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
               </div>
               <div style={subLabelStyle}>Overrides/extends the global table for desks on the selected repo (same name wins). A “•” marks a repo that has overrides. (Repo-local build config can also live in the repo's own <code>.cargo/config.toml</code> / <code>.env</code>.)</div>
               {projectRepos.length > 0 && selectedRepo !== '' && (
-                <DeskEnvRows entries={repoEntries} sample={deskEnvSample} buildRoot={buildRootDisplay} onEdit={editRepoAt} onCommit={commitRepoMap} onAdd={addRepoRow} onRemove={removeRepoRow} />
+                <DeskEnvRows entries={repoEntries} sample={deskEnvSample} buildRoot={buildRootDisplay} secretNames={secretVaultNames} onEdit={editRepoAt} onCommit={commitRepoMap} onAdd={addRepoRow} onRemove={removeRepoRow} />
               )}
 
               {/* Per-agent env OVERRIDES — layered on top of global + per-repo for the selected desk
@@ -818,8 +892,16 @@ export function SettingsModal({ config, onClose }: SettingsModalProps) {
               </div>
               <div style={subLabelStyle}>Overrides/extends global + per-repo for the selected desk (same name wins). A “•” marks a desk that has overrides.</div>
               {deskChoices.length > 0 && selectedAgent !== '' && (
-                <DeskEnvRows entries={agentEntries} sample={deskEnvSample} buildRoot={buildRootDisplay} onEdit={editAgentAt} onCommit={commitAgentMap} onAdd={addAgentRow} onRemove={removeAgentRow} />
+                <DeskEnvRows entries={agentEntries} sample={deskEnvSample} buildRoot={buildRootDisplay} secretNames={secretVaultNames} onEdit={editAgentAt} onCommit={commitAgentMap} onAdd={addAgentRow} onRemove={removeAgentRow} />
               )}
+
+              {/* Runtime env (GLOBAL) — proxy / custom CA for the agent's OWN model + network calls. */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                <span style={{ width: 140, flexShrink: 0, color: 'var(--cth-ink-500)', fontSize: 14 }}>Runtime env</span>
+                <span style={{ flex: 1, fontSize: 13, color: 'var(--cth-ink-500)' }}>{runtimeEnv.length} var{runtimeEnv.length === 1 ? '' : 's'}</span>
+              </div>
+              <div style={subLabelStyle}>For the agent's OWN model + network calls (proxy, custom CA) — injected into the worker, the Claude CLI, and bash. Common: <code>HTTPS_PROXY</code>, <code>NO_PROXY</code>, <code>NODE_EXTRA_CA_CERTS</code>. Use <code>${'{'}secret:NAME{'}'}</code> for credentials. (Distinct from Desk env, which is for what desks run.)</div>
+              <DeskEnvRows entries={runtimeEnv} sample={deskEnvSample} buildRoot={buildRootDisplay} tokenChips={['env:', 'secret:']} showCreated={false} secretNames={secretVaultNames} onEdit={editRuntimeAt} onCommit={commitRuntimeEnv} onAdd={addRuntimeRow} onRemove={removeRuntimeRow} />
 
               {/* Worktrees diagnostics — per repo, per worktree: branch, health flags, and recovery
                   actions (reset base to trunk, delete). */}
