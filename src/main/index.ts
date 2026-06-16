@@ -1020,6 +1020,23 @@ const sddpPipeline = new SddpPipeline({
     try { mkdirSync(dirname(p), { recursive: true }); writeFileSync(p, content, 'utf8'); }
     catch (e) { console.error('[sddp-pipeline] writeFeatureArtifact failed:', e); }
   },
+  // CHECKLIST GATE (P2): mechanical completion across specs/<feature>/checklists/*.md (`- [ ]` vs
+  // `- [X]`). total === 0 ⇒ no checklists ⇒ the gate is N/A.
+  checklistStatus: (repo, feature) => {
+    const dir = featureFilePath(repo, feature, 'checklists');
+    if (!dir || !existsSync(dir)) return { total: 0, checked: 0 };
+    let total = 0, checked = 0;
+    try {
+      for (const f of readdirSync(dir)) {
+        if (!f.endsWith('.md')) continue;
+        for (const line of readFileSync(join(dir, f), 'utf8').split('\n')) {
+          if (/^\s*-\s*\[ \]/.test(line)) total++;
+          else if (/^\s*-\s*\[[xX]\]/.test(line)) { total++; checked++; }
+        }
+      }
+    } catch { /* best-effort — an unreadable checklist dir ⇒ what we counted so far */ }
+    return { total, checked };
+  },
   escalate: (feature, message) => {
     try { hive.send({ to: 'god', act: 'request', needs_human: true, subject: `SDDP pipeline — ${feature}`, body: message }, 'system'); }
     catch (e) { console.error('[sddp-pipeline] escalate failed:', e); }

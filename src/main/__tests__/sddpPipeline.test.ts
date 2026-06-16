@@ -26,7 +26,7 @@ function mkPipeline() {
   const seeds: string[] = [];                     // epic ids the engine asked to seed cards for
   const assigns: { cardId: string; deskId: string }[] = [];
   const artifactText = new Map<string, string>(); // `${feature}/${rel}` → text (analyze read/write)
-  const state = { enabled: true, ownerUsable: true, autopilot: false, seedCount: 2, plannerDesk: null as string | null, uncovered: [] as string[], policyVerdict: 'PASS' as 'PASS' | 'FAIL' };
+  const state = { enabled: true, ownerUsable: true, autopilot: false, seedCount: 2, plannerDesk: null as string | null, uncovered: [] as string[], policyVerdict: 'PASS' as 'PASS' | 'FAIL', checklist: { total: 0, checked: 0 } };
   let onSpawn: (name: string) => void = () => {}; // simulate what a sub-agent writes
   let gate: Promise<void> | null = null;          // optional latch to hold a spawn open (lock test)
 
@@ -47,6 +47,7 @@ function mkPipeline() {
     analyzeFeature: () => ({ uncovered: state.uncovered }),
     featureArtifactText: (_r, feature, rel) => artifactText.get(`${feature}/${rel}`) ?? null,
     writeFeatureArtifact: (_r, feature, rel, content) => { artifactText.set(`${feature}/${rel}`, content); artifacts.add(`${feature}/${rel}`); },
+    checklistStatus: () => state.checklist,
     findDeskForRole: (role) => (role === 'planner' ? state.plannerDesk : null),
     assignCard: (cardId, deskId) => { assigns.push({ cardId, deskId }); },
     advanceMilestone: (epicId, key) => {
@@ -402,5 +403,64 @@ describe('SddpPipeline — Analyze (host-driven, multi-agent + CRITICAL gate)', 
     expect(h.spawns).toHaveLength(0);                                   // no re-spawn
     expect(milestone(h.getTasks()[0], 'analyze').status).toBe('active'); // held on its critical:2
     expect(h.escalations).toHaveLength(1);
+  });
+});
+
+describe('SddpPipeline — Checklist-completion gate (before Implement)', () => {
+  it('no checklists ⇒ N/A: seeds implement cards, never runs test-evaluator', async () => {
+    const h = mkPipeline();
+    h.state.checklist = { total: 0, checked: 0 };
+    h.setTasks([epicWith('implement')]);
+
+    await h.pipeline.advanceFeature('S:/repo', '00001');
+
+    expect(h.spawns).toHaveLength(0);
+    expect(h.seeds).toContain('epic-1');
+  });
+
+  it('an incomplete checklist HOLDS Implement (auto-resolves once, then escalates — no seed)', async () => {
+    const h = mkPipeline();
+    h.state.checklist = { total: 3, checked: 1 };                       // test-evaluator won't fix it here
+    h.setTasks([epicWith('implement')]);
+
+    await h.pipeline.advanceFeature('S:/repo', '00001');
+
+    expect(h.spawns.map((s) => s.name)).toContain('test-evaluator');    // one auto-resolve attempt
+    expect(h.seeds).toHaveLength(0);                                    // did NOT seed
+    expect(h.escalations).toHaveLength(1);
+  });
+
+  it('proceeds when test-evaluator completes the checklist', async () => {
+    const h = mkPipeline();
+    h.state.checklist = { total: 3, checked: 1 };
+    h.setOnSpawn((name) => { if (name === 'test-evaluator') h.state.checklist.checked = 3; });
+    h.setTasks([epicWith('implement')]);
+
+    await h.pipeline.advanceFeature('S:/repo', '00001');
+
+    expect(h.seeds).toContain('epic-1');
+    expect(h.escalations).toHaveLength(0);
+  });
+
+  it('autopilot proceeds despite an incomplete checklist', async () => {
+    const h = mkPipeline();
+    h.state.autopilot = true; h.state.checklist = { total: 3, checked: 1 };
+    h.setTasks([epicWith('implement')]);
+
+    await h.pipeline.advanceFeature('S:/repo', '00001');
+
+    expect(h.seeds).toContain('epic-1');
+    expect(h.escalations).toHaveLength(0);
+  });
+
+  it('a complete checklist proceeds without running test-evaluator', async () => {
+    const h = mkPipeline();
+    h.state.checklist = { total: 2, checked: 2 };
+    h.setTasks([epicWith('implement')]);
+
+    await h.pipeline.advanceFeature('S:/repo', '00001');
+
+    expect(h.spawns.map((s) => s.name)).not.toContain('test-evaluator');
+    expect(h.seeds).toContain('epic-1');
   });
 });

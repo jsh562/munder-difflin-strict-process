@@ -67,6 +67,9 @@ export interface SddpPipelineDeps {
   /** Write a `specs/<feature>/` text artifact (the engine authors `analysis-report.md` from the
    *  mechanical findings + the validators' output). */
   writeFeatureArtifact?(repo: string | null, feature: string, relPath: string, content: string): void;
+  /** Checklist completion (mechanical): `{ total, checked }` across `specs/<feature>/checklists/*.md`
+   *  (`- [ ]` vs `- [X]`). `total === 0` ⇒ no checklists ⇒ the gate is N/A. (P2 checklist gate.) */
+  checklistStatus?(repo: string | null, feature: string): { total: number; checked: number };
   /** Optional diagnostic log. */
   log?(message: string): void;
   /** Debounce window for `schedule` (ms); default 1500. */
@@ -203,7 +206,7 @@ export class SddpPipeline {
       if (milestoneDriver(active) !== 'host' || !active.subAgent) {
         // DESK/DISTRIBUTED step (implement/qc): the engine FEEDS (seeds implement cards) + TRACKS
         // (advances the pill when the distributed flow's marker lands) — it does not run the work.
-        this.trackDistributed(epic, active, r);
+        await this.trackDistributed(epic, active, r);
         return;
       }
 
@@ -370,11 +373,16 @@ export class SddpPipeline {
    *  the qc desk / the integrator do (the existing notifier flow). It (1) seeds the implement cards
    *  from tasks.md once, so the work exists deterministically, and (2) advances the milestone pill
    *  when the distributed flow's real marker (`.completed` / `.qc-passed`) appears. */
-  private trackDistributed(epic: HiveTask, active: FeatureMilestone, repo: string | null): void {
+  private async trackDistributed(epic: HiveTask, active: FeatureMilestone, repo: string | null): Promise<void> {
     const feature = epic.feature!;
     const markerPresent = !!active.gateArtifact && this.deps.featureArtifactExists(repo, feature, active.gateArtifact);
 
     if (active.key === 'implement' && !markerPresent) {
+      // CHECKLIST-COMPLETION GATE (sddp27 / AGENTS.md): if checklists/ exists, all items must be
+      // checked before Implement. Mechanical scan in code; one auto-resolve pass via test-evaluator;
+      // then block (unless autopilot) until complete. No checklists ⇒ N/A.
+      if (!(await this.checklistGate(epic, repo))) return; // held — don't seed/implement yet
+
       const hasCards = this.deps.listTasks().some(
         (t) => t.feature === feature && t.id !== epic.id && !(t.milestones && t.milestones.length)
       );
@@ -392,6 +400,37 @@ export class SddpPipeline {
     } else {
       this.setStatus(feature, active.key, 'waiting', active.key === 'implement' ? 'workers implementing' : 'awaiting QC');
     }
+  }
+
+  /** CHECKLIST-COMPLETION GATE before Implement. Returns true to PROCEED (no checklists, already
+   *  complete, or autopilot), false to HOLD. Runs `test-evaluator` ONCE to auto-check satisfied items,
+   *  re-scans, then blocks + escalates if still incomplete (the operator resolves the items, then a
+   *  re-trigger passes). Mechanical scan in code (`checklistStatus`); the LLM only auto-resolves. */
+  private async checklistGate(epic: HiveTask, repo: string | null): Promise<boolean> {
+    const feature = epic.feature!;
+    const status = this.deps.checklistStatus?.(repo, feature);
+    if (!status || status.total === 0 || status.checked >= status.total) return true; // N/A or complete
+
+    // One auto-resolve pass via test-evaluator (deduped per feature), then re-scan.
+    const evalKey = `${feature}::checklist-eval`;
+    if (!this.asked.has(evalKey)) {
+      const owner = this.resolveOwner(epic, feature, 'implement');
+      if (owner) {
+        this.asked.add(evalKey);
+        this.setStatus(feature, 'implement', 'running', 'evaluating checklist');
+        await this.deps.spawnSubAgent(owner, 'test-evaluator',
+          `Feature folder specs/${feature}/. Evaluate each checklist item in specs/${feature}/checklists/ against spec.md/plan.md/tasks.md + the code; mark items that are genuinely satisfied as [X] (never revert [X]→[ ]). Leave unmet items unchecked.`);
+        const re = this.deps.checklistStatus?.(repo, feature);
+        if (re && re.checked >= re.total) return true; // auto-resolve completed it
+      }
+    }
+
+    const cur = this.deps.checklistStatus?.(repo, feature) ?? status;
+    if (cur.checked >= cur.total) return true;
+    if (this.deps.autopilot()) return true; // autopilot proceeds despite an incomplete checklist (logged)
+    this.setStatus(feature, 'implement', 'blocked', `checklist ${cur.checked}/${cur.total} complete`);
+    this.escalateOnce(feature, `SDDP: checklist not complete (${cur.checked}/${cur.total}) for '${feature}' — resolve the items in specs/${feature}/checklists/ before Implement (or enable autopilot, or set Implement to manual).`);
+    return false;
   }
 
   private escalateOnce(feature: string, message: string): void {
