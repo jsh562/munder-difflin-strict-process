@@ -18,37 +18,46 @@ Deterministic, free, repeatable.
   engine branch (happy → integrate, merge-conflict, the bug loop with `[RECURRING]`, analyze-CRITICAL,
   optional-skip, clarify autopilot-OFF, the control paused/manual/stopped + idempotent + in-flight-lock
   paths).
-- **`src/main/__tests__/sddpFullStack.test.ts`** (12 cases) — the FULL composed stack with **only the
+- **`src/main/__tests__/sddpFullStack.test.ts`** (16 cases) — the FULL composed stack with **only the
   provider faked**: engine → `makeSpawnSubAgent` (deny-list + cwd-override) → `runOneShotSubAgent` →
   `NativeAgentWorker` → the **real `runAgentLoop`** → the **real toolkit** (`executeAgentTool`) → real
-  fs/git. Each specialist READS before it authors, so the real read/write/edit/bash/grep/hive/web/memory
-  paths run composed; the QC sub-agents' bash + write run cwd-OVERRIDDEN into the merged worktree; a
-  genuine tool failure is fed back and the loop recovers; one case drives the **real DeepSeek adapter**
-  over a mocked SSE stream (request-build + SSE parse composed, only the socket faked); one case runs the
-  integrator's **real `hive_integrate` git merge** into trunk.
+  fs/git. Each specialist READS before it authors; the QC sub-agents' bash + write run cwd-OVERRIDDEN
+  into the merged worktree; genuine tool failures are fed back and the loop recovers; the **real
+  DeepSeek + Minimax adapters** are each driven over a mocked SSE stream (request-build + SSE parse +
+  reasoning composed, only the socket faked); a single turn returning **multiple tool calls** runs them
+  all; **every one of the 20 registered sub-agents** is spawned and its write is allowed/denied per its
+  role; the integrator's **real `hive_integrate` git merge** lands on trunk; and a **persistent desk**
+  runs two turns through the real loop with a `block:true` drain continuation + cross-turn memory.
 
-**Together they cover:** engine orchestration, real git worktree merge + integrate, fs gating,
-`analyzeCoverage`, the checklist gate, the QC FAIL/bug-loop path, the real agentic loop (turn/hop caps +
-usage rollup), the deny-list, the cwd-override, the toolkit read/write/bash/grep/hive/web paths, the
-DeepSeek adapter wire-level, and tool-failure recovery.
+### Coverage matrix — what the automated suites actually exercise
 
-### What no automated test can cover (the ceiling)
+| Layer / behavior | Status | Where / why |
+|---|---|---|
+| Engine lifecycle + every branch (clarify/analyze/optional/conflict/recurring/control) | **COVERED-COMPOSED** | both suites |
+| Real git worktree (`prepareQcTree`) + merge + integrator `hive_integrate` merge to trunk | **COVERED-COMPOSED** | E2E + full-stack #12 |
+| One-shot sub-agent loop (`runOneShotSubAgent` → `runAgentLoop`) | **COVERED-COMPOSED** | full-stack |
+| Persistent desk loop: multi-turn + `block:true` drain continuation + cross-turn memory | **COVERED-COMPOSED** | full-stack #16 |
+| Real toolkit: read_file / list_dir / grep / write_file / edit_file / bash / hive_* / write_memory / web_search | **COVERED-COMPOSED** | full-stack |
+| cwd-override (QC sub-agents act in the merged tree) + specs/ redirect | **COVERED-COMPOSED** | full-stack #1 |
+| Deny-list + role gating for **all 20** registered sub-agents | **COVERED-COMPOSED** | full-stack #15 |
+| Tool-execution failure → fed back → loop recovers (not a deny refusal) | **COVERED-COMPOSED** | full-stack #10 |
+| Multiple tool-uses in one provider turn | **COVERED-COMPOSED** | full-stack #13 |
+| DeepSeek adapter wire-level (request build, SSE parse, reasoning→thinking) | **COVERED-COMPOSED** | full-stack #11 |
+| Minimax adapter wire-level (Anthropic-style SSE, tool_use assembly) | **COVERED-COMPOSED** | full-stack #14 |
+| Provider retry/circuit-breaker + capability-gate internals | UNIT-ONLY | `reliability`/`capabilityGate`/adapter tests |
+| deskEnv / secrets-vault / proxy env assembly | UNIT-ONLY | `index.ts` builds the spawn env (electron-coupled); see deskEnv/secrets unit tests |
+| Per-sub-agent telemetry breakdown | UNIT-ONLY | composed test asserts the rollup fires; `telemetryNormalize`/`costVectors` test the accounting |
+| **The native worker process** (`agentWorker.ts` utilityProcess) + `NativeRuntime.spawn()` lifecycle | **SANDBOX-ONLY** | electron-coupled (`process.parentPort`; `spawn` hardcodes the electron transport) — vitest can't fork a utilityProcess, so the composed tests run the loop in-process |
+| **God creates the epic + worker→reviewer→integrator ping choreography** | **SANDBOX-ONLY** | both suites hand-seed the epic; the notifier dance needs live desks |
+| **Whether the prompts elicit correct behavior** | **SANDBOX-ONLY** | the stub ignores each sub-agent's `systemPrompt` — only a live model tests prompt efficacy. The irreducible one. |
 
-Three things are deliberately out of the automated suites' reach — exercise them in the live sandbox
-(section 2). They are the boundary, not coverage holes:
+### The ceiling (SANDBOX-ONLY) — exercise these in section 2
 
-- **The native worker process (electron).** `src/main/runtime/worker/agentWorker.ts` is coupled to the
-  electron `utilityProcess` IPC seam (`process.parentPort`), and is the only place that selects the real
-  provider from the spawn env (`selectAdapter(process.env)`). vitest can't provide a utilityProcess, so
-  the composed test runs the loop **in-process** instead — the real child-process + its IPC round-trip
-  (tool calls / drain) are sandbox-only.
-- **The god creating the epic + the worker→reviewer→integrator choreography.** Both suites hand-seed the
-  feature EPIC card. The god (Michael) decomposing a request and calling `hive_add_task {epic:true}`, and
-  the notifier pinging a reviewer/integrator as cards move `doing → review → integrate → done`, need live
-  desks on the real hive — they aren't driven by either test.
-- **Whether the prompts actually work.** The scripted/stub provider IGNORES each sub-agent's
-  `systemPrompt` and replays canned turns. So nothing automated verifies that a specialist's prompt
-  *elicits* the right tool use from a real model — only a live model does. This is the irreducible one.
+The three SANDBOX-ONLY rows above are the irreducible boundary, not coverage holes: the **electron
+worker + `NativeRuntime` lifecycle** (real child process + IPC), the **god/notifier orchestration**
+(live desks moving cards `doing → review → integrate → done`), and **prompt efficacy** (does a
+specialist's prompt actually make a real model do the right thing). No vitest test can close these —
+run the live disposable sandbox below.
 
 ## 2. Live disposable sandbox (real DeepSeek desk, throwaway state)
 

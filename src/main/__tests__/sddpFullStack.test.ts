@@ -33,11 +33,12 @@ import { prepareQcTree as gitPrepareQcTree, repoTrunk, mergeBranch } from '../gi
 import { makeSpawnSubAgent } from '../runtime/subAgentExecutor';
 import {
   executeAgentTool, runAgentLoop, AGENT_TOOL_CATALOG, defaultMilestones, advanceMilestones,
-  analyzeCoverage, agentTaskBranch, buildBugTitles, bugSignature, makeDeepseekAdapter,
+  analyzeCoverage, agentTaskBranch, buildBugTitles, bugSignature, makeDeepseekAdapter, makeMinimaxAdapter,
+  SUB_AGENT_NAMES, subAgentSpec, roleAuthorsCode,
   type AgentToolDeps, type HiveTask, type HiveMessage, type FeatureStatus,
   type ProviderCall, type ProviderTurn, type ToolResult, type ByteStream, type FetchLike, type FetchResponseLike
 } from '@jsh562/won-agent-core';
-import type { WorkerTransport } from '../runtime/nativeAgentWorker';
+import { NativeAgentWorker, type WorkerTransport } from '../runtime/nativeAgentWorker';
 import type { WorkerCommand, WorkerMessage } from '../../shared/workerProtocol';
 import type { AgentEvent } from '../../shared/agentEvent';
 
@@ -70,6 +71,8 @@ function streamOf(chunks: string[]): ByteStream {
 }
 /** One SSE `data:` line carrying a JSON chunk (DeepSeek/OpenAI streaming shape). */
 function sse(obj: unknown): string { return `data: ${JSON.stringify(obj)}\n\n`; }
+/** One Anthropic-style SSE event (Minimax shape): an `event:` header + a `data:` JSON with `type`. */
+function sseMx(event: string, obj: Record<string, unknown> = {}): string { return `event: ${event}\ndata: ${JSON.stringify({ type: event, ...obj })}\n\n`; }
 /** A 200 streaming response wrapping a fabricated SSE body. */
 function okResponse(body: ByteStream): FetchResponseLike {
   return { ok: true, status: 200, body, headers: { get: () => null }, text: async () => '' };
@@ -88,11 +91,12 @@ function mockFetch(responses: FetchResponseLike[]): { fetch: FetchLike; requests
  * sub-agent turn. It bridges the worker protocol to the loop: the loop's `executeTool` emits a
  * `toolRequest` message (which `NativeAgentWorker` routes back through the deny-list + real toolkit)
  * and resolves when the matching `toolResult` command arrives; the loop's `emit` becomes `event`
- * messages. `requestDrain` answers `block:false` directly (one-shot — the runner kills on `stop`
- * before a protocol drain could round-trip; the drain-message path stays covered by stopDrain.test.ts).
+ * messages. `requestDrain` answers `block:false` by default (one-shot — the runner kills on `stop`
+ * before a protocol drain could round-trip); a `drain` override drives multi-turn autonomy for the
+ * persistent-desk case (a `block:true` reply makes the loop run another turn).
  */
-function realLoopTransport(opts: { name: string; env: Record<string, string>; providerCall: ProviderCall; toolLog: ToolLogEntry[]; eventLog: AgentEvent[] }): WorkerTransport {
-  const { name, env, providerCall, toolLog, eventLog } = opts;
+function realLoopTransport(opts: { name: string; env: Record<string, string>; providerCall: ProviderCall; toolLog: ToolLogEntry[]; eventLog: AgentEvent[]; drain?: () => Promise<{ block: boolean; reason?: string }> }): WorkerTransport {
+  const { name, env, providerCall, toolLog, eventLog, drain } = opts;
   let msgCb: ((m: WorkerMessage) => void) | null = null;
   let exitCb: ((c: number) => void) | null = null;
   let callSeq = 0;
@@ -111,7 +115,7 @@ function realLoopTransport(opts: { name: string; env: Record<string, string>; pr
             emit({ type: 'toolRequest', callId: ++callSeq, toolCallId: use.toolCallId, toolName: use.toolName, toolInput: use.toolInput });
           }),
           emit: (event) => { eventLog.push(event); emit({ type: 'event', event }); },
-          requestDrain: async () => ({ block: false }),
+          requestDrain: drain ?? (async () => ({ block: false })),
           caps: { maxTurns: Number(env.NATIVE_AGENT_MAX_TURNS) || 2, maxHops: Number(env.NATIVE_AGENT_MAX_HOPS) || 12 },
           systemPrompt: env.NATIVE_AGENT_SUBAGENT_PROMPT,
           tools: [...AGENT_TOOL_CATALOG]
@@ -551,9 +555,10 @@ describe('SDDP engine — full-stack composition (real runner + real loop + real
     expect(existsSync(join(h.repo, 'escape.txt'))).toBe(false); // the sandbox escape never wrote
   });
 
-  it('11. the REAL DeepSeek adapter at the wire level, composed: a mocked SSE stream drives a real tool call through loop → toolkit → fs', async () => {
-    // Round 1: the model returns a write_file tool call. Round 2: a final text + stop.
+  it('11. the REAL DeepSeek adapter at the wire level, composed: a mocked SSE stream (incl. reasoning) drives a real tool call through loop → toolkit → fs', async () => {
+    // Round 1: reasoning_content (→ thinking) then a write_file tool call. Round 2: a final text + stop.
     const round1 = okResponse(streamOf([
+      sse({ choices: [{ index: 0, delta: { reasoning_content: 'I will draft the spec first.' } }] }),
       sse({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'tc1', type: 'function', function: { name: 'write_file', arguments: JSON.stringify({ path: 'specs/00001/spec.md', content: '# Spec\nFR-001: a\n' }) } }] } }] }),
       sse({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }),
       sse({ choices: [], usage: { prompt_tokens: 30, completion_tokens: 12 } }),
@@ -582,6 +587,8 @@ describe('SDDP engine — full-stack composition (real runner + real loop + real
     // The adapter parsed the SSE tool call and the loop executed it through the REAL toolkit → fs.
     expect(h.toolLog.some((e) => e.toolName === 'write_file' && e.success)).toBe(true);
     expect(h.read('00001', 'spec.md')).toMatch(/FR-001/);
+    // The adapter's reasoning_content surfaced as thinking events (forwarded through the loop's emit).
+    expect(h.eventLog.some((e) => e.kind === 'thinking-delta' || e.kind === 'thinking-start')).toBe(true);
   });
 
   it('12. integrator real merge: hive_integrate runs a real git merge into trunk after .qc-passed; a non-integrator is refused', async () => {
@@ -609,5 +616,134 @@ describe('SDDP engine — full-stack composition (real runner + real loop + real
     const denied = await executeAgentTool(nonIntegrator, 'worker', { toolName: 'hive_integrate', toolInput: { repo: h.repo, branch: branches[0], apply: true } });
     expect(denied.success).toBe(false);
     expect(denied.content).toMatch(/do not hold the integrator role/);
+  });
+
+  it('13. multiple tool-uses in ONE provider turn: the loop executes every tool the model parallelized, in sequence', async () => {
+    const h = setupFullStack();
+    // One turn returning TWO toolUses (a real model can parallelize) — the loop runs both before the next round.
+    h.setTurns('plan-author', [
+      { toolUses: [
+        { toolName: 'write_file', toolInput: { path: 'specs/00001/plan.md', content: '# Plan\n' }, toolCallId: 'm-1' },
+        { toolName: 'write_file', toolInput: { path: 'specs/00001/notes.md', content: '# Notes\n' }, toolCallId: 'm-2' }
+      ], usage: USAGE, endOfTurn: false },
+      { text: 'two files written', toolUses: [], usage: USAGE, endOfTurn: true }
+    ]);
+
+    const res = await h.spawn('owner', 'plan-author', 'go');
+    expect(res.success).toBe(true);
+    const writes = h.toolLog.filter((e) => e.agent === 'plan-author' && e.toolName === 'write_file' && e.success);
+    expect(writes).toHaveLength(2); // BOTH tools from the single turn executed via the real toolkit
+    expect(h.read('00001', 'plan.md')).toMatch(/# Plan/);
+    expect(h.read('00001', 'notes.md')).toMatch(/# Notes/);
+  });
+
+  it('14. the REAL Minimax adapter at the wire level, composed: an Anthropic-style SSE stream drives a real tool call through loop → toolkit → fs', async () => {
+    // Round 1: a write_file tool_use (assembled from input_json_delta fragments). Round 2: final text.
+    const round1 = okResponse(streamOf([
+      sseMx('message_start', { message: { usage: { input_tokens: 15, output_tokens: 1 } } }),
+      sseMx('content_block_start', { index: 0, content_block: { type: 'tool_use', id: 'toolu_w', name: 'write_file' } }),
+      sseMx('content_block_delta', { index: 0, delta: { type: 'input_json_delta', partial_json: '{"path":"specs/00001/spec.md","content":' } }),
+      sseMx('content_block_delta', { index: 0, delta: { type: 'input_json_delta', partial_json: '"# Spec\\nFR-001: a\\n"}' } }),
+      sseMx('content_block_stop', { index: 0 }),
+      sseMx('message_delta', { delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 6 } }),
+      sseMx('message_stop')
+    ]));
+    const round2 = okResponse(streamOf([
+      sseMx('message_start', { message: { usage: { input_tokens: 25, output_tokens: 1 } } }),
+      sseMx('content_block_start', { index: 0, content_block: { type: 'text', text: '' } }),
+      sseMx('content_block_delta', { index: 0, delta: { type: 'text_delta', text: 'spec drafted' } }),
+      sseMx('content_block_stop', { index: 0 }),
+      sseMx('message_delta', { delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 3 } }),
+      sseMx('message_stop')
+    ]));
+    const { fetch, requests } = mockFetch([round1, round2]);
+    const h = setupFullStack({
+      providerFor: (name) => name === 'spec-author'
+        ? makeMinimaxAdapter({ fetch, apiKey: 'mx-test-secret', endpoint: 'https://api.minimax.io/v1', model: 'minimax-m2' })
+        : null
+    });
+
+    const res = await h.spawn('owner', 'spec-author', 'draft the spec');
+    expect(res.success).toBe(true);
+    expect(requests.length).toBeGreaterThanOrEqual(1); // the REAL Minimax adapter hit the (mocked) wire
+    expect(h.toolLog.some((e) => e.toolName === 'write_file' && e.success)).toBe(true);
+    expect(h.read('00001', 'spec.md')).toMatch(/FR-001/);
+  });
+
+  it('15. EVERY registered sub-agent composes, and its write is allowed/denied by its role (deny-list gating over the whole registry)', async () => {
+    const h = setupFullStack();
+    for (const name of SUB_AGENT_NAMES) {
+      h.setTurns(name, [
+        { toolUses: [{ toolName: 'write_file', toolInput: { path: `specs/00001/probe-${name}.md`, content: 'x' }, toolCallId: `${name}-1` }], usage: USAGE, endOfTurn: false },
+        { text: 'ok', toolUses: [], usage: USAGE, endOfTurn: true }
+      ]);
+      const res = await h.spawn('owner', name, 'probe');
+      expect(res.success).toBe(true); // the spawn composes (loop runs to completion) for every registry entry
+    }
+    // The role → deny-list gate composes for ALL 20: an authoring role (worker/planner/qc) may write_file;
+    // a read-only role ([]) has it refused by the executor deny-list before the toolkit.
+    for (const name of SUB_AGENT_NAMES) {
+      const spec = subAgentSpec(name)!;
+      const entry = h.toolLog.find((e) => e.agent === name && e.toolName === 'write_file');
+      expect(entry, `write_file should have round-tripped for ${name}`).toBeTruthy();
+      if (roleAuthorsCode(spec.roles)) {
+        expect(entry!.success, `${name} (${spec.roles.join(',') || 'no roles'}) should be allowed to write`).toBe(true);
+      } else {
+        expect(entry!.success, `${name} (read-only) should be denied write`).toBe(false);
+        expect(entry!.content).toMatch(/a sub-agent may not call/);
+      }
+    }
+  });
+});
+
+describe('Native persistent desk — composed multi-turn loop (real loop + real toolkit, drain continuation)', () => {
+  it('16. a persistent desk runs TWO turns via the real loop with a block:true drain continuation; tools route to the real toolkit and memory carries across turns', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'sddp-desk-'));
+    roots.push(root);
+    const repo = join(root, 'repo');
+    mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['-c', 'init.defaultBranch=main', 'init'], { cwd: repo, stdio: 'pipe' });
+
+    // Real toolkit deps with a LIVE memory map, so write_memory in turn 1 is readable in turn 2.
+    const mem = new Map<string, string>();
+    const deps: AgentToolDeps = { ...baseDeps(repo), memory: (id) => mem.get(id) ?? '', appendMemory: (id, t) => mem.set(id, (mem.get(id) ?? '') + '\n' + t) };
+    const toolLog: ToolLogEntry[] = [];
+    const eventLog: AgentEvent[] = [];
+
+    // Turn 1: write_memory → end. Turn 2 (a drain continuation): hive_read_memory → end.
+    const provider = makeScriptedProvider([
+      { toolUses: [{ toolName: 'write_memory', toolInput: { text: 'fact-from-turn-1' }, toolCallId: 'd-1' }], usage: USAGE, endOfTurn: false },
+      { text: 'turn 1 done', toolUses: [], usage: USAGE, endOfTurn: true },
+      { toolUses: [{ toolName: 'hive_read_memory', toolInput: {}, toolCallId: 'd-2' }], usage: USAGE, endOfTurn: false },
+      { text: 'turn 2 done', toolUses: [], usage: USAGE, endOfTurn: true }
+    ]);
+    let drains = 0;
+    const drain = async () => (drains++ === 0 ? { block: true, reason: 'continue: process your inbox' } : { block: false });
+
+    // The PERSISTENT desk: a NativeAgentWorker (the same class one-shot uses) over the in-process
+    // real-loop transport, but driven across multiple turns rather than killed after one stop.
+    const worker = new NativeAgentWorker({
+      agentId: 'desk',
+      transportFactory: () => realLoopTransport({ name: 'desk', env: { NATIVE_AGENT_MAX_TURNS: '3' }, providerCall: provider, toolLog, eventLog, drain }),
+      onToolRequest: (id, req) => executeAgentTool(deps, id, req),
+      onDrainRequest: async () => ({ block: false })
+    });
+
+    const waitFor = async (pred: () => boolean, ms = 4000) => {
+      const start = Date.now();
+      while (!pred()) { if (Date.now() - start > ms) throw new Error('waitFor timed out'); await new Promise((r) => setTimeout(r, 5)); }
+    };
+
+    await worker.start();
+    worker.send({ kind: 'operator', text: 'go' });
+    await waitFor(() => eventLog.filter((e) => e.kind === 'turn-start').length >= 2 && eventLog.some((e) => e.kind === 'stop' && (e as { stopActive?: boolean }).stopActive === true));
+    worker.kill();
+
+    expect(eventLog.filter((e) => e.kind === 'turn-start').length).toBe(2); // real multi-turn loop ran (drain continuation)
+    expect(drains).toBe(1);                                                  // a drain-created turn does NOT re-drain
+    expect(toolLog.some((e) => e.toolName === 'write_memory' && e.success)).toBe(true);  // turn 1, via real toolkit
+    const readBack = toolLog.find((e) => e.toolName === 'hive_read_memory');             // turn 2, via real toolkit
+    expect(readBack?.success).toBe(true);
+    expect(readBack?.content).toMatch(/fact-from-turn-1/);                   // memory written in turn 1 is read in turn 2
   });
 });
