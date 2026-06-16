@@ -15,7 +15,8 @@ import {
   getBranch, getStatus, getLog, getBranches, getAheadBehind, isRepo,
   addWorktree, removeWorktree, listWorktrees, planWorktree, type GitWorktree,
   previewMerge, mergeBranch, agentBranchFor, agentBranchForId, branchCommitsAhead,
-  repoTrunk, worktreeHealth, resetBaseToTrunk, deleteMergedBranch
+  repoTrunk, worktreeHealth, resetBaseToTrunk, deleteMergedBranch,
+  prepareQcTree as gitPrepareQcTree, shortHash
 } from './git';
 import { HiveManager, roleCanEditCode, roleAuthorsCode, roleCanWriteFiles, canIntegrate as rolesCanIntegrate, canReview as rolesCanReview, boardCapabilityLine, type AgentMeta, type HiveMessage, type HiveTask, type AgentRole } from './hive';
 import { HookServer } from './hooks';
@@ -671,7 +672,7 @@ const agentToolDeps: AgentToolDeps = {
  * caller's provider+model, runs caller-scoped via `executeNativeToolFor(callerId)`, rolls the child's
  * token cost up to the caller. Never throws — returns `{ success:false }` on any guard/error.
  */
-async function spawnSubAgentFor(callerId: string, name: string, input: string, signal?: AbortSignal): Promise<{ content: string; success: boolean }> {
+async function spawnSubAgentFor(callerId: string, name: string, input: string, signal?: AbortSignal, cwdOverride?: string): Promise<{ content: string; success: boolean }> {
   const spec = subAgentSpec(name);
   if (!spec) return { content: `unknown sub-agent '${name}' (available: ${SUB_AGENT_NAMES.join(', ')})`, success: false };
   const providerId = agentProviderIds.get(callerId);
@@ -706,7 +707,7 @@ async function spawnSubAgentFor(callerId: string, name: string, input: string, s
     transportFactory: () => makeElectronWorkerTransport({ agentId: childId, maxOldSpaceMb: 512, env }),
     executeTool: async (req) => {
       if (denySet.has(req.toolName)) return { content: `a sub-agent may not call ${req.toolName}`, success: false };
-      return executeNativeToolFor(callerId, req);
+      return executeNativeToolFor(callerId, req, cwdOverride);
     },
     // Roll the child's token cost up to the caller (the sub-run is visible as the caller's
     // spawn_subagent tool call + result; we don't forward the raw child stream under a synthetic id).
@@ -810,7 +811,8 @@ const NATIVE_AGENT_WORKER_PROMPT = [
 // (caller-scoped cwd/repo/roles) — same governance, same single-committer.
 async function executeNativeToolFor(
   id: string,
-  req: { toolCallId: string; toolName: string; toolInput: unknown }
+  req: { toolCallId: string; toolName: string; toolInput: unknown },
+  cwdOverride?: string
 ): Promise<{ content: string; success: boolean }> {
   if (control.shouldHalt(id)) return { content: 'halted by operator', success: false };
   const decision = control.toolDecision(id, req.toolName);
@@ -818,7 +820,13 @@ async function executeNativeToolFor(
   // The attempt is recorded BEFORE execution, so a desk hammering an identical denied tool
   // still feeds the breaker's loop guard.
   breaker.recordToolUse(id, req.toolName, req.toolInput);
-  const result = await executeAgentTool(agentToolDeps, id, req);
+  // cwdOverride (host-driven QC): run the child's tools in the QC-integration worktree instead of the
+  // caller's own cwd — its filesystem/bash resolve there, and it's added as a read root. (specs/ still
+  // anchors to repoFor() so qc-report.md lands in the shared base specs/<feature>/.)
+  const deps = cwdOverride
+    ? { ...agentToolDeps, resolveCwd: () => cwdOverride, readRoots: (rid: string) => [cwdOverride, ...(agentToolDeps.readRoots?.(rid) ?? [])] }
+    : agentToolDeps;
+  const result = await executeAgentTool(deps, id, req);
   // Visibility (#edit-gate): make a read-only role denial observable in the main log, so
   // "is the god actually writing?" is a fact, not a guess.
   if (!result.success && (req.toolName === 'write_file' || req.toolName === 'edit_file' || req.toolName === 'bash')
@@ -919,6 +927,10 @@ function desksForRole(role: AgentRole): string[] {
   const agents = hive.registry().agents;
   return Object.values(agents).filter((a) => a.archived !== true && (a.roles ?? []).includes(role)).map((a) => a.id);
 }
+
+/** QC-integration worktree path → its origin repo (so `removeQcTree` can `git worktree remove` from
+ *  the repo, not the throwaway tree). Set by `prepareQcTree`, cleared by `removeQcTree`. */
+const qcTreeRepo = new Map<string, string>();
 
 /** Safe absolute path of a `specs/<feature>/<relPath>` artifact (sanitized feature segment + no dir
  *  traversal), or null. Shared by the engine's analyze read/write deps (mirrors featureArtifactExists). */
@@ -1036,6 +1048,34 @@ const sddpPipeline = new SddpPipeline({
       }
     } catch { /* best-effort — an unreadable checklist dir ⇒ what we counted so far */ }
     return { total, checked };
+  },
+  // HOST-DRIVEN QC (P4): build a QC-integration worktree (merge the feature's implement branches off
+  // trunk), run the QC sub-agents IN it, tear it down. `qcTreeRepo` maps tree path → origin repo so
+  // removeQcTree can run `git worktree remove` from the repo.
+  prepareQcTree: async (epic) => {
+    const repo = epic.project ?? (epic.assignee ? repoForId(epic.assignee) : null);
+    const feature = epic.feature;
+    if (!repo || !feature) return { ok: false, path: null, conflicts: [] };
+    const ledger = hive.tasks() as { tasks?: HiveTask[] } | undefined;
+    const branches = [...new Set((ledger?.tasks ?? [])
+      .filter((t) => t.feature === feature && t.id !== epic.id && t.branch)
+      .map((t) => t.branch!))];
+    const base = await repoTrunk(repo);
+    const root = join(readConfig().harnessHome ?? repo, 'qc-worktrees');
+    const path = join(root, `${feature.replace(/[\\/]/g, '_')}-${shortHash(normalizeRepoPath(repo))}`);
+    const res = await gitPrepareQcTree(repo, path, base, branches);
+    if (!res.ok) return { ok: false, path: null, conflicts: res.conflicts };
+    qcTreeRepo.set(path, repo);
+    return { ok: true, path, conflicts: res.conflicts };
+  },
+  removeQcTree: (path) => {
+    const repo = qcTreeRepo.get(path);
+    if (repo) { void removeWorktree(repo, path); qcTreeRepo.delete(path); }
+  },
+  spawnSubAgentInTree: (callerId, name, input, treePath, signal) => spawnSubAgentFor(callerId, name, input, signal, treePath),
+  sddpPolicy: () => {
+    const c = readConfig().sddpConfig ?? {};
+    return { qcStrictness: c.qcStrictness ?? 'standard', coverageTarget: c.coverageTarget, maxQcIterations: c.maxQcIterations ?? 10 };
   },
   escalate: (feature, message) => {
     try { hive.send({ to: 'god', act: 'request', needs_human: true, subject: `SDDP pipeline — ${feature}`, body: message }, 'system'); }

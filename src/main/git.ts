@@ -332,6 +332,31 @@ export async function deleteMergedBranch(repo: string, branch: string): Promise<
   return { ok: false, error: res.error };
 }
 
+/**
+ * Provision a throwaway QC-INTEGRATION worktree: a detached worktree at `base` (the trunk) into which
+ * each implement-card `branch` is merged, so the QC suite runs against the INTEGRATED result without
+ * touching trunk. This is what resolves the `.qc-passed`↔integrate deadlock (QC needs merged code; the
+ * merge can't happen on trunk until QC passes). Any stale tree at `wtPath` is removed first. A branch
+ * that conflicts is `merge --abort`ed and reported in `conflicts` (the caller routes it back to its
+ * author) — the rest still merge so QC can report on what it can. Best-effort; never throws.
+ */
+export async function prepareQcTree(
+  repo: string, wtPath: string, base: string, branches: string[]
+): Promise<{ ok: boolean; merged: string[]; conflicts: string[]; error?: string }> {
+  await removeWorktree(repo, wtPath); // drop any stale tree (best-effort)
+  const add = await runGit(repo, ['worktree', 'add', '--detach', wtPath, base]);
+  if (!add.ok) return { ok: false, merged: [], conflicts: [], error: add.error };
+  const merged: string[] = [];
+  const conflicts: string[] = [];
+  for (const br of branches) {
+    if (!br) continue;
+    const m = await runGit(wtPath, ['merge', '--no-ff', '--no-edit', br]);
+    if (m.ok) merged.push(br);
+    else { await runGit(wtPath, ['merge', '--abort']); conflicts.push(br); }
+  }
+  return { ok: true, merged, conflicts };
+}
+
 // ─── Worktree diagnostics + recovery (Settings → Worktrees) ──────────────────
 
 /** A health flag for a worktree row in the operator diagnostics. */

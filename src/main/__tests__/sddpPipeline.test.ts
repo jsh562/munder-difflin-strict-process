@@ -17,7 +17,7 @@ function epicWith(activeKey: string, assignee = 'dwight'): HiveTask {
   return { id: 'epic-1', title: 'Feature 00001', assignee, status: 'doing', dependsOn: [], project: 'S:/repo', feature: '00001', milestones, priority: 0, createdAt: '' };
 }
 
-function mkPipeline() {
+function mkPipeline(opts: { hostQc?: boolean } = {}) {
   let tasks: HiveTask[] = [];
   const artifacts = new Set<string>();           // `${feature}/${relPath}` present on "disk"
   const spawns: { caller: string; name: string; input: string; signal?: AbortSignal }[] = [];
@@ -25,8 +25,10 @@ function mkPipeline() {
   const asks: { feature: string; questions: string }[] = [];
   const seeds: string[] = [];                     // epic ids the engine asked to seed cards for
   const assigns: { cardId: string; deskId: string }[] = [];
+  const removedTrees: string[] = [];              // qc trees torn down
+  const bugSeeds: string[] = [];                  // qc-fail reports passed to seedBugCards
   const artifactText = new Map<string, string>(); // `${feature}/${rel}` → text (analyze read/write)
-  const state = { enabled: true, ownerUsable: true, autopilot: false, seedCount: 2, plannerDesk: null as string | null, uncovered: [] as string[], policyVerdict: 'PASS' as 'PASS' | 'FAIL', checklist: { total: 0, checked: 0 } };
+  const state = { enabled: true, ownerUsable: true, autopilot: false, seedCount: 2, plannerDesk: null as string | null, uncovered: [] as string[], policyVerdict: 'PASS' as 'PASS' | 'FAIL', checklist: { total: 0, checked: 0 }, qcConflicts: [] as string[], qcAuditorPass: true, storyPass: true, bugCount: 0 };
   let onSpawn: (name: string) => void = () => {}; // simulate what a sub-agent writes
   let gate: Promise<void> | null = null;          // optional latch to hold a spawn open (lock test)
 
@@ -67,9 +69,23 @@ function mkPipeline() {
     },
     debounceMs: 0
   };
+  // Host-driven QC deps are OPT-IN: present ⇒ qc routes to runQc; absent ⇒ qc feed-tracks (default).
+  if (opts.hostQc) {
+    deps.prepareQcTree = async () => ({ ok: state.qcConflicts.length === 0 ? true : true, path: 'S:/qc/00001', conflicts: state.qcConflicts });
+    deps.removeQcTree = (p) => { removedTrees.push(p); };
+    deps.spawnSubAgentInTree = async (caller, name, input, _tree, signal) => {
+      spawns.push({ caller, name, input, signal });
+      onSpawn(name);
+      const pass = name === 'qc-auditor' ? state.qcAuditorPass : name === 'story-verifier' ? state.storyPass : true;
+      return { content: `VERDICT: ${pass ? 'PASS' : 'FAIL'}`, success: true };
+    };
+    deps.sddpPolicy = () => ({ qcStrictness: 'standard', maxQcIterations: 10 });
+    deps.seedBugCards = (_epic, report) => { bugSeeds.push(report); return state.bugCount; };
+  }
+
   const pipeline = new SddpPipeline(deps);
   return {
-    pipeline, artifacts, spawns, escalations, asks, seeds, assigns, state, artifactText,
+    pipeline, artifacts, spawns, escalations, asks, seeds, assigns, state, artifactText, removedTrees, bugSeeds,
     setTasks: (t: HiveTask[]) => { tasks = t; },
     getTasks: () => tasks,
     setOnSpawn: (fn: (name: string) => void) => { onSpawn = fn; },
@@ -462,5 +478,68 @@ describe('SddpPipeline — Checklist-completion gate (before Implement)', () => 
 
     expect(h.spawns.map((s) => s.name)).not.toContain('test-evaluator');
     expect(h.seeds).toContain('epic-1');
+  });
+});
+
+describe('SddpPipeline — host-driven QC (worktree + qc-auditor/story-verifier)', () => {
+  it('PASS: runs both QC sub-agents in the tree, writes .qc-passed, advances, tears the tree down', async () => {
+    const h = mkPipeline({ hostQc: true });
+    h.state.qcAuditorPass = true; h.state.storyPass = true;
+    h.setTasks([epicWith('qc')]);
+
+    await h.pipeline.advanceFeature('S:/repo', '00001');
+
+    expect(h.spawns.map((s) => s.name).sort()).toEqual(['qc-auditor', 'story-verifier']);
+    expect(h.artifacts.has('00001/.qc-passed')).toBe(true);            // engine wrote the marker
+    expect(milestone(h.getTasks()[0], 'qc').status).toBe('done');
+    expect(h.removedTrees).toEqual(['S:/qc/00001']);                  // tree torn down
+    expect(h.escalations).toHaveLength(0);
+  });
+
+  it('FAIL: no .qc-passed, holds + escalates + files bug cards, still tears the tree down', async () => {
+    const h = mkPipeline({ hostQc: true });
+    h.state.qcAuditorPass = false; h.state.bugCount = 2;
+    h.setTasks([epicWith('qc')]);
+
+    await h.pipeline.advanceFeature('S:/repo', '00001');
+
+    expect(h.artifacts.has('00001/.qc-passed')).toBe(false);
+    expect(milestone(h.getTasks()[0], 'qc').status).toBe('active');    // held
+    expect(h.bugSeeds).toHaveLength(1);
+    expect(h.escalations).toHaveLength(1);
+    expect(h.removedTrees).toEqual(['S:/qc/00001']);
+  });
+
+  it('merge CONFLICT: escalates without running the QC sub-agents', async () => {
+    const h = mkPipeline({ hostQc: true });
+    h.state.qcConflicts = ['agent/kevin-t1'];
+    h.setTasks([epicWith('qc')]);
+
+    await h.pipeline.advanceFeature('S:/repo', '00001');
+
+    expect(h.spawns).toHaveLength(0);                                  // never ran qc-auditor
+    expect(milestone(h.getTasks()[0], 'qc').status).toBe('active');
+    expect(h.escalations[0].message).toMatch(/conflict/i);
+    expect(h.removedTrees).toEqual(['S:/qc/00001']);
+  });
+
+  it('idempotent: an existing .qc-passed advances without building a tree', async () => {
+    const h = mkPipeline({ hostQc: true });
+    h.setTasks([epicWith('qc')]);
+    h.artifacts.add('00001/.qc-passed');
+
+    await h.pipeline.advanceFeature('S:/repo', '00001');
+
+    expect(h.spawns).toHaveLength(0);
+    expect(milestone(h.getTasks()[0], 'qc').status).toBe('done');
+  });
+
+  it('without the host-QC deps, qc still feed-tracks (.qc-passed advances)', async () => {
+    const h = mkPipeline();                                            // no hostQc
+    h.setTasks([epicWith('qc')]);
+    h.artifacts.add('00001/.qc-passed');
+    await h.pipeline.advanceFeature('S:/repo', '00001');
+    expect(milestone(h.getTasks()[0], 'qc').status).toBe('done');      // tracked, not host-run
+    expect(h.spawns).toHaveLength(0);
   });
 });

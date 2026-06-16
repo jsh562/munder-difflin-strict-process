@@ -70,6 +70,20 @@ export interface SddpPipelineDeps {
   /** Checklist completion (mechanical): `{ total, checked }` across `specs/<feature>/checklists/*.md`
    *  (`- [ ]` vs `- [X]`). `total === 0` ⇒ no checklists ⇒ the gate is N/A. (P2 checklist gate.) */
   checklistStatus?(repo: string | null, feature: string): { total: number; checked: number };
+  /** HOST-DRIVEN QC (P4). Provision a throwaway QC-integration worktree: merge the feature's implement
+   *  branches into a detached tree off trunk so the suite runs on the INTEGRATED code (resolves the
+   *  `.qc-passed`↔integrate deadlock). Returns the tree `path` (for the QC sub-agents' cwd) + any
+   *  `conflicts` (branches the host couldn't merge → route back to authors). */
+  prepareQcTree?(epic: HiveTask): Promise<{ ok: boolean; path: string | null; conflicts: string[] }>;
+  /** Tear down a QC tree provisioned by `prepareQcTree`. */
+  removeQcTree?(path: string): void;
+  /** Run a sub-agent ONCE as `callerId` but with its tools resolving cwd to `treePath` (the QC tree).
+   *  Like `spawnSubAgent` + a cwd override — so qc-auditor/story-verifier act on the merged code. */
+  spawnSubAgentInTree?(callerId: string, name: string, input: string, treePath: string, signal?: AbortSignal): Promise<{ content: string; success: boolean }>;
+  /** SDDP policy knobs (`config.sddpConfig`, with defaults) — QC strictness + the bug-loop iteration cap. */
+  sddpPolicy?(): { qcStrictness: 'minimal' | 'standard' | 'strict'; coverageTarget?: number; maxQcIterations: number };
+  /** Seed bug-task cards from a failed QC report, round-robin to workers (P5). Returns the count. */
+  seedBugCards?(epic: HiveTask, report: string): number;
   /** Optional diagnostic log. */
   log?(message: string): void;
   /** Debounce window for `schedule` (ms); default 1500. */
@@ -200,6 +214,15 @@ export class SddpPipeline {
       if (active.key === 'analyze') {
         const ownerId = this.resolveOwner(epic, feature, active.key);
         if (ownerId) await this.runAnalyze(epic, active, ownerId);
+        return;
+      }
+
+      // QC step: host-driven (P4) when the QC-tree deps are wired — the engine builds a QC-integration
+      // worktree + runs qc-auditor/story-verifier itself. Falls back to feed-track (trackDistributed,
+      // the qc-desk notifier flow) when the deps are absent.
+      if (active.key === 'qc' && this.deps.prepareQcTree && this.deps.spawnSubAgentInTree) {
+        const ownerId = this.resolveOwner(epic, feature, active.key);
+        if (ownerId) await this.runQc(epic, active, ownerId);
         return;
       }
 
@@ -399,6 +422,66 @@ export class SddpPipeline {
       this.deps.advanceMilestone(epic.id, active.key);
     } else {
       this.setStatus(feature, active.key, 'waiting', active.key === 'implement' ? 'workers implementing' : 'awaiting QC');
+    }
+  }
+
+  /** HOST-DRIVEN QC (P4). Builds a QC-integration worktree (merge the feature's implement branches off
+   *  trunk), runs `qc-auditor` (build/lint/tests per strictness) + `story-verifier` (SC-###/US# vs the
+   *  merged code) IN that tree, then gates: both PASS ⇒ the engine writes `.qc-passed` + advances (the
+   *  hive integrate gate unblocks); a merge conflict or a FAIL ⇒ hold + escalate (P5 files bug cards +
+   *  loops). The QC sub-agents' `qc-report.md` still lands in the SHARED specs/ (specs anchor to the
+   *  base repo, not the tree). Idempotent: if `.qc-passed` already exists, just advance. */
+  private async runQc(epic: HiveTask, active: FeatureMilestone, ownerId: string): Promise<void> {
+    const feature = epic.feature!;
+    const repo = this.deps.repoForEpic(epic);
+    if (this.deps.featureArtifactExists(repo, feature, '.qc-passed')) { this.deps.advanceMilestone(epic.id, active.key); return; }
+    const lockKey = `${feature}::qc`;
+    if (this.inflight.has(lockKey)) return;
+
+    this.inflight.add(lockKey);
+    const ac = new AbortController();
+    this.aborters.set(lockKey, ac);
+    this.setStatus(feature, 'qc', 'running', 'preparing QC tree');
+    let treePath: string | null = null;
+    try {
+      const tree = await this.deps.prepareQcTree!(epic);
+      treePath = tree.path;
+      if (!tree.ok || !tree.path) {
+        this.setStatus(feature, 'qc', 'blocked', 'could not prepare QC tree');
+        this.escalateOnce(feature, `SDDP QC: couldn't build the integration tree for '${feature}' (no implement branches? a git error?). Check the worker branches.`);
+        return;
+      }
+      if (tree.conflicts.length > 0) {
+        this.setStatus(feature, 'qc', 'blocked', `merge conflicts: ${tree.conflicts.join(', ')}`);
+        this.escalateOnce(feature, `SDDP QC: merge conflicts integrating '${feature}' (${tree.conflicts.join(', ')}). Route those branches back to their authors to rebase, then re-run QC.`);
+        return;
+      }
+      const policy = this.deps.sddpPolicy?.() ?? { qcStrictness: 'standard' as const, maxQcIterations: 10 };
+      const dir = `specs/${feature}`;
+      this.setStatus(feature, 'qc', 'running', 'running QC');
+      const qc = await this.deps.spawnSubAgentInTree!(ownerId, 'qc-auditor',
+        `Feature folder ${dir}/. You are in the MERGED integration tree. Run the build + tests${policy.qcStrictness === 'minimal' ? '' : ' + lint'}${policy.qcStrictness === 'strict' ? ` + security scan + coverage (target ${policy.coverageTarget ?? 80}%)` : ''}. Write ${dir}/qc-report.md. End with a line "VERDICT: PASS" (all required checks pass) or "VERDICT: FAIL".`,
+        tree.path, ac.signal);
+      if (ac.signal.aborted) { this.setStatus(feature, 'qc', 'stopped'); return; }
+      const story = await this.deps.spawnSubAgentInTree!(ownerId, 'story-verifier',
+        `Feature folder ${dir}/. In the MERGED tree, verify each user story / SC-### in ${dir}/spec.md is actually implemented. End with "VERDICT: PASS" or "VERDICT: FAIL".`,
+        tree.path, ac.signal);
+      if (ac.signal.aborted) { this.setStatus(feature, 'qc', 'stopped'); return; }
+
+      const pass = /VERDICT:\s*PASS/i.test(qc.content) && /VERDICT:\s*PASS/i.test(story.content);
+      if (pass) {
+        this.deps.writeFeatureArtifact?.(repo, feature, '.qc-passed', '');
+        this.escalated.delete(feature);
+        this.deps.advanceMilestone(epic.id, active.key); // integrate now unblocks (.qc-passed present)
+      } else {
+        const n = this.deps.seedBugCards?.(epic, `${qc.content}\n\n${story.content}`) ?? 0; // P5
+        this.setStatus(feature, 'qc', 'blocked', n > 0 ? `QC failed — ${n} bug task(s) filed` : 'QC failed');
+        this.escalateOnce(feature, `SDDP QC FAILED for '${feature}' — see ${dir}/qc-report.md.${n > 0 ? ` ${n} bug task(s) filed back to workers.` : ''}`);
+      }
+    } finally {
+      if (treePath) { try { this.deps.removeQcTree?.(treePath); } catch { /* best-effort */ } }
+      this.inflight.delete(lockKey);
+      this.aborters.delete(lockKey);
     }
   }
 
