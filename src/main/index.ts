@@ -8,7 +8,7 @@ import {
   modelForRole, OPS_STANDUP_MISSION, HEARTBEAT_MISSION, type HarnessConfig, type ScheduledMission
 } from './config';
 import { listDir, readFileText, writeFileText } from './fs';
-import { normalizeRepoPath, normalizedPathSet } from './paths';
+import { normalizeRepoPath, normalizedPathSet, buildCacheKey } from './paths';
 import {
   getBranch, getStatus, getLog, getBranches, getAheadBehind, isRepo,
   addWorktree, removeWorktree, listWorktrees, planWorktree, type GitWorktree,
@@ -275,6 +275,36 @@ async function provisionWorktree(
     console.error('[worktree] provision failed:', e);
     return null;
   }
+}
+
+/**
+ * The single root that holds EVERY desk's redirected build output (`config.buildCacheDir`, else
+ * `<harnessHome>/build-cache`). Heavy, churning, executable build trees (a Rust `target/`, etc.)
+ * are kept OUT of the desks' worktrees and out of the project repo so (a) the user excludes ONE
+ * folder from antivirus instead of every worktree, and (b) worktrees stay light. Null only when
+ * no harnessHome is configured (pre-onboarding) and no explicit dir is set.
+ */
+function buildCacheRoot(): string | null {
+  const cfg = readConfig();
+  if (cfg.buildCacheDir) return cfg.buildCacheDir;
+  return cfg.harnessHome ? join(cfg.harnessHome, 'build-cache') : null;
+}
+
+/**
+ * Build-tool env redirecting a desk's output off its worktree into a per-desk subdir of the one
+ * cache root. Keyed by `<basename>-<shortHash(cwd)>` so each distinct working tree (a worktree OR a
+ * base repo) gets its OWN dir — cargo takes a per-`target` lock, so one builder per dir avoids the
+ * concurrent-build cache corruption a shared dir would cause; the hash discriminates same-named
+ * repos. The dir is created eagerly so the var always points somewhere real. Returns `undefined`
+ * (inherit the parent env) when there's no cache root or no cwd. Today this sets `CARGO_TARGET_DIR`
+ * (Rust); other ecosystems lacking a clean redirect can be added here later.
+ */
+function buildCacheEnvFor(cwd: string | null | undefined): Record<string, string> | undefined {
+  const root = buildCacheRoot();
+  if (!root || !cwd) return undefined;
+  const dir = join(root, buildCacheKey(cwd));
+  try { mkdirSync(dir, { recursive: true }); } catch { /* best-effort — cargo will surface a write error */ }
+  return { CARGO_TARGET_DIR: dir };
 }
 
 /**
@@ -573,6 +603,10 @@ const agentToolDeps: AgentToolDeps = {
   // Run the bash tool through a real shell (Git Bash on Windows) so ls/grep/find/pipes
   // work — instead of Node's cmd.exe default. Detected once at startup.
   bashShell: () => resolveBashEnv().shell,
+  // Redirect heavy build output (Rust `target/`, …) off the desk's worktree into the one
+  // AV-excludable cache root, keyed per working tree. A native desk's bash runs in MAIN, so this
+  // is the seam that reaches its cargo build (the Claude PTY path sets the same var in opts.env).
+  bashEnv: (id) => buildCacheEnvFor(hive.registry().agents[id]?.cwd),
   // web_search routes through the host (provider + formatting). Free + keyless via
   // DuckDuckGo; config is read live per call so the operator's enable/disable takes
   // effect at once. Throws a clear note when disabled — the executor turns that into a
@@ -1465,6 +1499,13 @@ ipcMain.handle('pty:spawn', async (_evt, opts: SpawnOptions & { hive?: AgentMeta
       worktreePaths.set(opts.id, wt.path);
       worktreeOrigins.set(opts.id, wt.origin);
     }
+  }
+  // Redirect this desk's build output (Rust `target/`, …) off its (now-final) cwd into the one
+  // AV-excludable cache root — so a Claude author/base-tree desk's cargo build doesn't churn
+  // `target/` inside the worktree or the repo. (Native desks get the same var via `bashEnv`.)
+  if (opts.hive && !opts.hive.isGod && !opts.hive.isAssistant) {
+    const buildEnv = buildCacheEnvFor(opts.cwd);
+    if (buildEnv) opts.env = { ...(opts.env ?? {}), ...buildEnv };
   }
   // If the agent carries hive metadata, provision its workspace and inject the
   // identity + protocol (extra --append-system-prompt args + AGENT_* env).

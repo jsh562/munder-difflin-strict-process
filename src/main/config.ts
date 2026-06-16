@@ -104,6 +104,10 @@ export interface HarnessConfig {
    *  separate from the hive bookkeeping so its file writes can't pollute the registry
    *  / board / memory. Unset ⇒ auto-derived `<harnessHome>/workspace`. */
   godWorkspace?: string;
+  /** One root for EVERY desk's redirected build output (Rust `target/`, …), keyed per working tree
+   *  so heavy/churning build trees stay OUT of the worktrees and the repo — the operator excludes
+   *  this single folder from antivirus. Unset ⇒ auto-derived `<harnessHome>/build-cache`. */
+  buildCacheDir?: string;
   /** Folders the user registered during onboarding (used as quick-picks). */
   registeredRepos: string[];
   /** When true, new agents are spawned with --permission-mode bypassPermissions. */

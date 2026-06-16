@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { resolve } from 'node:path';
-import { normalizeRepoPath, samePath, normalizedPathSet } from '../paths';
+import { normalizeRepoPath, samePath, normalizedPathSet, buildCacheKey } from '../paths';
 
 const win = process.platform === 'win32';
 
@@ -45,5 +45,31 @@ describe('normalizedPathSet', () => {
     const set = normalizedPathSet(['foo/bar', 'foo/bar/', '', null, 'foo/baz/../bar']);
     expect(set.size).toBe(1);
     expect(set.has(normalizeRepoPath('foo/bar'))).toBe(true);
+  });
+});
+
+describe('buildCacheKey — per-working-tree build dir name', () => {
+  it('is deterministic and begins with the basename', () => {
+    const a = buildCacheKey('S:/munderdiff/worktrees/stanley-mqdrvp0p');
+    expect(a).toBe(buildCacheKey('S:/munderdiff/worktrees/stanley-mqdrvp0p'));
+    expect(a.startsWith('stanley-mqdrvp0p-')).toBe(true);
+  });
+
+  it('discriminates same-named dirs on different paths (no collision)', () => {
+    // Two repos both named "numrs" under different parents must NOT share a build dir.
+    expect(buildCacheKey('S:/a/numrs')).not.toBe(buildCacheKey('S:/b/numrs'));
+    // …but both still carry the basename prefix.
+    expect(buildCacheKey('S:/a/numrs').startsWith('numrs-')).toBe(true);
+    expect(buildCacheKey('S:/b/numrs').startsWith('numrs-')).toBe(true);
+  });
+
+  it('is stable across trailing-slash / .. variants of one path', () => {
+    expect(buildCacheKey('S:/md/numrs')).toBe(buildCacheKey('S:/md/numrs/'));
+    expect(buildCacheKey('S:/md/numrs')).toBe(buildCacheKey('S:/md/sub/../numrs'));
+  });
+
+  it('is case-insensitive only on win32 (matches normalizeRepoPath)', () => {
+    if (win) expect(buildCacheKey('S:/Md/NumRS')).toBe(buildCacheKey('s:/md/numrs'));
+    else expect(buildCacheKey('/Md/NumRS')).not.toBe(buildCacheKey('/md/numrs'));
   });
 });

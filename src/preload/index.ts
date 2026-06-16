@@ -138,6 +138,8 @@ export interface HarnessConfig {
   harnessHome: string | null;
   /** Optional working directory for a native god (else `<harnessHome>/workspace`). */
   godWorkspace?: string;
+  /** Single root for all desks' redirected build output (else `<harnessHome>/build-cache`). */
+  buildCacheDir?: string;
   registeredRepos: string[];
   autoMode: boolean;
   defaultCommand: string;
