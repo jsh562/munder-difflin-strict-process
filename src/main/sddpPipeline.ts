@@ -471,7 +471,7 @@ export class SddpPipeline {
       const dir = `specs/${feature}`;
       this.setStatus(feature, 'qc', 'running', 'running QC');
       const qc = await this.deps.spawnSubAgentInTree!(ownerId, 'qc-auditor',
-        `Feature folder ${dir}/. You are in the MERGED integration tree. Run the build + tests${policy.qcStrictness === 'minimal' ? '' : ' + lint'}${policy.qcStrictness === 'strict' ? ` + security scan + coverage (target ${policy.coverageTarget ?? 80}%)` : ''}. Write ${dir}/qc-report.md. End with a line "VERDICT: PASS" (all required checks pass) or "VERDICT: FAIL".`,
+        `Feature folder ${dir}/. You are in the MERGED integration tree. Run the build + tests${policy.qcStrictness === 'minimal' ? '' : ' + lint'}${policy.qcStrictness === 'strict' ? ` + security scan + coverage (target ${policy.coverageTarget ?? 80}%)` : ''}. Write ${dir}/qc-report.md. List EACH failure as its own bug line: "[BUG:<CRITICAL|ERROR|WARNING>] {<req if known>} [<category>] <description> — <file:line>" (categories: test-failure, lint-error, security-vuln, coverage-gap, requirement-gap, pi-violation, runtime-error). End with a line "VERDICT: PASS" (all required checks pass) or "VERDICT: FAIL".`,
         tree.path, ac.signal);
       if (ac.signal.aborted) { this.setStatus(feature, 'qc', 'stopped'); return; }
       const story = await this.deps.spawnSubAgentInTree!(ownerId, 'story-verifier',

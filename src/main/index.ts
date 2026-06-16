@@ -39,7 +39,7 @@ import { makeElectronWorkerTransport } from './runtime/electronWorkerTransport';
 import { runOneShotSubAgent, subAgentChildId, resolveSubAgentModel } from './runtime/subAgentRunner';
 import { nativeSddpGodPrompt, nativeSddpRolePrompt } from './sddpPrompts';
 import { SddpPipeline } from './sddpPipeline';
-import { executeAgentTool, subAgentSpec, SUB_AGENT_NAMES, agentTaskBranch, analyzeCoverage, type AgentToolDeps, type FeatureStatus } from '@jsh562/won-agent-core';
+import { executeAgentTool, subAgentSpec, SUB_AGENT_NAMES, agentTaskBranch, analyzeCoverage, buildBugTitles, bugSignature, type AgentToolDeps, type FeatureStatus } from '@jsh562/won-agent-core';
 import { redactConfig, injectionEnvForProvider, keyPresence, setKeyInConfig, clearKeyInConfig, WEB_SEARCH_KEY_ID, NATIVE_PROVIDER_MODEL_ENV, type SafeConfig } from './credentials';
 import { setSecretInConfig, clearSecretInConfig, getSecretValue, secretNames } from './secrets';
 import { searchWebDuckDuckGo } from './webSearch';
@@ -1085,18 +1085,23 @@ const sddpPipeline = new SddpPipeline({
     const feature = epic.feature;
     if (!feature) return 0;
     const max = readConfig().sddpConfig?.maxQcIterations ?? 10;
-    const tag = attempt >= max ? '[DEFERRED] ' : attempt >= 3 ? '[ESCALATED] ' : '';
     const found = report.split('\n').map((l) => l.trim()).filter((l) => /\[BUG:/i.test(l));
     const findings = found.length ? found : [`[BUG:ERROR] QC failed for ${feature} — see specs/${feature}/qc-report.md`];
     const ledger = hive.tasks() as { tasks?: HiveTask[] } | undefined;
     const existing = Array.isArray(ledger?.tasks) ? ledger!.tasks : [];
+    // Recurrence: signatures of every prior [BUG card for this feature (done cards from earlier
+    // attempts are how the same finding gets re-tagged [RECURRING] when it comes back).
+    const priorSigs = new Set(existing
+      .filter((t) => t.feature === feature && /\[BUG/i.test(t.title))
+      .map((t) => bugSignature(t.title)));
+    const titles = buildBugTitles(findings, priorSigs, attempt, max); // [BUG:sev] [RECURRING?] [ESCALATED?] [DEFERRED?] …
     const workers = desksForRole('worker');
     const now = new Date().toISOString();
-    const created: HiveTask[] = findings.map((f, i) => {
+    const created: HiveTask[] = titles.map((title, i) => {
       const id = `bug-${Date.now()}-${existing.length + i}`;
       const assignee = workers.length ? workers[i % workers.length] : undefined;
       return {
-        id, title: `${tag}${f.startsWith('[BUG') ? f : `[BUG:ERROR] ${f}`}`.trim(),
+        id, title,
         assignee, status: 'todo', dependsOn: [],
         project: assignee ? (repoForId(assignee) ?? repo ?? undefined) : (repo ?? undefined),
         branch: assignee ? agentTaskBranch(assignee, id) : undefined,
