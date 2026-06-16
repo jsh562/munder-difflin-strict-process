@@ -26,9 +26,9 @@ function mkPipeline(opts: { hostQc?: boolean } = {}) {
   const seeds: string[] = [];                     // epic ids the engine asked to seed cards for
   const assigns: { cardId: string; deskId: string }[] = [];
   const removedTrees: string[] = [];              // qc trees torn down
-  const bugSeeds: string[] = [];                  // qc-fail reports passed to seedBugCards
+  const bugSeeds: { report: string; attempt: number }[] = []; // seedBugCards calls
   const artifactText = new Map<string, string>(); // `${feature}/${rel}` → text (analyze read/write)
-  const state = { enabled: true, ownerUsable: true, autopilot: false, seedCount: 2, plannerDesk: null as string | null, uncovered: [] as string[], policyVerdict: 'PASS' as 'PASS' | 'FAIL', checklist: { total: 0, checked: 0 }, qcConflicts: [] as string[], qcAuditorPass: true, storyPass: true, bugCount: 0 };
+  const state = { enabled: true, ownerUsable: true, autopilot: false, seedCount: 2, plannerDesk: null as string | null, uncovered: [] as string[], policyVerdict: 'PASS' as 'PASS' | 'FAIL', checklist: { total: 0, checked: 0 }, qcConflicts: [] as string[], qcAuditorPass: true, storyPass: true, bugCount: 0, openBugs: 0 };
   let onSpawn: (name: string) => void = () => {}; // simulate what a sub-agent writes
   let gate: Promise<void> | null = null;          // optional latch to hold a spawn open (lock test)
 
@@ -80,7 +80,8 @@ function mkPipeline(opts: { hostQc?: boolean } = {}) {
       return { content: `VERDICT: ${pass ? 'PASS' : 'FAIL'}`, success: true };
     };
     deps.sddpPolicy = () => ({ qcStrictness: 'standard', maxQcIterations: 10 });
-    deps.seedBugCards = (_epic, report) => { bugSeeds.push(report); return state.bugCount; };
+    deps.seedBugCards = (_epic, report, attempt) => { bugSeeds.push({ report, attempt }); state.openBugs += state.bugCount; return state.bugCount; };
+    deps.openBugCards = () => state.openBugs;
   }
 
   const pipeline = new SddpPipeline(deps);
@@ -541,5 +542,48 @@ describe('SddpPipeline — host-driven QC (worktree + qc-auditor/story-verifier)
     await h.pipeline.advanceFeature('S:/repo', '00001');
     expect(milestone(h.getTasks()[0], 'qc').status).toBe('done');      // tracked, not host-run
     expect(h.spawns).toHaveLength(0);
+  });
+});
+
+describe('SddpPipeline — QC bug loop (P5)', () => {
+  it('FAIL files bug cards (attempt 1), then WAITS while they are open instead of re-running QC', async () => {
+    const h = mkPipeline({ hostQc: true });
+    h.state.qcAuditorPass = false; h.state.bugCount = 2;
+    h.setTasks([epicWith('qc')]);
+
+    await h.pipeline.advanceFeature('S:/repo', '00001');               // run 1: FAIL → seeds 2 bugs
+    expect(h.bugSeeds).toEqual([{ report: expect.any(String), attempt: 1 }]);
+    const after1 = h.spawns.length;
+
+    await h.pipeline.advanceFeature('S:/repo', '00001');               // run 2: bugs open → WAIT
+    expect(h.spawns).toHaveLength(after1);                             // no re-run
+    expect(h.bugSeeds).toHaveLength(1);                                // no new seeding
+    expect(h.pipeline.statusFor('00001')?.state).toBe('waiting');
+  });
+
+  it('re-runs QC once the bug cards are closed; a PASS then writes .qc-passed + advances', async () => {
+    const h = mkPipeline({ hostQc: true });
+    h.state.qcAuditorPass = false; h.state.bugCount = 1;
+    h.setTasks([epicWith('qc')]);
+
+    await h.pipeline.advanceFeature('S:/repo', '00001');               // FAIL (attempt 1), 1 bug open
+    h.state.openBugs = 0;                                              // workers fixed the bug
+    h.state.qcAuditorPass = true;                                     // now the suite passes
+    await h.pipeline.advanceFeature('S:/repo', '00001');               // re-run → PASS
+
+    expect(h.artifacts.has('00001/.qc-passed')).toBe(true);
+    expect(milestone(h.getTasks()[0], 'qc').status).toBe('done');
+  });
+
+  it('increments the attempt across fail cycles (drives [ESCALATED]/[DEFERRED] tagging host-side)', async () => {
+    const h = mkPipeline({ hostQc: true });
+    h.state.qcAuditorPass = false; h.state.bugCount = 1;
+    h.setTasks([epicWith('qc')]);
+
+    await h.pipeline.advanceFeature('S:/repo', '00001');               // attempt 1
+    h.state.openBugs = 0;                                              // bug fixed → loop reopens
+    await h.pipeline.advanceFeature('S:/repo', '00001');               // attempt 2 (still failing)
+
+    expect(h.bugSeeds.map((b) => b.attempt)).toEqual([1, 2]);
   });
 });

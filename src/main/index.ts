@@ -1077,6 +1077,39 @@ const sddpPipeline = new SddpPipeline({
     const c = readConfig().sddpConfig ?? {};
     return { qcStrictness: c.qcStrictness ?? 'standard', coverageTarget: c.coverageTarget, maxQcIterations: c.maxQcIterations ?? 10 };
   },
+  // BUG LOOP (P5): file bug-task cards from a failed QC report (the [BUG:…] lines it emitted, else one
+  // generic card), round-robin to workers. attempt drives the escalation tag (≥3 ESCALATED;
+  // ≥maxQcIterations DEFERRED). The titles carry `[BUG` so openBugCards can gate the loop on them.
+  seedBugCards: (epic, report, attempt) => {
+    const repo = epic.project ?? (epic.assignee ? repoForId(epic.assignee) : null);
+    const feature = epic.feature;
+    if (!feature) return 0;
+    const max = readConfig().sddpConfig?.maxQcIterations ?? 10;
+    const tag = attempt >= max ? '[DEFERRED] ' : attempt >= 3 ? '[ESCALATED] ' : '';
+    const found = report.split('\n').map((l) => l.trim()).filter((l) => /\[BUG:/i.test(l));
+    const findings = found.length ? found : [`[BUG:ERROR] QC failed for ${feature} — see specs/${feature}/qc-report.md`];
+    const ledger = hive.tasks() as { tasks?: HiveTask[] } | undefined;
+    const existing = Array.isArray(ledger?.tasks) ? ledger!.tasks : [];
+    const workers = desksForRole('worker');
+    const now = new Date().toISOString();
+    const created: HiveTask[] = findings.map((f, i) => {
+      const id = `bug-${Date.now()}-${existing.length + i}`;
+      const assignee = workers.length ? workers[i % workers.length] : undefined;
+      return {
+        id, title: `${tag}${f.startsWith('[BUG') ? f : `[BUG:ERROR] ${f}`}`.trim(),
+        assignee, status: 'todo', dependsOn: [],
+        project: assignee ? (repoForId(assignee) ?? repo ?? undefined) : (repo ?? undefined),
+        branch: assignee ? agentTaskBranch(assignee, id) : undefined,
+        feature, priority: 1, createdAt: now
+      } as HiveTask;
+    });
+    hive.writeTasks([...existing, ...created]);
+    return created.length;
+  },
+  openBugCards: (epic) => {
+    const ledger = hive.tasks() as { tasks?: HiveTask[] } | undefined;
+    return (ledger?.tasks ?? []).filter((t) => t.feature === epic.feature && t.status !== 'done' && /\[BUG/i.test(t.title)).length;
+  },
   escalate: (feature, message) => {
     try { hive.send({ to: 'god', act: 'request', needs_human: true, subject: `SDDP pipeline — ${feature}`, body: message }, 'system'); }
     catch (e) { console.error('[sddp-pipeline] escalate failed:', e); }

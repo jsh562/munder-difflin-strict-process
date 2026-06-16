@@ -82,8 +82,13 @@ export interface SddpPipelineDeps {
   spawnSubAgentInTree?(callerId: string, name: string, input: string, treePath: string, signal?: AbortSignal): Promise<{ content: string; success: boolean }>;
   /** SDDP policy knobs (`config.sddpConfig`, with defaults) — QC strictness + the bug-loop iteration cap. */
   sddpPolicy?(): { qcStrictness: 'minimal' | 'standard' | 'strict'; coverageTarget?: number; maxQcIterations: number };
-  /** Seed bug-task cards from a failed QC report, round-robin to workers (P5). Returns the count. */
-  seedBugCards?(epic: HiveTask, report: string): number;
+  /** Seed bug-task cards from a failed QC report (P5), round-robin to workers, feature-tagged with the
+   *  `[BUG:severity]` grammar. `attempt` drives the escalation tag (≥3 ⇒ `[ESCALATED]`,
+   *  ≥maxQcIterations ⇒ `[DEFERRED]`). Always creates ≥1 card on a FAIL. Returns the count. */
+  seedBugCards?(epic: HiveTask, report: string, attempt: number): number;
+  /** Count of OPEN (not-done) bug cards for the feature (title carries `[BUG`). The QC loop WAITS while
+   *  any are open (workers are fixing them) and only re-runs QC once they're all closed. (P5.) */
+  openBugCards?(epic: HiveTask): number;
   /** Optional diagnostic log. */
   log?(message: string): void;
   /** Debounce window for `schedule` (ms); default 1500. */
@@ -139,6 +144,7 @@ export class SddpPipeline {
   private readonly asked = new Set<string>();      // human-gated steps already relayed to the operator
   private readonly aborters = new Map<string, AbortController>(); // `${feature}::${key}` → abort handle
   private readonly status = new Map<string, FeatureEngineStatus>(); // feature → engine status (monitor)
+  private readonly qcAttempts = new Map<string, number>();         // feature → QC fail count (bug loop, P5)
 
   constructor(private readonly deps: SddpPipelineDeps) {}
 
@@ -438,6 +444,11 @@ export class SddpPipeline {
     const lockKey = `${feature}::qc`;
     if (this.inflight.has(lockKey)) return;
 
+    // BUG LOOP (P5): if a prior QC run filed bug cards that are still open, WAIT for the workers to
+    // close them before re-running QC — so a FAIL doesn't re-run the whole suite on every board tick.
+    const openBugs = this.deps.openBugCards?.(epic) ?? 0;
+    if (openBugs > 0) { this.setStatus(feature, 'qc', 'waiting', `awaiting ${openBugs} bug fix(es)`); return; }
+
     this.inflight.add(lockKey);
     const ac = new AbortController();
     this.aborters.set(lockKey, ac);
@@ -472,11 +483,17 @@ export class SddpPipeline {
       if (pass) {
         this.deps.writeFeatureArtifact?.(repo, feature, '.qc-passed', '');
         this.escalated.delete(feature);
+        this.qcAttempts.delete(feature);
         this.deps.advanceMilestone(epic.id, active.key); // integrate now unblocks (.qc-passed present)
       } else {
-        const n = this.deps.seedBugCards?.(epic, `${qc.content}\n\n${story.content}`) ?? 0; // P5
-        this.setStatus(feature, 'qc', 'blocked', n > 0 ? `QC failed — ${n} bug task(s) filed` : 'QC failed');
-        this.escalateOnce(feature, `SDDP QC FAILED for '${feature}' — see ${dir}/qc-report.md.${n > 0 ? ` ${n} bug task(s) filed back to workers.` : ''}`);
+        // P5 bug loop: file bug cards (attempt-tagged), then WAIT for them (via openBugCards) before
+        // re-running. The attempt count drives [ESCALATED]/[DEFERRED] tags in seedBugCards.
+        const attempt = (this.qcAttempts.get(feature) ?? 0) + 1;
+        this.qcAttempts.set(feature, attempt);
+        const max = this.deps.sddpPolicy?.().maxQcIterations ?? 10;
+        const n = this.deps.seedBugCards?.(epic, `${qc.content}\n\n${story.content}`, attempt) ?? 0;
+        this.setStatus(feature, 'qc', 'blocked', `QC failed (attempt ${attempt}) — ${n} bug task(s) filed`);
+        this.escalateOnce(feature, `SDDP QC FAILED for '${feature}' (attempt ${attempt}/${max}) — see ${dir}/qc-report.md. ${n} bug task(s) filed back to workers${attempt >= max ? ' and tagged [DEFERRED] — manual review needed' : attempt >= 3 ? ' (some [ESCALATED])' : ''}.`);
       }
     } finally {
       if (treePath) { try { this.deps.removeQcTree?.(treePath); } catch { /* best-effort */ } }
