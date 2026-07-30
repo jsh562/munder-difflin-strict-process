@@ -63,7 +63,7 @@ Claude/CLI path keeps working unchanged.
   and a review / bulk-delete panel.
 - **Richer task board.** REVIEW / INTEGRATE lanes, "blocked by" chips with jump-to-blocker, role-gated
   lanes, a per-feature phase tracker, and fleet Pause-all / Resume-all / Stop-all.
-- **SDDP — spec-driven mode.** An optional, gated Specify → Plan → Tasks → Implement → QC → Integrate
+- **Spec-Driven Development Framework Mode — spec-driven mode.** An optional, gated Specify → Plan → Tasks → Implement → QC → Integrate
   lifecycle with filesystem-enforced phase gates and an automated QC bug-fix loop.
 - **Plus:** a secrets vault + proxy/runtime env, cross-provider cost telemetry, agent web search
   (keyless DuckDuckGo), Windows Git Bash for the `bash` tool, and a Vitest + ESLint test suite
