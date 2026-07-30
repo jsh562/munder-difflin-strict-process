@@ -1,5 +1,26 @@
 @import './tokens.css';
 
+/* Departure Mono — a complete retro pixel monospace (box-drawing 128/128, block
+   elements 32/32) bundled locally so the terminal can use xterm's DOM renderer (for
+   reliable text selection/copy) without the grid shearing that forced WebGL with the
+   incomplete VT323. It ships a single weight, so we map BOLD to the same file: this
+   avoids the browser synthesizing a wider faux-bold that would break cell alignment —
+   bold output still reads as brighter (xterm draws bold in bright colors). */
+@font-face {
+  font-family: "Departure Mono";
+  src: url("../assets/fonts/DepartureMono-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Departure Mono";
+  src: url("../assets/fonts/DepartureMono-Regular.woff2") format("woff2");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
 *, *::before, *::after { box-sizing: border-box; }
 
 /* The app is a fixed cream/light design. Without declaring it, Chromium on a

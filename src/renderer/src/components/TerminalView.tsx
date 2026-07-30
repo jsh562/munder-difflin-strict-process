@@ -48,7 +48,7 @@ export function TerminalView({ initialLines = [], feed = [] }: TerminalViewProps
     if (!hostRef.current) return;
     const term = new Terminal({
       theme,
-      fontFamily: 'VT323, monospace',
+      fontFamily: '"Departure Mono", "Cascadia Mono", Consolas, monospace',
       fontSize: 18,
       lineHeight: 1.0,
       cursorBlink: true,

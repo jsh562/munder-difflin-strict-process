@@ -35,9 +35,18 @@ export class PtyManager {
    *  (archive, worktree removal, map cleanup) that the explicit kill() path
    *  runs. Best-effort — set once by the main process. */
   private exitHandler: ((id: string) => void) | null = null;
+  /** Optional observer of raw PTY output, additive to the renderer stream. The
+   *  Claude ProviderRuntime adapter (E001) uses it to derive text-delta events
+   *  without changing the existing `pty:data:<id>` send. Best-effort, never throws. */
+  private dataObserver: ((id: string, data: string) => void) | null = null;
 
   attachWebContents(wc: WebContents) {
     this.webContents = wc;
+  }
+
+  /** Register an additive observer of PTY output (E001 Claude adapter). */
+  setDataObserver(observer: (id: string, data: string) => void): void {
+    this.dataObserver = observer;
   }
 
   /** Register the natural-exit teardown callback. Invoked from inside node-pty's
@@ -153,6 +162,8 @@ export class PtyManager {
         const s = this.sessions.get(opts.id);
         if (s) s.lastOutputAt = Date.now();
         this.safeSend(`pty:data:${opts.id}`, data);
+        // Additive: feed the provider-runtime adapter without altering the send above.
+        try { this.dataObserver?.(opts.id, data); } catch { /* never throw out of onData */ }
       });
       proc.onExit(({ exitCode, signal }) => {
         this.safeSend(`pty:exit:${opts.id}`, { exitCode, signal });

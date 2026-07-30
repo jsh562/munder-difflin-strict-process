@@ -1,0 +1,2 @@
+E004 Provider Credential Management — implementation complete 2026-06-09T01:37:49Z
+Gates: typecheck PASS (node+web), lint 0 errors, vitest 54/54 (8 credentials tests).

@@ -1,10 +1,16 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
+import type { AgentEvent } from '../shared/agentEvent';
+import type { DeskEnvEntry } from '../shared/deskEnv';
+
+export type { AgentEvent };
 
 export interface HiveAgentMeta {
   id: string;
   name: string;
   role?: string;
   capabilities?: string[];
+  /** Capability roles (worker / reviewer / integrator). Optional at spawn — defaulted host-side. */
+  roles?: ('worker' | 'reviewer' | 'integrator' | 'planner' | 'qc')[];
   cwd: string;
   isGod?: boolean;
   isAssistant?: boolean;
@@ -32,16 +38,44 @@ export interface HiveRegistry {
   agents: Record<string, HiveAgentMeta & { status: string; lastSeen: number; archived?: boolean }>;
 }
 
+/** An attributed comment on a task card (reviewer feedback, worker test result). */
+export interface HiveComment {
+  by: string;
+  at: string;
+  text: string;
+}
+
 /** A card on the task kanban, persisted to hive/tasks.json. */
 export interface HiveTask {
   id: string;
   title: string;
   description?: string;
   assignee?: string;
-  status: 'todo' | 'doing' | 'blocked' | 'done';
+  status: 'todo' | 'doing' | 'blocked' | 'review' | 'integrate' | 'done';
   dependsOn: string[];
+  /** Task id(s) currently blocking this card (set when status='blocked'). */
+  blockedBy?: string[];
+  /** Attributed feedback thread (newest last). */
+  comments?: HiveComment[];
+  /** Project repo the card belongs to (stamped on assign) — for off-project detection. */
+  project?: string;
+  /** SDDP: the feature folder this card belongs to (its specs/<feature>/ dir) — drives the
+   *  lifecycle gate + the board phase. Absent ⇒ unscoped / non-SDDP card. */
+  feature?: string;
   priority: number;
   createdAt: string;
+}
+
+/** SDDP: a feature's on-disk marker state (mirrors FeatureStatus in won-agent-core). The
+ *  renderer derives the phase + next gate from these via the shared featurePhase() helper. */
+export interface FeatureStatus {
+  feature: string;
+  hasSpec: boolean;
+  hasClarifications: boolean;
+  hasPlan: boolean;
+  hasTasks: boolean;
+  completed: boolean;
+  qcPassed: boolean;
 }
 
 /** A message the router just delivered, with its resolved recipient ids. Drives
@@ -87,6 +121,8 @@ export interface ScheduledMission {
   kind?: 'dispatch' | 'heartbeat';
   /** Heartbeat only: floor-quiet threshold in ms. */
   quietThresholdMs?: number;
+  /** Per-project scoping (a repo path): fire to that project's desks instead of `to`. */
+  project?: string;
 }
 
 /** Circuit-breaker thresholds (Lane A #6.6b). Mirrors src/main/config.ts. */
@@ -101,6 +137,18 @@ export interface CircuitBreakerConfig {
 export interface HarnessConfig {
   onboardingComplete: boolean;
   harnessHome: string | null;
+  /** Optional working directory for a native god (else `<harnessHome>/workspace`). */
+  godWorkspace?: string;
+  /** Single root for all desks' redirected build output (else `<harnessHome>/build-cache`). */
+  buildCacheDir?: string;
+  /** Token-templated per-desk env vars (GLOBAL base; else the built-in CARGO_TARGET_DIR default). */
+  deskEnv?: DeskEnvEntry[];
+  /** Per-repo env overrides (keyed by repo path) layered on the global `deskEnv`. */
+  deskEnvByRepo?: Record<string, DeskEnvEntry[]>;
+  /** Per-agent env overrides (keyed by agent id) layered on global + per-repo. */
+  deskEnvByAgent?: Record<string, DeskEnvEntry[]>;
+  /** Runtime env (global) — proxy / custom CA for the agent's own model + network calls. */
+  runtimeEnv?: DeskEnvEntry[];
   registeredRepos: string[];
   autoMode: boolean;
   defaultCommand: string;
@@ -111,6 +159,18 @@ export interface HarnessConfig {
   opsStandupSeeded?: boolean;
   heartbeatSeeded?: boolean;
   notifications?: boolean;
+  /** Operator gate: allow native (DeepSeek/Minimax) desks to use the web_search tool
+   *  (the Brave Search API key rides the credentials store under 'web-search'). */
+  webSearchEnabled?: boolean;
+  /** Operator gate: allow native (DeepSeek/Minimax) desks to use the `bash` tool
+   *  (still cwd-sandboxed + breaker-watched + destructive-command guarded). OFF by
+   *  default. Claude desks are unaffected (their shell rides the CLI's own gate). */
+  nativeBashEnabled?: boolean;
+  /** Per-floor spec-driven (SDDP) mode: desks follow Specify→…→QC→Integrate; planner/qc
+   *  roles + feature-phase banner + phase gates activate. OFF by default. */
+  sddpMode?: boolean;
+  /** SDDP policy knobs (QC strictness / coverage target / max checklist files / max QC iterations). */
+  sddpConfig?: { qcStrictness?: 'minimal' | 'standard' | 'strict'; coverageTarget?: number; maxChecklist?: number; maxQcIterations?: number };
   slackEnabled?: boolean;
   slackSigningSecret?: string;
   slackBotToken?: string;
@@ -123,6 +183,11 @@ export interface HarnessConfig {
   circuitBreaker?: CircuitBreakerConfig;
   /** Terminal theme, mirrored into each agent's per-session Claude settings. */
   terminalTheme?: 'light' | 'dark';
+  /** E004 — redacted presence map (true ⇒ a key is stored) the renderer receives
+   *  from `config:get`. Raw provider keys never cross the bridge. */
+  providerKeyPresence?: Record<string, boolean>;
+  /** Secret-vault NAMES the renderer receives from `config:get` (values never cross the bridge). */
+  secretNames?: string[];
 }
 
 export interface MemoryStatus {
@@ -168,7 +233,9 @@ export interface AgentUsage {
 }
 
 /** Live cumulative cost/token snapshot from the OTel collector (the locked
- *  cross-lane seam). PII-free by construction. Mirrors telemetry.ts. */
+ *  cross-lane seam). PII-free by construction. Mirrors telemetry.ts.
+ *  `usd` is `number | null` — `null` = unpriced (unknown model); consumers
+ *  exclude it from billed totals, never treat it as 0 (FR-006/FR-014). */
 export interface AgentUsageSample {
   agentId: string;
   sessionId: string;
@@ -178,7 +245,7 @@ export interface AgentUsageSample {
   cacheRead: number;
   cacheCreation: number;
   model: string;
-  usd: number;
+  usd: number | null;
 }
 
 /** One tool invocation for the per-agent span waterfall (#7B.2). Ephemeral. */
@@ -213,7 +280,11 @@ export interface BreakerState {
 export type TelemetryEvent =
   | { kind: 'usage'; sample: AgentUsageSample }
   | { kind: 'tool_result'; span: ToolSpan }
-  | { kind: 'api_error'; agentId: string; sessionId: string; ts: number; error: string };
+  | { kind: 'api_error'; agentId: string; sessionId: string; ts: number; error: string }
+  /** E007 T020 {FR-006} — operator-visible telemetry-parity warning for an unknown/
+   *  unpriced model id (the sample's `usd` is `null`, no price billed). Bounded to
+   *  the model id alone — no prompt/tokens/headers/secret (FR-006/FR-013). */
+  | { kind: 'parity_warning'; model: string; ts: number };
 
 /** Cold-start backfill from the collector. */
 export interface TelemetrySnapshot {
@@ -279,9 +350,33 @@ const api = {
   chooseFolder: (): Promise<{ ok: true; path: string } | { ok: false; error: string }> =>
     ipcRenderer.invoke('dialog:chooseFolder'),
 
+  // ─── Worktrees (review + bulk cleanup of kept isolated worktrees) ──────────
+  listWorktrees: (): Promise<Array<{ repo: string; path: string; branch: string | null; head: string; isMain: boolean; locked: boolean }>> =>
+    ipcRenderer.invoke('git:listWorktrees'),
+  removeWorktree: (repo: string, path: string): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('git:removeWorktree', repo, path),
+  /** Commits a worktree's branch is ahead of its repo base (unmerged work) — for the
+   *  delete-confirm warning. 0 when merged/missing. */
+  gitBranchAhead: (repo: string, branch: string): Promise<number> =>
+    ipcRenderer.invoke('git:branchAhead', repo, branch),
+  /** Per-worktree/agent health for the diagnostics table (one entry per registered repo). */
+  worktreeHealth: (): Promise<Array<{
+    repo: string; trunk: string; baseBranch: string | null; baseOnAgentBranch: boolean;
+    worktrees: Array<{ path: string; branch: string | null; head: string; isMain: boolean; locked: boolean; dirty: number; ahead: number; agentId: string | null; flags: string[] }>;
+  }>> => ipcRenderer.invoke('git:worktreeHealth'),
+  /** Put a repo's base tree back on its trunk (stashes any uncommitted state first). */
+  resetBaseToTrunk: (repo: string): Promise<{ ok: boolean; stashed: boolean; error?: string }> =>
+    ipcRenderer.invoke('git:resetBaseToTrunk', repo),
+
   // ─── Terminal.app ────────────────────────────────────────────────────────
   openTerminalAt: (cwd: string): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('terminal:openAtFolder', cwd),
+  /** Reveal a folder in the OS file manager (Explorer/Finder). */
+  revealFolder: (cwd: string): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('folder:reveal', cwd),
+  /** Open a folder in the user's editor (VS Code `code` if on PATH, else reveal it). */
+  openInEditor: (cwd: string): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('folder:openInEditor', cwd),
 
   // ─── Clipboard ─────────────────────────────────────────────────────────────
   copyToClipboard: (text: string): Promise<{ ok: boolean; error?: string }> =>
@@ -297,12 +392,71 @@ const api = {
     ipcRenderer.invoke('config:update', patch),
   ensureHarnessHome: (path: string): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('config:ensureHome', path),
+
+  // ─── Fleet default model (E005 / FR-005) ───────────────────────────────────
+  /** The house-wide default MODEL id (`HarnessConfig.defaultModel`) applied to new
+   *  agents that pick no explicit model. Thin passthrough over the existing
+   *  `config:get`/`config:update` IPC — NO new secret path; the provider is derived
+   *  from the id (DR-1), never stored. `getFleetDefault` returns the stored id (or
+   *  undefined ⇒ role-based fallback); `setFleetDefault` writes it (a blank string
+   *  clears it). Changing it is non-retroactive — existing agents keep their
+   *  creation-time snapshot (DR-4). */
+  fleetDefault: {
+    get: async (): Promise<string | undefined> => {
+      const cfg: HarnessConfig = await ipcRenderer.invoke('config:get');
+      const id = (cfg.defaultModel ?? '').trim();
+      return id.length ? id : undefined;
+    },
+    set: (modelId: string | undefined): Promise<HarnessConfig> =>
+      ipcRenderer.invoke('config:update', { defaultModel: (modelId ?? '').trim() || undefined } as Partial<HarnessConfig>)
+  },
   /** Change the harness home folder. 'move' copies the existing hive + palace
    *  into the new folder (old kept as a safety net); 'fresh' just re-points and
    *  bootstraps an empty home. On success the app relaunches (never resolves);
    *  on failure (e.g. copy error) returns { ok: false, error }. */
   changeHome: (newHome: string, mode: 'move' | 'fresh'): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('config:changeHome', { newHome, mode }),
+
+  // ─── Per-agent assignment seam (E005 / FR-013, DR-10) ──────────────────────
+  /** The GOD assignment seam. GOD assigns a provider+model to an agent
+   *  programmatically through the SAME mechanism the operator uses: `assign`
+   *  records the derived provider (main-side, for the E006 runtime seam) and
+   *  forwards the model to the renderer, which applies it via the existing
+   *  agent-update path (writing `model` + `assignmentSource='explicit'`, then
+   *  persisting). The provider is DERIVED from the model id (DR-1), never stored;
+   *  no secret path. `onAgentAssign` is the renderer-side subscription that applies
+   *  a forwarded assignment; returns an unsubscribe fn. */
+  agent: {
+    assign: (agentId: string, modelId: string | undefined):
+      Promise<{ ok: boolean; providerId: string | null; error?: string }> =>
+      ipcRenderer.invoke('agent:assign', agentId, modelId),
+    onAgentAssign: (cb: (e: { agentId: string; modelId: string }) => void): (() => void) => {
+      const listener = (_e: IpcRendererEvent, payload: { agentId: string; modelId: string }) => cb(payload);
+      ipcRenderer.on('agent:assigned', listener);
+      return () => ipcRenderer.removeListener('agent:assigned', listener);
+    }
+  },
+
+  // ─── Provider credentials (E004) ─────────────────────────────────────────
+  /** Store/clear/inspect provider API keys. Keys travel main→store only; the
+   *  renderer can set a key and read presence, but never read a key back. */
+  credentials: {
+    set: (providerId: string, key: string): Promise<{ ok: boolean; error?: string }> =>
+      ipcRenderer.invoke('credentials:set', providerId, key),
+    clear: (providerId: string): Promise<{ ok: boolean; error?: string }> =>
+      ipcRenderer.invoke('credentials:clear', providerId),
+    presence: (): Promise<Record<string, boolean>> =>
+      ipcRenderer.invoke('credentials:presence')
+  },
+  /** Named secret vault. Set/clear travel renderer→main; the renderer only ever learns the NAMES
+   *  (`list`), never the values — referenced from env tables via `${secret:NAME}`. */
+  secrets: {
+    list: (): Promise<string[]> => ipcRenderer.invoke('secrets:list'),
+    set: (name: string, value: string): Promise<{ ok: boolean; error?: string }> =>
+      ipcRenderer.invoke('secrets:set', name, value),
+    clear: (name: string): Promise<{ ok: boolean; error?: string }> =>
+      ipcRenderer.invoke('secrets:clear', name)
+  },
 
   // ─── Filesystem (sandboxed to cwd) ───────────────────────────────────────
   listDir: (root: string, rel: string): Promise<
@@ -332,6 +486,12 @@ const api = {
   hiveRegistry: (): Promise<HiveRegistry> => ipcRenderer.invoke('hive:registry'),
   hiveBoard: (): Promise<string> => ipcRenderer.invoke('hive:board'),
   hiveTasks: (): Promise<unknown> => ipcRenderer.invoke('hive:tasks'),
+  // SDDP: a feature's on-disk phase markers under <repo>/specs/<feature>/ (null when absent).
+  hiveFeatureStatus: (repo: string | null, feature: string): Promise<FeatureStatus | null> =>
+    ipcRenderer.invoke('hive:featureStatus', repo, feature),
+  // SDDP host engine's per-feature live step status (active step + running/waiting/paused/blocked).
+  pipelineStatus: (): Promise<Record<string, { step: string | null; state: string; message?: string }>> =>
+    ipcRenderer.invoke('pipeline:status'),
   hiveLog: (n?: number): Promise<unknown[]> => ipcRenderer.invoke('hive:log', n ?? 200),
   hiveMemory: (id: string): Promise<string> => ipcRenderer.invoke('hive:memory', id),
   hiveInbox: (id: string): Promise<HiveMessage[]> => ipcRenderer.invoke('hive:inbox', id),
@@ -432,6 +592,43 @@ const api = {
     return () => ipcRenderer.removeListener('telemetry:event', listener);
   },
 
+  // ─── Native agent panel rendering (E008 — the AgentEvent stream) ───────────
+  /** Subscribe to a native agent's live normalized `AgentEvent` stream, forwarded
+   *  by the single-writer main bridge over the per-agent `agent:event:<agentId>`
+   *  channel (mirrors `onPtyData`). Each event was append-and-committed to the
+   *  per-agent run log BEFORE this forward, so the renderer never sees an event that
+   *  wasn't first persisted. Returns an unsubscribe fn. */
+  onAgentEvent: (agentId: string, cb: (e: AgentEvent) => void): (() => void) => {
+    const channel = `agent:event:${agentId}`;
+    const listener = (_e: IpcRendererEvent, payload: AgentEvent) => cb(payload);
+    ipcRenderer.on(channel, listener);
+    return () => ipcRenderer.removeListener(channel, listener);
+  },
+  /** Backfill a native agent's persisted run log on panel (re)open / app restart.
+   *  Returns the ordered AgentEvent array the renderer folds into its views — the
+   *  same views the live stream builds. Missing/partial/corrupt/truncated each
+   *  degrade to a best-effort array (never throws). */
+  loadNativeEvents: (agentId: string): Promise<AgentEvent[]> =>
+    ipcRenderer.invoke('agent:loadEvents', agentId),
+  /** Submit operator input / steer to a running native agent — the native-desk
+   *  peer of `writePty` for a Claude desk (E008 T023 {FR-015/021}). Bridges the
+   *  `native:send` IPC, routing the input through the ProviderRuntime send seam
+   *  in main. `input.kind` distinguishes a plain prompt (`'operator'`) from a
+   *  steer (`'steer'`) so each lands on the correct seam. Returns a structured
+   *  ack: `{ ok:true }` on delivery, `{ ok:false, error }` when the input could
+   *  not be routed (e.g. the native worker is missing) so the panel can surface
+   *  distinct not-delivered feedback (FR-022) — never throws/blocks. */
+  nativeSend: (
+    agentId: string,
+    input: { kind: 'operator' | 'steer'; text: string }
+  ): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('native:send', agentId, input),
+  /** Stop ONE native worker (operator kill, peer to `killPty`). The renderer routes
+   *  a stop by runtime kind: native desk (incl. the god) → here; Claude desk → killPty.
+   *  A stopped native worker is archived + gone until respawned. */
+  nativeKill: (agentId: string): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('native:kill', agentId),
+
   // ─── Circuit breaker (Lane A #6 state → avatars/meter) ──────────────────────
   /** Subscribe to breaker-state changes; returns an unsubscribe fn. */
   onBreakerState: (cb: (s: BreakerState) => void): (() => void) => {
@@ -442,6 +639,15 @@ const api = {
   /** Push a breaker state to the renderer (Lane A's policy / interim glue calls this). */
   setBreakerState: (state: BreakerState): Promise<{ ok: boolean }> =>
     ipcRenderer.invoke('control:setBreakerState', state),
+
+  /** Subscribe to the authoritative live fleet state (per-desk running + in-a-turn), pushed on
+   *  the fleet-snapshot beat. The renderer reconciles each desk's status from it so a stale
+   *  "working" badge self-heals. Returns an unsubscribe fn. */
+  onFleetState: (cb: (state: { id: string; running: boolean; inTurn: boolean }[]) => void): (() => void) => {
+    const listener = (_e: IpcRendererEvent, payload: { id: string; running: boolean; inTurn: boolean }[]) => cb(payload);
+    ipcRenderer.on('fleet:state', listener);
+    return () => ipcRenderer.removeListener('fleet:state', listener);
+  },
 
   // ─── Operator control over agents (#7C.1–7C.3) ──────────────────────────────
   /** Pause/unpause an agent — paused → its tool calls are denied at PreToolUse. */
@@ -478,6 +684,9 @@ const api = {
   listMissions: (): Promise<ScheduledMission[]> => ipcRenderer.invoke('missions:list'),
   saveMissions: (missions: ScheduledMission[]): Promise<{ ok: boolean }> =>
     ipcRenderer.invoke('missions:save', missions),
+  /** Fire a mission immediately (the "fire now" button), regardless of its interval. */
+  fireMission: (id: string): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('missions:fireNow', id),
   /** Fires when the scheduler stamps a mission's lastFiredAt (a beat/dispatch),
    *  so the SCHEDULES panel can refresh "last fired" without a reload. */
   onMissionsUpdated: (cb: () => void): (() => void) => {
@@ -520,6 +729,10 @@ const api = {
    *  archives it automatically via pty:kill; this is the explicit primitive. */
   hiveSetArchived: (id: string, archived: boolean): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('hive:setArchived', id, archived),
+  /** Set an agent's capability roles (worker / reviewer / integrator). Durable in the
+   *  registry; the capability gate applies immediately, the role's prompt on next respawn. */
+  hiveSetRoles: (id: string, roles: ('worker' | 'reviewer' | 'integrator' | 'planner' | 'qc')[]): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('hive:setRoles', id, roles),
 
   // ─── Slack integration (Slack message → Michael's queue) ─────────────────────
   /** Register a listener for inbound Slack messages; returns an unsubscribe fn.

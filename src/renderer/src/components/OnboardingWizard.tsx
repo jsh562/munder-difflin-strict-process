@@ -76,7 +76,7 @@ export function OnboardingWizard({ onComplete }: OnboardingWizardProps) {
       zIndex: 200,
       padding: 32
     }}>
-      <div style={{ width: 640, maxWidth: '94vw' }}>
+      <div style={{ width: 640, maxWidth: '94vw', maxHeight: 'calc(100vh - 64px)', overflowY: 'auto' }}>
         <PixelPanel
           variant="dialog"
           title={

@@ -4,16 +4,24 @@ import { PixelBadge } from './PixelBadge';
 import { PixelButton } from './PixelButton';
 import { SpritePortrait } from './SpritePortrait';
 import { PtyTerminalView } from './PtyTerminalView';
+import { NativeTranscriptView } from './NativeTranscriptView';
 import { MessageQueueComposer } from './MessageQueueComposer';
+import { isNativeRuntimeDesk } from '@/lib/runtimeKind';
+import { displayStatus } from '@/lib/agentStatus';
+import { stopAgent, startGod, pauseAgent } from '@/lib/agentControl';
+import { AgentRoleControl } from './AgentRoleControl';
+import { AgentWorkspaceControl } from './AgentWorkspaceControl';
+import { restartDesk } from '@/lib/restartDesk';
 import { TasksKanban } from './TasksKanban';
-import { disposeTerminal } from './terminalPool';
 import { Icon } from './Icon';
 import { MemoryGraphPanel } from './MemoryGraphPanel';
+import { ProviderModelPicker } from './ProviderModelPicker';
 import { useFleetTelemetry } from '@/hooks/useTelemetry';
 import { COMMAND_GROUPS } from '@shared/claudeCommands';
+import { MISSION_TEMPLATES } from '@shared/missionTemplates';
 import { useStore, type Agent } from '@/store/store';
 import { usePtyParser } from '@/hooks/usePtyParser';
-import { buildSpawnCommand, AGENT_MODELS } from '@/store/config';
+import { assignmentProvenance, isAssignmentStale } from '@shared/assignment';
 
 /** Michael's control surface. Shown instead of the plain terminal/files panel
  *  when the god agent is selected: terminal + queue, the floor roster (with
@@ -35,6 +43,8 @@ interface ScheduledMission {
   /** 'heartbeat' (Lane A #1) is a context-aware adaptive beat, not a plain dispatch. */
   kind?: 'dispatch' | 'heartbeat';
   quietThresholdMs?: number;
+  /** Per-project scoping (a repo path): fire to that project's desks instead of `to`. */
+  project?: string;
 }
 
 /** Compact relative time, e.g. "4m ago" / "in 2m" / "just now". A positive ms is
@@ -73,7 +83,7 @@ interface GHIssue {
 
 const TABS: { key: CCTab; label: string; icon: Parameters<typeof Icon>[0]['name'] }[] = [
   { key: 'terminal', label: 'terminal', icon: 'terminal' },
-  { key: 'floor', label: 'monitor', icon: 'mcp' },
+  { key: 'floor', label: 'agents', icon: 'mcp' },
   { key: 'tasks', label: 'tasks', icon: 'check' },
   { key: 'memory', label: 'memory', icon: 'sparkle' },
   { key: 'graph', label: 'graph', icon: 'web' },
@@ -94,6 +104,15 @@ export function CommandCenterPanel({ agent }: { agent: Agent }) {
   const fullscreenAgentId = useStore((s) => s.fullscreenAgentId);
   const onPtyStream = usePtyParser(agent.id);
   const isFullscreenedHere = fullscreenAgentId === agent.id;
+  // A native god (DeepSeek/Minimax) has no Claude PTY — show its synthesized transcript
+  // (not the PTY view / "no live terminal"). Mirrors the main router's model resolution
+  // via the fleet-default fallback (a god's record may carry no explicit model).
+  const fleetDefaultModel = useStore((s) => s.fleetDefaultModel);
+  const isNative = isNativeRuntimeDesk(agent, fleetDefaultModel);
+  // Operator Stop/Pause/Start for Michael (Part 2). `godDesired === 'stopped'` means a
+  // Stop is in effect (worker killed, kept down across reloads); Start brings him back.
+  const godDesired = useStore((s) => s.godDesired);
+  const paused = useStore((s) => !!s.paused[agent.id]);
 
   return (
     <PixelPanel
@@ -119,9 +138,32 @@ export function CommandCenterPanel({ agent }: { agent: Agent }) {
             fontFamily: 'var(--cth-font-display)', fontSize: 10, lineHeight: '14px', color: 'var(--cth-ink-900)'
           }}>MICHAEL · COMMAND CENTER</div>
           <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginTop: 1 }}>
-            <PixelBadge status={agent.status} />
-            <span style={{ fontSize: 12, color: 'var(--cth-ink-500)' }}>runs the floor</span>
+            <PixelBadge status={displayStatus(agent, paused, godDesired)} />
+            <span style={{ fontSize: 12, color: 'var(--cth-ink-500)' }}>
+              {godDesired === 'stopped' ? 'stopped' : paused ? 'paused' : 'runs the floor'}
+            </span>
           </div>
+        </div>
+        {/* Operator controls — Stop/Pause while running, Start once stopped. */}
+        <div style={{ display: 'flex', gap: 4, flexShrink: 0 }}>
+          {godDesired === 'stopped' ? (
+            <CtlButton onClick={() => startGod()} title="Start Michael (respawn his worker)" tone="go">
+              <Icon name="play" /> start
+            </CtlButton>
+          ) : (
+            <>
+              <CtlButton
+                onClick={() => void pauseAgent(agent.id, !paused)}
+                title={paused ? 'Resume Michael' : 'Pause Michael (deny tools, stop waking him)'}
+                tone={paused ? 'go' : 'idle'}
+              >
+                <Icon name={paused ? 'play' : 'pause'} /> {paused ? 'resume' : 'pause'}
+              </CtlButton>
+              <CtlButton onClick={() => void stopAgent(agent, isNative)} title="Stop Michael (kill his worker)" tone="stop">
+                <Icon name="x" /> stop
+              </CtlButton>
+            </>
+          )}
         </div>
       </div>
 
@@ -158,6 +200,13 @@ export function CommandCenterPanel({ agent }: { agent: Agent }) {
         {tab === 'terminal' && (
           isFullscreenedHere ? (
             <Centered>Terminal is open in fullscreen. Press Esc to bring it back.</Centered>
+          ) : isNative ? (
+            <>
+              <div style={{ flex: 1, minHeight: 0, display: 'flex' }}>
+                <NativeTranscriptView agentId={agent.id} embedded />
+              </div>
+              <MessageQueueComposer agent={agent} />
+            </>
           ) : agent.ptyId ? (
             <>
               <div style={{ flex: 1, minHeight: 0, display: 'flex' }}>
@@ -212,8 +261,15 @@ export function CommandCenterPanel({ agent }: { agent: Agent }) {
 
 function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
   const agents = useStore((s) => s.agents);
+  const pausedMap = useStore((s) => s.paused);
+  const godDesired = useStore((s) => s.godDesired);
   const select = useStore((s) => s.select);
   const updateAgent = useStore((s) => s.updateAgent);
+  // E005 {FR-003/FR-004} — per-desk re-assign + revert-to-default helpers. These
+  // persist the new binding (survives restart, SC-006); `restartWithModel` below
+  // also restarts the live PTY so the change takes effect immediately.
+  const reassignAgentModel = useStore((s) => s.reassignAgentModel);
+  const revertAgentToFleetDefault = useStore((s) => s.revertAgentToFleetDefault);
   const enrichEnabled = useStore((s) => s.enrichEnabled);
   const setEnrichEnabled = useStore((s) => s.setEnrichEnabled);
   const toolCounts = useStore((s) => s.toolCounts);
@@ -222,6 +278,10 @@ function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
   // AND live cost/usage in one place).
   const { samples, spark, rate, lastTool, breakers } = useFleetTelemetry();
   const [repos, setRepos] = useState<string[]>([]);
+  // E005 {FR-004} — the current house default model id (config `defaultModel`),
+  // read from the bridge. Drives the "revert to fleet default" action + the
+  // provenance label so a desk reads "fleet default" vs "custom".
+  const [fleetDefault, setFleetDefault] = useState<string | undefined>(undefined);
   // Floor-wide token budget (drives the breaker); also the token-meter denominator.
   const [tokenCap, setTokenCap] = useState<number | undefined>(undefined);
   // Per-agent token limit (overrides the floor budget for that agent), keyed by id.
@@ -242,12 +302,18 @@ function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
   const [mInterval, setMInterval] = useState<string>(String(INTERVAL_OPTS[0].ms));
   const [mTo, setMTo] = useState<string>('god');
   const [mBody, setMBody] = useState('');
+  // Per-project scoping: '' = use the `to` recipient; otherwise a repo path → that
+  // project's desks. Value `tpl:<i>` in the target select means "apply template i".
+  const [mProject, setMProject] = useState<string>('');
 
   useEffect(() => {
     window.cth.getConfig().then((c) => {
       setRepos(c.registeredRepos ?? []);
       setTokenCap(c.costCapTokens);
       setAgentTokenCaps(c.agentTokenCaps ?? {});
+      // E005 — the house default id (provider derived from it, DR-1); blank ⇒ unset.
+      const def = (c.defaultModel ?? '').trim();
+      setFleetDefault(def.length ? def : undefined);
     }).catch(() => { /* noop */ });
     window.cth.listMissions().then(setMissions).catch(() => { /* noop */ });
     // Refresh "last fired" when the scheduler stamps a beat/dispatch (#2.3).
@@ -281,31 +347,50 @@ function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
       intervalMs: Number(mInterval),
       to: mTo,
       body: mBody.trim(),
-      enabled: true
+      enabled: true,
+      // A project path scopes the mission to that project's desks (overrides `to` at fire).
+      ...(mProject ? { project: mProject } : {})
     };
     persistMissions([...missions, next]);
-    setMLabel(''); setMBody('');
+    setMLabel(''); setMBody(''); setMProject('');
   };
+  // Prefill the create form from a built-in template (label/interval/to/body).
+  const applyTemplate = (i: number) => {
+    const t = MISSION_TEMPLATES[i];
+    if (!t) return;
+    setMLabel(t.label);
+    setMInterval(String(t.intervalMs));
+    setMTo(t.to);
+    setMBody(t.body);
+  };
+  const fireNow = (id: string) => { void window.cth.fireMission(id).catch(() => { /* noop */ }); };
   const targetName = (to: string) =>
     to === 'broadcast' ? 'everyone' : to === 'god' ? 'Michael' : agents.find((a) => a.id === to)?.name ?? to;
   const intervalLabel = (ms: number) => INTERVAL_OPTS.find((o) => o.ms === ms)?.label ?? `${Math.round(ms / 3600000)}h`;
 
-  const restartWithModel = async (a: Agent, model: string | undefined) => {
-    if (!a.ptyId) return;
+  // E005 {FR-003/FR-004} — change a desk's model (or revert it to the fleet
+  // default) AND restart its live PTY so the new `--model` takes effect. `source`
+  // records provenance: 'explicit' for an operator/GOD pick (re-assign), or
+  // 'fleet-default' when re-inheriting the house default. The persisted assignment
+  // (model + assignmentSource) is written via the store helpers below so it
+  // survives the localStorage round-trip (SC-006); `updateAgent` then carries the
+  // transient run-state (command/status) that needn't persist.
+  const restartWithModel = async (
+    a: Agent,
+    model: string | undefined,
+    source: 'explicit' | 'fleet-default'
+  ) => {
     setRestarting(a.id);
     try {
-      const cfg = await window.cth.getConfig();
-      await window.cth.killPty(a.ptyId);
-      disposeTerminal(a.ptyId);
-      const command = buildSpawnCommand(cfg, model);
-      const [exe, ...args] = command.trim().split(/\s+/);
-      const hive = a.isGod
-        ? { id: a.id, name: a.name, cwd: a.cwd, isGod: true, role: 'orchestrator (god)' }
-        : a.isAssistant
-        ? { id: a.id, name: a.name, cwd: a.cwd, isAssistant: true, role: "Michael's prep assistant" }
-        : { id: a.id, name: a.name, cwd: a.cwd, role: a.description };
-      const res = await window.cth.spawnPty({ id: a.ptyId, cwd: a.cwd, command: exe, args, cols: 100, rows: 30, hive });
-      if (res.ok) updateAgent(a.id, { command: command.trim(), model, status: 'idle', action: 'restarting…' });
+      // Shared respawn — works for native desks too (the old PTY-only path early-returned
+      // on `!a.ptyId`, so native model-change silently did nothing).
+      const res = await restartDesk(a, { model });
+      if (res.ok) {
+        // Persist the durable assignment (model + provenance), then the transient run-state.
+        if (source === 'fleet-default') revertAgentToFleetDefault(a.id, model);
+        else reassignAgentModel(a.id, model);
+        updateAgent(a.id, { status: 'idle', action: 'restarting…' });
+      }
     } catch { /* noop */ } finally {
       setRestarting(null);
     }
@@ -454,7 +539,7 @@ function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
                   fontFamily: 'var(--cth-font-ui)', fontSize: 13, color: 'var(--cth-ink-900)'
                 }}
               >{a.name}{a.isGod ? ' (god)' : a.isAssistant ? ' (assistant)' : ''}</button>
-              <PixelBadge status={armed ? 'looping' : a.status} />
+              <PixelBadge status={armed ? 'looping' : displayStatus(a, !!pausedMap[a.id], godDesired)} />
               {armed && <span title={breaker?.reason} style={{ color: 'var(--cth-coral)', fontSize: 12 }}>⚠</span>}
               <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--cth-ink-500)' }}>
                 {(toolCounts[a.id] ?? 0)} tool calls
@@ -519,20 +604,15 @@ function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
                 </span>
               )}
             </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-              <Select
-                value={a.model ?? ''}
-                disabled={restarting === a.id}
-                onChange={(v) => restartWithModel(a, v || undefined)}
-              >
-                {AGENT_MODELS.map((m) => (
-                  <option key={m.label} value={m.id ?? ''}>{m.label}</option>
-                ))}
-              </Select>
-              <span style={{ fontSize: 11, color: 'var(--cth-ink-500)' }}>
-                {restarting === a.id ? 'restarting…' : 'model (restarts agent)'}
-              </span>
-            </div>
+            <AgentModelControl
+              agent={a}
+              fleetDefault={fleetDefault}
+              busy={restarting === a.id}
+              onPick={(id) => restartWithModel(a, id, 'explicit')}
+              onRevert={() => restartWithModel(a, fleetDefault, 'fleet-default')}
+            />
+            <AgentRoleControl agent={a} />
+            {!a.isGod && !a.isAssistant && <AgentWorkspaceControl agent={a} />}
           </div>
           );
         })}
@@ -593,10 +673,19 @@ function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
             <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ fontSize: 13, color: 'var(--cth-ink-900)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.label}</div>
               <div style={{ fontSize: 11, color: 'var(--cth-ink-500)' }}>
-                → {targetName(m.to)}{hb ? ` · adaptive ~${intervalLabel(m.intervalMs)} · auto digest` : ''}
+                → {m.project ? `${m.project.split(/[\\/]/).filter(Boolean).pop()} (project)` : targetName(m.to)}{hb ? ` · adaptive ~${intervalLabel(m.intervalMs)} · auto digest` : ''}
               </div>
               <div style={{ fontSize: 10, color: 'var(--cth-ink-500)' }}>{fired}{next}</div>
             </div>
+            <button
+              onClick={() => fireNow(m.id)}
+              title="Fire this mission now (ignores the interval)"
+              style={{
+                padding: '2px 7px 1px', border: 'none', cursor: 'pointer', flexShrink: 0,
+                background: 'var(--cth-cream-200)', boxShadow: 'inset 0 0 0 1px var(--cth-ink-700)',
+                fontFamily: 'var(--cth-font-ui)', fontSize: 12, color: 'var(--cth-ink-900)'
+              }}
+            >▶ now</button>
             <button
               onClick={() => toggleMission(m.id)}
               style={{
@@ -619,6 +708,17 @@ function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
           </div>
           );
         })}
+        {/* Start from a built-in template (prefills label/interval/target/body). */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 6 }}>
+          <span style={{ fontFamily: 'var(--cth-font-display)', fontSize: 8, color: 'var(--cth-ink-500)' }}>TEMPLATE</span>
+          <Select
+            value=""
+            onChange={(v) => { if (v !== '') applyTemplate(Number(v)); }}
+          >
+            <option value="">— from template —</option>
+            {MISSION_TEMPLATES.map((t, i) => <option key={t.label} value={String(i)}>{t.label}</option>)}
+          </Select>
+        </div>
         <div style={{ display: 'flex', gap: 6, marginTop: 6, marginBottom: 6 }}>
           <input
             value={mLabel}
@@ -629,11 +729,18 @@ function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
           <Select value={mInterval} onChange={setMInterval}>
             {INTERVAL_OPTS.map((o) => <option key={o.ms} value={String(o.ms)}>{o.label}</option>)}
           </Select>
-          <Select value={mTo} onChange={setMTo}>
+          {/* Target: a single recipient, OR a project (fires to that project's desks). */}
+          <Select value={mProject ? `proj:${mProject}` : mTo} onChange={(v) => {
+            if (v.startsWith('proj:')) { setMProject(v.slice(5)); }
+            else { setMProject(''); setMTo(v); }
+          }}>
             <option value="broadcast">everyone</option>
             <option value="god">Michael</option>
             {agents.filter((a) => !a.isGod).map((a) => (
               <option key={a.id} value={a.id}>{a.name}</option>
+            ))}
+            {repos.map((r) => (
+              <option key={r} value={`proj:${r}`}>{r.split(/[\\/]/).filter(Boolean).pop()} (project)</option>
             ))}
           </Select>
         </div>
@@ -718,6 +825,142 @@ function FloorTab({ seed }: { seed: { text: string; seq: number } }) {
         )}
       </Section>
     </Scroll>
+  );
+}
+
+// ─── Per-desk model assignment (E005 / FR-003, FR-004, US3) ──────────────────
+
+/** The per-agent provider+model change surface on the Floor roster — the REAL
+ *  per-desk edit-assignment control (the plan named AddAgentModal, but that is
+ *  creation-only; an EXISTING desk's model is changed here). Surfaces:
+ *   - a default-vs-custom provenance badge via `assignmentProvenance` (FR-004): a
+ *     desk reads "custom" when it carries an explicit pick, "fleet default" when it
+ *     inherits the house default, "role default" when neither is set, and "stale"
+ *     when its stored model id no longer resolves (DR-5, preserved + flagged);
+ *   - the shared `ProviderModelPicker` (FR-001/FR-009) to re-assign — provider
+ *     grouped, capability tags, non-blocking gap warning; picking restarts the PTY;
+ *   - a "revert to fleet default" action (FR-004) shown only when the desk is
+ *     custom AND a fleet default exists. Provider is DERIVED from the model (DR-1). */
+function AgentModelControl({
+  agent,
+  fleetDefault,
+  busy,
+  onPick,
+  onRevert
+}: {
+  agent: Agent;
+  fleetDefault: string | undefined;
+  busy: boolean;
+  onPick: (modelId: string) => void;
+  onRevert: () => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const stale = isAssignmentStale(agent.model);
+  // The persisted `assignmentSource` is the source of truth for the badge (a desk
+  // frozen as fleet-default reads "fleet default" even if resolution shifts). With
+  // no stored source and no model, the desk is on the role-based fallback.
+  const resolved = agent.assignmentSource ?? (agent.model ? 'explicit' : 'role-based');
+  const prov = assignmentProvenance(resolved, agent.assignmentSource);
+  const canRevert = prov.isCustom && !!fleetDefault;
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+        {/* Provenance badge — custom vs fleet default vs role default (FR-004). */}
+        <span
+          title={
+            stale
+              ? `This desk's model (${agent.model}) is no longer in the registry — pick a new one.`
+              : prov.isCustom
+              ? `Custom model for this desk: ${agent.model}`
+              : prov.isFleetDefault
+              ? `Inheriting the fleet default${agent.model ? ` (${agent.model})` : ''}`
+              : 'Using the role-based default model'
+          }
+          style={{
+            padding: '1px 6px 0',
+            fontFamily: 'var(--cth-font-ui)',
+            fontSize: 11,
+            lineHeight: '16px',
+            color: 'var(--cth-ink-900)',
+            background: stale
+              ? 'var(--cth-coral-light)'
+              : prov.isFleetDefault
+              ? 'var(--cth-mint-light)'
+              : 'var(--cth-cream-200)',
+            boxShadow: `inset 0 0 0 1px ${stale ? 'var(--cth-coral)' : 'var(--cth-ink-700)'}`
+          }}
+        >
+          {stale ? 'stale' : prov.label}
+        </span>
+        <span
+          style={{
+            flex: 1,
+            minWidth: 0,
+            fontFamily: 'var(--cth-font-mono)',
+            fontSize: 11,
+            color: 'var(--cth-ink-500)',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap'
+          }}
+        >
+          {agent.model ?? 'role default'}
+        </span>
+        <button
+          onClick={() => setEditing((v) => !v)}
+          disabled={busy}
+          style={{
+            flexShrink: 0,
+            padding: '2px 8px 1px',
+            border: 'none',
+            cursor: busy ? 'default' : 'pointer',
+            background: editing ? 'var(--cth-sky)' : 'var(--cth-cream-200)',
+            boxShadow: `inset 0 0 0 1px ${editing ? 'var(--cth-ink-900)' : 'var(--cth-ink-700)'}`,
+            fontFamily: 'var(--cth-font-ui)',
+            fontSize: 11,
+            color: 'var(--cth-ink-900)',
+            opacity: busy ? 0.6 : 1
+          }}
+        >
+          {busy ? 'restarting…' : editing ? 'close' : 'change model'}
+        </button>
+        {canRevert && (
+          <button
+            onClick={onRevert}
+            disabled={busy}
+            title={`Revert this desk to the fleet default (${fleetDefault})`}
+            style={{
+              flexShrink: 0,
+              padding: '2px 8px 1px',
+              border: 'none',
+              cursor: busy ? 'default' : 'pointer',
+              background: 'var(--cth-cream-200)',
+              boxShadow: 'inset 0 0 0 1px var(--cth-ink-700)',
+              fontFamily: 'var(--cth-font-ui)',
+              fontSize: 11,
+              color: 'var(--cth-ink-900)',
+              opacity: busy ? 0.6 : 1
+            }}
+          >
+            revert to default
+          </button>
+        )}
+      </div>
+      {editing && (
+        <ProviderModelPicker
+          selectedModelId={agent.model}
+          accent={agent.accent}
+          onChange={(id) => {
+            setEditing(false);
+            onPick(id);
+          }}
+        />
+      )}
+      <span style={{ fontSize: 11, color: 'var(--cth-ink-500)' }}>
+        changing the model restarts the agent
+      </span>
+    </div>
   );
 }
 
@@ -1073,6 +1316,27 @@ function Centered({ children }: { children: React.ReactNode }) {
 
 function Muted({ children }: { children: React.ReactNode }) {
   return <div style={{ fontSize: 12, color: 'var(--cth-ink-500)' }}>{children}</div>;
+}
+
+/** Compact header control button (Stop / Pause / Start). `tone` colours the chip:
+ *  stop=coral, go=mint (start/resume), idle=cream (pause). */
+function CtlButton({
+  onClick, title, tone, children
+}: { onClick: () => void; title: string; tone: 'stop' | 'go' | 'idle'; children: React.ReactNode }) {
+  const bg = tone === 'stop' ? 'var(--cth-coral-light)' : tone === 'go' ? 'var(--cth-mint-light)' : 'var(--cth-cream-200)';
+  const edge = tone === 'stop' ? 'var(--cth-coral)' : tone === 'go' ? 'var(--cth-ink-900)' : 'var(--cth-ink-700)';
+  return (
+    <button
+      onClick={onClick}
+      title={title}
+      style={{
+        display: 'inline-flex', alignItems: 'center', gap: 4,
+        padding: '3px 8px 2px', border: 'none', cursor: 'pointer',
+        background: bg, boxShadow: `inset 0 0 0 1px ${edge}`,
+        fontFamily: 'var(--cth-font-ui)', fontSize: 12, color: 'var(--cth-ink-900)'
+      }}
+    >{children}</button>
+  );
 }
 
 function Pre({ children }: { children: React.ReactNode }) {

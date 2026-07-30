@@ -86,6 +86,33 @@ world** so every agent remembers what it learns and recalls it instantly.
 - **Memory that's instant.** A markdown-first memory layer with a semantic recall index means agents
   remember across sessions and recall in milliseconds.
 
+## What this fork adds
+
+This is a fork of [`chaitanyagiri/munder-difflin`](https://github.com/chaitanyagiri/munder-difflin).
+Upstream runs **every agent as a CLI subprocess** in a terminal. This fork adds a second, more deeply
+integrated way to run agents — and a set of coordination features built on top of it. The existing
+Claude/CLI path keeps working unchanged.
+
+**Full engineering detail: [`FORK-FEATURES.md`](./FORK-FEATURES.md).**
+
+- **Native in-process runtime (DeepSeek · Minimax).** The app runs the agent loop itself and calls
+  the LLM API directly — parsing the stream and executing tool calls in-process — instead of only
+  driving a CLI. Both agent kinds share one `ProviderRuntime` interface, so Claude is unaffected.
+- **In-app tool harness (19 tools).** Because a native agent has no CLI to provide tools, the app
+  does: `read_file` / `edit_file` / `grep` / `bash` / `web_search`, nine `hive_*` coordination tools,
+  and `spawn_subagent` — each governed by a permission gate and circuit breaker in the main process.
+- **Typed agent roles.** `worker · integrator · reviewer · planner · qc`, where the role decides which
+  tools an agent is even offered (a reviewer never sees an edit tool).
+- **Git worktree orchestration.** Per-task branches, worktree health classification, merge preview,
+  and a review / bulk-delete panel.
+- **Richer task board.** REVIEW / INTEGRATE lanes, "blocked by" chips with jump-to-blocker, role-gated
+  lanes, a per-feature phase tracker, and fleet Pause-all / Resume-all / Stop-all.
+- **SDDP — spec-driven mode.** An optional, gated Specify → Plan → Tasks → Implement → QC → Integrate
+  lifecycle with filesystem-enforced phase gates and an automated QC bug-fix loop.
+- **Plus:** a secrets vault + proxy/runtime env, cross-provider cost telemetry, agent web search
+  (keyless DuckDuckGo), Windows Git Bash for the `bash` tool, and a Vitest + ESLint test suite
+  (56 test files).
+
 ## How it works
 
 ```

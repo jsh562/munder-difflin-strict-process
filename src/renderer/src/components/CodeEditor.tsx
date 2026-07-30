@@ -19,7 +19,7 @@ const cthEditorTheme = EditorView.theme({
     background: '#FCFAF0',
     color: '#1A1320',
     height: '100%',
-    fontFamily: 'VT323, "JetBrains Mono", monospace',
+    fontFamily: '"Departure Mono", "Cascadia Mono", Consolas, monospace',
     fontSize: '16px'
   },
   '.cm-content': { caretColor: '#FF6B6B', padding: '8px 0' },

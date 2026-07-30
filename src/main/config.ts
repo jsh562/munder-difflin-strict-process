@@ -2,6 +2,7 @@ import { app } from 'electron';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
+import type { DeskEnvEntry } from '../shared/deskEnv';
 
 /** A recurring auto-dispatched mission fired on an interval by the scheduler. */
 export interface ScheduledMission {
@@ -24,6 +25,10 @@ export interface ScheduledMission {
    *  inbox/outbox mtimes, any PTY output) has moved in this many ms. Default
    *  ~5 min. NOT derived from registry.status (which never transitions in main). */
   quietThresholdMs?: number;
+  /** Per-project scoping (a repo path). When set, the mission fires to every non-archived
+   *  desk whose project matches this repo (instead of the single `to`), so a standup/triage
+   *  can target one project's team. Absent ⇒ the plain `to` recipient. */
+  project?: string;
 }
 
 /** The built-in hourly ops standup: god reviews who's doing what + whether tasks
@@ -96,13 +101,41 @@ export interface HarnessConfig {
   onboardingComplete: boolean;
   /** Folder where the harness keeps its own state (agent metadata, logs). */
   harnessHome: string | null;
+  /** Optional working directory for a NATIVE god — its own scratch space, kept
+   *  separate from the hive bookkeeping so its file writes can't pollute the registry
+   *  / board / memory. Unset ⇒ auto-derived `<harnessHome>/workspace`. */
+  godWorkspace?: string;
+  /** One root for EVERY desk's redirected build output (Rust `target/`, …), keyed per working tree
+   *  so heavy/churning build trees stay OUT of the worktrees and the repo — the operator excludes
+   *  this single folder from antivirus. Unset ⇒ auto-derived `<harnessHome>/build-cache`. */
+  buildCacheDir?: string;
+  /** Per-desk env vars (GLOBAL base), injected into each desk's environment. Each value is a TEMPLATE
+   *  with `${buildRoot}`/`${worktreeKey}`/`${cwd}`/`${agentId}`/`${harnessHome}` + `${env:NAME}` tokens
+   *  the host expands per desk (so the user defines the parent folder once and the per-worktree
+   *  structure is filled in automatically). General — any var, not just build dirs. Unset ⇒ the
+   *  built-in default (`CARGO_TARGET_DIR`). See `src/shared/deskEnv.ts`. */
+  deskEnv?: DeskEnvEntry[];
+  /** Per-project-repo env OVERRIDES, keyed by the repo path (a `registeredRepos` string; matched
+   *  case/separator-insensitively). For a desk whose project repo matches, these layer ON TOP of the
+   *  global `deskEnv` (same `name` wins). Unset ⇒ only the global table applies. */
+  deskEnvByRepo?: Record<string, DeskEnvEntry[]>;
+  /** Per-agent env OVERRIDES, keyed by EXACT agent id. Layered ON TOP of global + per-repo for that
+   *  desk (most specific wins). Unset ⇒ only the global + per-repo tables apply. */
+  deskEnvByAgent?: Record<string, DeskEnvEntry[]>;
   /** Folders the user registered during onboarding (used as quick-picks). */
   registeredRepos: string[];
   /** When true, new agents are spawned with --permission-mode bypassPermissions. */
   autoMode: boolean;
   /** The command we run when spawning a new agent. */
   defaultCommand: string;
-  /** Default model for newly spawned agents (e.g. 'claude-sonnet-4-6[1m]'); unset = CLI default. */
+  /** Default model for newly spawned agents (e.g. 'claude-sonnet-4-6[1m]'); unset = CLI default.
+   *  E005 FleetDefault (DR-1): this is the canonical, house-wide default MODEL id —
+   *  the single stored value of the fleet default. The provider is NOT stored here;
+   *  it is DERIVED from this model id at read time via the E002 registry
+   *  (`lookupModelInfo`), so the two never drift. Absence ⇒ the role-based fallback
+   *  applies (DR-8); a present-but-unresolvable id is a STALE default and falls
+   *  through to the role-based fallback at creation, never auto-remapped (DR-11).
+   *  Changing it is NON-RETROACTIVE — existing agents keep their snapshot (DR-4). */
   defaultModel?: string;
   /** Enable semantic memory (MemPalace CLI). No-op if mempalace isn't installed. */
   semanticMemory: boolean;
@@ -151,6 +184,60 @@ export interface HarnessConfig {
   slackChannelId?: string;
   /** Local HTTP port the webhook server binds to (default 3847). */
   slackPort?: number;
+  /** Per-provider API keys for native (non-Claude) providers (E004), keyed by
+   *  provider id (src/shared/providerRegistry). Plaintext at rest — an ACCEPTED
+   *  MVP risk (ADR-0007). NEVER sent to the renderer (redacted via redactConfig),
+   *  the git hive, transcripts, or telemetry; injected only into a native worker's
+   *  spawn env. A future OS-keychain backend swaps in behind the injection seam. */
+  providerKeys?: Record<string, string>;
+  /** Secret vault — named secret values referenced from env tables via `${secret:NAME}`. Encrypted at
+   *  rest (`safeStorage`, `enc:`/`raw:` prefixed). NEVER sent to the renderer (redacted to names only);
+   *  decrypted in main and injected into a desk's env. See `src/main/secrets.ts`. */
+  secrets?: Record<string, string>;
+  /** Runtime env (GLOBAL) — vars for the agent's OWN model + network calls (proxy / custom CA), e.g.
+   *  `HTTPS_PROXY`, `NO_PROXY`, `NODE_EXTRA_CA_CERTS`. Injected into the native worker process, the
+   *  Claude PTY, and bash (so git/curl honor them too). Values may use `${env:NAME}`/`${secret:NAME}`.
+   *  Distinct from `deskEnv` (which is for what desks RUN). */
+  runtimeEnv?: DeskEnvEntry[];
+  /** Opt-in: allow native (DeepSeek/Minimax) desks to run the `bash` tool. OFF by
+   *  default — a native desk gets filesystem/search/memory tools unconditionally,
+   *  but shell execution stays gated until the operator turns this on (the toolkit
+   *  still cwd-sandboxes + breaker-watches every bash call when enabled). Claude
+   *  desks are unaffected (their shell rides the CLI's own permission system). */
+  nativeBashEnabled?: boolean;
+  /** Opt-in: allow native desks to use the `web_search` tool. OFF by default. The
+   *  API key lives in `providerKeys['web-search']` (redacted like any provider key);
+   *  this flag is the operator gate. When off (or no key) the tool fails closed with
+   *  a clear note. Claude desks are unaffected (they use their own web tooling). */
+  webSearchEnabled?: boolean;
+  /** Opt-in: put the whole floor in SPEC-DRIVEN (SDDP) mode. OFF by default. When on,
+   *  desks follow the Specify→Clarify→Plan→Tasks→Implement→QC→Integrate lifecycle: role
+   *  prompts switch to the SDDP variants, the `planner`/`qc` roles become meaningful, the
+   *  kanban shows a feature-phase banner, and `hive_update_task` enforces the phase gates.
+   *  A wholesale switch — when off, standard behaviour is unchanged. */
+  sddpMode?: boolean;
+  /** SDDP autopilot (mirrors sddp27's AUTOPILOT): when ON, the host engine AUTO-RESOLVES the
+   *  human-in-the-loop gates instead of pausing for the operator — e.g. Clarify is resolved by the
+   *  spec-author with documented reasonable defaults rather than asking. OFF by default (the human
+   *  gates stay in the loop). See the Human-Gates Registry in docs/orchestration-model.md. */
+  sddpAutopilot?: boolean;
+  /** SDDP only: the model an ephemeral `spawn_subagent` specialist runs on. Lets the operator
+   *  point sub-agents at a cheaper/faster model than the orchestrator desk. The provider +
+   *  credentials are ALWAYS inherited from the calling desk; only the model id is overridden, and
+   *  only when the override resolves to the SAME provider as the caller (a cross-provider override
+   *  is ignored so the caller's key still works). Absent ⇒ sub-agents run on the caller's model. */
+  sddpSubAgentModel?: string;
+  /** SDDP policy knobs (mirrors sddp27's `.github/sddp-config.md`). `qcStrictness` selects the
+   *  required QC categories (minimal=build/test; standard=+lint; strict=+security/coverage);
+   *  `coverageTarget` is the % the QC auditor enforces; `maxChecklist` caps how many checklist files
+   *  the checklist step authors; `maxQcIterations` bounds the implement↔QC bug loop before findings are
+   *  deferred. All optional with built-in defaults. */
+  sddpConfig?: {
+    qcStrictness?: 'minimal' | 'standard' | 'strict';
+    coverageTarget?: number;
+    maxChecklist?: number;
+    maxQcIterations?: number;
+  };
 
   // ─── Memory reflection (the janitor's condense half) ───────────────────────
   /** Master toggle for the in-process MemoryReflector. Default on. */
@@ -179,6 +266,7 @@ const DEFAULTS: HarnessConfig = {
   embeddingModel: 'minilm',
   missions: [OPS_STANDUP_MISSION],
   notifications: false,
+  webSearchEnabled: false,
   slackEnabled: false,
   slackSigningSecret: undefined,
   slackBotToken: undefined,
@@ -199,13 +287,24 @@ function configPath(): string {
   return join(app.getPath('userData'), 'config.json');
 }
 
+/** Migrate legacy keys in place so older configs keep working. `buildEnv`/`buildEnvByRepo` were
+ *  renamed to `deskEnv`/`deskEnvByRepo` (the table is general, not build-only) — surface the old
+ *  values under the new keys when the new ones are absent. New writes use the new keys; the stale old
+ *  keys are harmless (ignored). */
+function migrateConfig(cfg: HarnessConfig): HarnessConfig {
+  const legacy = cfg as HarnessConfig & { buildEnv?: DeskEnvEntry[]; buildEnvByRepo?: Record<string, DeskEnvEntry[]> };
+  if (cfg.deskEnv === undefined && legacy.buildEnv !== undefined) cfg.deskEnv = legacy.buildEnv;
+  if (cfg.deskEnvByRepo === undefined && legacy.buildEnvByRepo !== undefined) cfg.deskEnvByRepo = legacy.buildEnvByRepo;
+  return cfg;
+}
+
 export function readConfig(): HarnessConfig {
   const p = configPath();
   if (!existsSync(p)) return { ...DEFAULTS };
   try {
     const raw = readFileSync(p, 'utf8');
     const parsed = JSON.parse(raw);
-    return { ...DEFAULTS, ...parsed };
+    return migrateConfig({ ...DEFAULTS, ...parsed });
   } catch {
     return { ...DEFAULTS };
   }
@@ -256,6 +355,21 @@ export function modelForRole(meta: RoleHint): string | undefined {
   const hay = `${meta.role ?? ''} ${(meta.capabilities ?? []).join(' ')}`.toLowerCase();
   if (/\b(triage|rout|verif|lint|format|summar|classif|label)/.test(hay)) return MODEL_HELPER;
   return MODEL_WORKER;
+}
+
+/** E005 {FR-005} — the configured FleetDefault MODEL id, or undefined when unset
+ *  (⇒ role-based fallback, DR-8). This reads the SINGLE stored value
+ *  (`defaultModel`) of the house default; the provider is DERIVED from the model id
+ *  at read time via the E002 registry (DR-1/HINT-001), never stored as a second
+ *  editable field, so they cannot drift. A blank string is treated as unset. The
+ *  id is returned VERBATIM — a present-but-unresolvable (stale) id is preserved and
+ *  surfaced for re-selection, never auto-remapped (DR-11); honoring DR-11 at
+ *  creation precedence is the resolver's job (src/shared/assignment.ts), which
+ *  treats a stale fleet default as absent. */
+export function fleetDefaultModel(config?: HarnessConfig): string | undefined {
+  const cfg = config ?? readConfig();
+  const id = (cfg.defaultModel ?? '').trim();
+  return id.length ? id : undefined;
 }
 
 /** Auto-suggested command string given current autoMode preference. */

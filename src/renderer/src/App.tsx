@@ -1,10 +1,13 @@
 import { useEffect, useState } from 'react';
 import { useStore, selectedAgent } from '@/store/store';
+import { restartSigOf, deskStaleKeys } from '@/lib/restartSig';
+import { FleetControls } from '@/components/FleetControls';
 import { startMockLoop, stopMockLoop } from '@/store/mockEvents';
 import type { HarnessConfig } from '@/store/config';
 import { OfficeFloor } from '@/scene/office/OfficeFloor';
 import { useHive } from '@/hooks/useHive';
 import { MemoryPanel } from '@/components/MemoryPanel';
+import { TaskBoardOverlay } from '@/components/TaskBoardOverlay';
 import { AgentDetailPanel } from '@/components/AgentDetailPanel';
 import { AgentStrip } from '@/components/AgentStrip';
 import { AddAgentModal } from '@/components/AddAgentModal';
@@ -30,8 +33,15 @@ export function App() {
   const godStatus = useStore(s => s.godStatus);
   const fullscreenAgentId = useStore(s => s.fullscreenAgentId);
   const fullscreenFilePath = useStore(s => s.fullscreenFilePath);
+  const tasksBoardOpen = useStore(s => s.tasksBoardOpen);
   const sidebarWidth = useStore(s => s.sidebarWidth);
   const setSidebarWidth = useStore(s => s.setSidebarWidth);
+  // How many live desks are running with outdated restart-required settings (e.g. SDDP toggled
+  // after they spawned) — drives the badge on the settings gear. The assistant is exempt.
+  const staleDeskCount = useStore((s) => {
+    const live = restartSigOf({ sddpMode: s.sddpMode, autoMode: s.autoMode, terminalTheme: s.terminalTheme });
+    return s.agents.filter((a) => !a.isAssistant && deskStaleKeys(a.spawnSig, live).length > 0).length;
+  });
 
   const [config, setConfig] = useState<HarnessConfig | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -41,7 +51,18 @@ export function App() {
   // Initial config load
   useEffect(() => {
     let cancelled = false;
-    window.cth.getConfig().then(c => { if (!cancelled) setConfig(c); });
+    window.cth.getConfig().then(c => {
+      if (cancelled) return;
+      setConfig(c);
+      // Mirror the fleet-default model into the store so the runtime-kind check can
+      // apply the same fallback the main spawn router uses for model-less desks (god).
+      useStore.getState().setFleetDefaultModel((c as { defaultModel?: string }).defaultModel ?? null);
+      // Mirror the restart-required settings (restartSig) so the renderer can flag desks running
+      // with outdated settings. sddpMode + autoMode + terminalTheme are baked into a desk at spawn.
+      useStore.getState().setSddpMode((c as { sddpMode?: boolean }).sddpMode === true);
+      useStore.getState().setAutoMode(c.autoMode === true);
+      useStore.getState().setTerminalTheme((c as { terminalTheme?: 'light' | 'dark' }).terminalTheme === 'dark' ? 'dark' : 'light');
+    });
     return () => { cancelled = true; };
   }, []);
 
@@ -137,13 +158,19 @@ export function App() {
         }}>
           v0.1 · {config.autoMode ? 'auto mode on' : 'auto mode off'}
         </span>
+        {/* Right cluster: fleet-wide pause/stop controls, then the settings gear. */}
+        <div className="cth-titlebar-nodrag" style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
+          <FleetControls />
+        </div>
         <button
           className="cth-titlebar-nodrag cth-settings-btn"
           onClick={() => setSettingsOpen(true)}
-          title="Settings"
+          title={staleDeskCount > 0
+            ? `${staleDeskCount} desk${staleDeskCount === 1 ? '' : 's'} running with outdated settings — open Settings to restart`
+            : 'Settings'}
           aria-label="Settings"
           style={{
-            marginLeft: 'auto',
+            position: 'relative',
             display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
             width: 28, height: 28, padding: 0,
             background: 'var(--cth-paper-100)',
@@ -153,6 +180,19 @@ export function App() {
           }}
         >
           <Icon name="gear" size={1} style={{ width: 18, height: 18 }} />
+          {/* "Restart required" badge: a desk is running with settings that changed since it
+              spawned (applies only on respawn). Coral dot + count, like an unread badge. */}
+          {staleDeskCount > 0 && (
+            <span
+              style={{
+                position: 'absolute', top: -5, right: -5, minWidth: 14, height: 14, padding: '0 3px',
+                display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                background: 'var(--cth-coral)', color: 'var(--cth-ink-900)',
+                boxShadow: '0 0 0 1.5px var(--cth-ink-900)', borderRadius: 7,
+                fontFamily: 'var(--cth-font-display)', fontSize: 8, lineHeight: '14px'
+              }}
+            >{staleDeskCount}</span>
+          )}
         </button>
       </div>
 
@@ -165,6 +205,7 @@ export function App() {
         <div style={{ flex: 1, minHeight: 0, minWidth: 0, position: 'relative' }}>
           <OfficeFloor />
           <MemoryPanel />
+          {tasksBoardOpen && <TaskBoardOverlay />}
           {agentCount === 0 && godStatus === 'booting' && <MichaelBooting />}
           {agentCount === 0 && godStatus !== 'booting' && (
             <div style={{
@@ -241,14 +282,22 @@ export function App() {
         </div>
       </div>
 
-      <AgentStrip config={config} />
+      <AgentStrip config={config} onConfigChange={setConfig} />
 
       {addAgentOpen && (
         <AddAgentModal onClose={() => setAddAgentOpen(false)} config={config} />
       )}
 
       {settingsOpen && (
-        <SettingsModal config={config} onClose={() => setSettingsOpen(false)} />
+        <SettingsModal
+          config={config}
+          onClose={() => {
+            setSettingsOpen(false);
+            // Settings writes config to disk but holds local copies; re-pull so the matrix +
+            // project-repo rows (and anything else reading App.config) reflect the changes.
+            window.cth.getConfig().then((c) => setConfig(c)).catch(() => { /* keep current */ });
+          }}
+        />
       )}
 
       {quitWarn && (

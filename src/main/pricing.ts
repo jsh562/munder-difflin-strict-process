@@ -1,53 +1,31 @@
 /**
- * Fallback-only model → price table (USD per million tokens).
+ * Compatibility shim over the provider/model registry (E002).
  *
- * The LIVE telemetry path does NOT use this. Claude Code emits a pre-computed,
- * per-model `cost_usd` on every `api_request` log and a `claude_code.cost.usage`
- * metric (verified by the 7A.1 spike), so the collector (`telemetry.ts`) trusts
- * Claude's own figure. This table exists solely for the OFFLINE transcript
- * reconciler (`transcript.ts`), which runs when telemetry is off and must
- * estimate cost from raw token counts.
- *
- * It supersedes the old hard-coded Sonnet-for-everyone constants that lived in
- * `transcript.ts` (cost bug #1 — Opus undercosted ~5×, Haiku overcosted). Prices
- * are now matched per model family. This is the ONE place per-model pricing
- * lives; both the transcript backend and the collector's fallback import it.
+ * Pricing is no longer a hardcoded family-string table — it lives in the data-
+ * driven registry (`src/shared/providerRegistry.ts`), which carries dated/tiered
+ * rows for every provider and FAILS LOUD on an unknown model id instead of the
+ * old `DEFAULT_PRICE = SONNET`. This module stays as a thin shim so existing
+ * consumers (`transcript.ts`, `telemetry.ts`) keep importing `normalizeModel` /
+ * `estimateCostUsd` unchanged. Claude cost is bit-identical to the prior table
+ * because the registry's Claude rows are the same constants (SC-006).
  */
+import {
+  computeCost,
+  lookupPrice,
+  type PriceLookupOpts,
+  type PriceRow,
+  type TokenSplit as RegistryTokenSplit
+} from '../shared/providerRegistry';
 
-/** USD per million tokens for one model family. */
+// Re-exported from the registry — the one canonical normalizer.
+export { normalizeModel } from '../shared/providerRegistry';
+
+/** USD per million tokens for one model. Kept for back-compat with `priceFor`. */
 export interface ModelPrice {
   inputPerM: number;
   outputPerM: number;
   cacheReadPerM: number;
   cacheWritePerM: number;
-}
-
-// Anthropic list prices, USD per million tokens. Approximate, fallback-only —
-// the live path uses Claude's own per-model cost, so drift here is harmless.
-const OPUS: ModelPrice = { inputPerM: 15, outputPerM: 75, cacheReadPerM: 1.5, cacheWritePerM: 18.75 };
-const SONNET: ModelPrice = { inputPerM: 3, outputPerM: 15, cacheReadPerM: 0.3, cacheWritePerM: 3.75 };
-const HAIKU: ModelPrice = { inputPerM: 0.8, outputPerM: 4, cacheReadPerM: 0.08, cacheWritePerM: 1.0 };
-
-/** When the model id is unknown, assume Sonnet (the historical default). */
-const DEFAULT_PRICE: ModelPrice = SONNET;
-
-/**
- * Strip Claude Code's variant suffix so `claude-opus-4-8[1m]` (the form the
- * `token.usage` metric carries) and `claude-opus-4-8` (the base id the
- * `api_request` log carries) resolve to the same family. Case is preserved;
- * matching is done case-insensitively in `priceFor`.
- */
-export function normalizeModel(model: string | undefined | null): string {
-  return (model ?? '').trim().replace(/\[[^\]]*\]\s*$/, '');
-}
-
-/** Resolve a model id to its price row by family, falling back to Sonnet. */
-export function priceFor(model: string | undefined | null): ModelPrice {
-  const m = normalizeModel(model).toLowerCase();
-  if (m.includes('opus')) return OPUS;
-  if (m.includes('haiku')) return HAIKU;
-  if (m.includes('sonnet')) return SONNET;
-  return DEFAULT_PRICE;
 }
 
 /** Token split used by the cost estimator (matches `AgentUsage` token fields). */
@@ -59,15 +37,64 @@ export interface TokenSplit {
 }
 
 /**
- * Estimate USD cost for a token split using the model's fallback price row.
- * Used only by the transcript reconciler; the live path trusts Claude's cost.
+ * Resolve a model id to its price row (back-compat shape). An unknown id no
+ * longer defaults to Sonnet — it returns a zeroed row (the registry has already
+ * warned), never another vendor's price.
+ */
+export function priceFor(model: string | undefined | null): ModelPrice {
+  const row: PriceRow | { unknown: true } = lookupPrice(model);
+  if ('unknown' in row) return { inputPerM: 0, outputPerM: 0, cacheReadPerM: 0, cacheWritePerM: 0 };
+  return {
+    inputPerM: row.inputPerM,
+    outputPerM: row.outputPerM,
+    cacheReadPerM: row.cacheReadPerM,
+    cacheWritePerM: row.cacheWritePerM
+  };
+}
+
+/**
+ * Estimate USD cost for a token split. Delegates to the registry's `computeCost`,
+ * which uses the same arithmetic and the same Claude price rows as before, so the
+ * result is unchanged for Claude models and fail-loud (best-effort 0) for unknown.
  */
 export function estimateCostUsd(model: string | undefined | null, tokens: TokenSplit): number {
-  const p = priceFor(model);
-  return (
-    (tokens.inputTokens / 1_000_000) * p.inputPerM +
-    (tokens.outputTokens / 1_000_000) * p.outputPerM +
-    (tokens.cacheReadTokens / 1_000_000) * p.cacheReadPerM +
-    (tokens.cacheWriteTokens / 1_000_000) * p.cacheWritePerM
-  );
+  return computeCost(model, tokens).usd;
+}
+
+/**
+ * Seam price resolution (E007 AD-003 / FR-006 / FR-007). The ONE place the usage
+ * seam resolves token counts → USD, distinguishing the two failure modes the
+ * registry's `computeCost {usd, bestEffort}` conflates:
+ *
+ *   - UNKNOWN MODEL id (`lookupPrice` → `{unknown:true}`): there is NO price row,
+ *     so NO price is billed. Returns `usd = null` (unpriced — explicitly NOT $0)
+ *     and `unknownModel = true`, so the seam writes `AgentUsageSample.usd = null`
+ *     and raises the parity warning. The registry has already `console.warn`ed
+ *     the unknown id (fail-loud) — never a wrong-vendor default.
+ *   - KNOWN MODEL, MISSING usage FIELD: the model has a price row, so the price is
+ *     never substituted. The absent field degrades to 0 for THIS computation only
+ *     (registry `computeCost` already treats a nullish field as 0); `usd` is the
+ *     best-effort number and `bestEffort = true`.
+ *
+ * The context size (the call's input/prompt length, AD-004/HINT-003) is threaded
+ * into the lookup opts so the Minimax context-length tier row is selected, then
+ * the WHOLE call (input+output+cache) is repriced at that selected dated row.
+ *
+ * USD is computed ONCE here from the registry; consumers never recompute (FR-002).
+ */
+export function resolvePrice(
+  model: string | undefined | null,
+  tokens: RegistryTokenSplit,
+  opts?: PriceLookupOpts
+): { usd: number | null; unknownModel: boolean; bestEffort: boolean } {
+  // Distinguish unknown-model FIRST — `computeCost`'s bestEffort flag conflates
+  // an unknown id with a missing field, so check the row directly (HINT-002).
+  const row = lookupPrice(model, opts);
+  if ('unknown' in row) {
+    // Unpriced: no default/substituted price. `null`, NOT 0 (FR-006).
+    return { usd: null, unknownModel: true, bestEffort: false };
+  }
+  // Known model: price is fixed; a missing token field degrades to 0 only (FR-007).
+  const { usd, bestEffort } = computeCost(model, tokens, opts);
+  return { usd, unknownModel: false, bestEffort };
 }

@@ -1,0 +1,3 @@
+E004 Provider Credential Management — QC PASSED 2026-06-09T01:41:10Z
+Typecheck PASS (node+web) | Lint 0 errors | Vitest 54/54 (8 credentials) | 7/7 SC SATISFIED | security props verified (ADR-0007).
+See qc-report.md.

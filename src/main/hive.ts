@@ -25,43 +25,28 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { randomBytes, createHash } from 'node:crypto';
 import type { AgentUsageSample } from './usage';
+import type { AgentEvent } from '../shared/agentEvent';
 import { COMMAND_GROUPS } from '../shared/claudeCommands';
+// The mailbox + task-ledger vocabulary is owned by @jsh562/won-agent-core (so the extracted
+// coding toolkit is host-agnostic); re-exported below so existing `import { HiveMessage }
+// from '../hive'` consumers across the app are unchanged.
+import { reconcileBlocked, roleCanEditCode, roleAuthorsCode, roleCanWriteFiles, canIntegrate, canReview, boardCapabilityLine, advanceMilestones } from '@jsh562/won-agent-core';
+import type { MessageAct, HiveMessage, HiveTask, AgentRole, FeatureStatus } from '@jsh562/won-agent-core';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
-export type MessageAct = 'request' | 'inform' | 'propose' | 'query' | 'agree' | 'refuse' | 'done';
-
-export interface HiveMessage {
-  id: string;
-  conversation: string;
-  in_reply_to: string | null;
-  from: string;
-  to: string;                 // an agentId, 'god', or 'broadcast'
-  act: MessageAct;
-  subject: string;
-  body: string;
-  hops: number;
-  requires_reply: boolean;
-  needs_human: boolean;
-  created_at: string;
-}
-
-export interface HiveTask {
-  id: string;
-  title: string;
-  description?: string;
-  assignee?: string;
-  status: 'todo' | 'doing' | 'blocked' | 'done';
-  dependsOn: string[];
-  priority: number;
-  createdAt: string;
-}
+export type { MessageAct, HiveMessage, HiveTask, AgentRole };
+export { roleCanEditCode, roleAuthorsCode, roleCanWriteFiles, canIntegrate, canReview, boardCapabilityLine };
 
 export interface AgentMeta {
   id: string;
   name: string;
   role?: string;
   capabilities?: string[];
+  /** Capability roles (worker / integrator). Drives the integration gate + delegation.
+   *  Separate from the god/assistant identity flags. Defaulted in `ensureAgent` when
+   *  unset (god → ['integrator'], normal desk → ['worker'], assistant → []). */
+  roles?: AgentRole[];
   cwd: string;
   isGod?: boolean;
   /** Michael's prep assistant — enriches prompts and forwards them to Michael.
@@ -143,6 +128,34 @@ export class HiveManager {
   ) {}
 
   private routerTimer: NodeJS.Timeout | null = null;
+
+  /** Resolve a desk's PROJECT repo (its origin repo for an isolated desk, else its cwd) so
+   *  task notifications can match reviewers/integrators "for that project". Defaults to the
+   *  registry cwd; the main process injects a worktree-origin-aware resolver. */
+  private repoFor: (id: string) => string | null = (id) => this.registry().agents[id]?.cwd ?? null;
+  setRepoResolver(fn: (id: string) => string | null): void { this.repoFor = fn; }
+
+  /** Resolve an SDDP feature's on-disk phase from `<repo>/specs/<feature>/`, injected by the
+   *  main process (scanFeatureStatus). Drives the planner/qc auto-routing (what's done). Default
+   *  returns null ⇒ no resolver ⇒ feature status unknown (planner ping still fires for an
+   *  un-started feature; qc ping fires unless we can confirm `.qc-passed`). */
+  private featureStatusFor: (repo: string | null, feature: string) => FeatureStatus | null = () => null;
+  setFeatureStatusResolver(fn: (repo: string | null, feature: string) => FeatureStatus | null): void { this.featureStatusFor = fn; }
+
+  /** Notify the host SDDP engine that a feature's board state changed, so it can drive the next
+   *  milestone's sub-agent (the host-driven pipeline). Injected by the main process; default no-op
+   *  (no engine / non-SDDP). Fire-and-forget from the write path — never blocks single-committer. */
+  private pipelineTrigger: (repo: string | null, feature: string) => void = () => {};
+  setPipelineTrigger(fn: (repo: string | null, feature: string) => void): void { this.pipelineTrigger = fn; }
+
+  /** Is a desk actually RUNNING right now (a live worker/PTY), injected by the main process?
+   *  Lets task routing prefer a LIVE role-holder over a dead/idle one. Default returns false (no
+   *  resolver ⇒ no preference; routing falls back to all eligible holders — today's behavior). */
+  private isRunning: (id: string) => boolean = () => false;
+  setRunningResolver(fn: (id: string) => boolean): void { this.isRunning = fn; }
+  /** SDDP planner-kickoff dedupe: feature keys (`project::feature`) already nudged to a planner
+   *  this session, so a feature lacking tasks.md is nudged ONCE (not on every board write). */
+  private nudgedPlannerFeatures = new Set<string>();
 
   /** The embedded OTLP collector's loopback URL, set by the main process once the
    *  collector is bound (telemetry.ts). null = telemetry off → no OTel env is
@@ -240,7 +253,7 @@ export class HiveManager {
    * Ensure an agent's workspace + registry entry, returning the spawn injection
    * (extra `claude` args + env) that makes the process hive-aware.
    */
-  ensureAgent(meta: AgentMeta, opts: { semanticMemory?: boolean; theme?: 'light' | 'dark' } = {}): SpawnInjection {
+  ensureAgent(meta: AgentMeta, opts: { semanticMemory?: boolean; theme?: 'light' | 'dark'; sddp?: boolean } = {}): SpawnInjection {
     const root = this.root();
     if (!root) return { args: [], env: {} };
     this.ensureHive();
@@ -262,10 +275,15 @@ export class HiveManager {
 
     // upsert registry
     const reg = this.registry();
+    const prev = reg.agents[meta.id];
+    // Capability roles: an explicit spawn value wins; else PRESERVE what's in the registry
+    // (so a role the operator set survives a respawn); else default by identity.
+    const defaultRoles: AgentRole[] = meta.isGod ? ['integrator', 'reviewer'] : meta.isAssistant ? [] : ['worker'];
     reg.agents[meta.id] = {
       ...meta,
       capabilities: meta.capabilities ?? [],
       role: meta.role ?? (meta.isGod ? 'orchestrator' : 'agent'),
+      roles: meta.roles ?? prev?.roles ?? defaultRoles,
       status: 'idle',
       // A (re)spawn always means a live terminal — clear any prior archived flag.
       archived: false,
@@ -301,7 +319,7 @@ export class HiveManager {
       env.OTEL_LOGS_EXPORT_INTERVAL = '2000';
       env.OTEL_RESOURCE_ATTRIBUTES = `agent.id=${meta.id},agent.name=${meta.name}`;
     }
-    const args = ['--append-system-prompt', this.injectedPrompt(meta, dir, root, opts.semanticMemory ?? false)];
+    const args = ['--append-system-prompt', this.injectedPrompt(meta, dir, root, opts.semanticMemory ?? false, opts.sddp ?? false)];
 
     // Phase 1 — autonomy: attach lifecycle hooks via --settings (no edits to the
     // user's repo) so the agent reports activity and drains its inbox on Stop.
@@ -335,6 +353,26 @@ export class HiveManager {
       this.appendLog({ kind: 'archive', agentId: id, archived });
       this.commit(`hive: ${archived ? 'archive' : 'unarchive'} ${id}`);
     } catch { /* best-effort — never crash a lifecycle handler */ }
+  }
+
+  /**
+   * Set an agent's capability roles (worker / integrator). Durable in the registry, so
+   * the integration gate (read live per tool call) takes effect immediately; the agent's
+   * role-specific PROMPT only changes on its next (re)spawn. No-op if unregistered.
+   */
+  setRoles(id: string, roles: AgentRole[]): void {
+    const root = this.root();
+    if (!root) return;
+    try {
+      const reg = this.registry();
+      const agent = reg.agents[id];
+      if (!agent) return;
+      agent.roles = roles;
+      agent.lastSeen = Date.now();
+      this.writeJson(join(root, 'registry.json'), reg);
+      this.appendLog({ kind: 'roles', agentId: id, roles });
+      this.commit(`hive: roles ${id} = [${roles.join(', ')}]`);
+    } catch { /* best-effort */ }
   }
 
   /**
@@ -422,7 +460,7 @@ export class HiveManager {
     const reason = [
       `You have ${fresh.length} new hive message(s) in your inbox. Address them before finishing:`,
       lines,
-      `Open the files in ${dir}/inbox/ for full detail, act on each, then move handled ones to inbox/.done/. Reply via your outbox if a message requires it.`
+      `Act on each; reply with hive_send_message if one needs a response. Re-read your inbox anytime with hive_read_inbox. (These won't be shown again — no need to open inbox files.)`
     ].join('\n');
     return { block: true, reason };
   }
@@ -454,17 +492,75 @@ export class HiveManager {
    * Volatile context belongs on the live channels — the inbox (hive messages) and
    * the PTY — never baked into this prefix. (Lane A #6.1.)
    */
-  private injectedPrompt(meta: AgentMeta, dir: string, root: string, semanticMemory: boolean): string {
+  /**
+   * The SPEC-DRIVEN (SDDP) role line for a Claude desk — the mode's lifecycle + this desk's
+   * phase responsibilities. A Claude desk additionally has the real `/sddp-*` slash-skills
+   * (which fan out to the `sddp-*` sub-agents), so this names them as an accelerator a native
+   * (DeepSeek) desk can't use. The hive plumbing (protocol/guardrails/memory) is added by the
+   * caller and is mode-independent.
+   */
+  private sddpRoleLine(meta: AgentMeta, root: string): string {
+    const lifecycle = 'SPEC-DRIVEN (SDDP) MODE is active: work flows per FEATURE through a strict, gated lifecycle with artifacts in specs/<feature>/ — Specify (spec.md) → Clarify → Plan (plan.md) → Tasks (tasks.md) → Implement → QC (.qc-passed) → Integrate. Never skip a phase; preserve artifact IDs (T###, FR-###, SC-###) and checkbox state ([ ]→[X]); never delete [NEEDS CLARIFICATION] markers. The specs/ folder is the SHARED feature workspace in the base repo — write/read it with the normal relative path specs/<feature>/... and it is shared across every desk regardless of your worktree; implement CODE on your branch, put feature ARTIFACTS in specs/.';
+    if (meta.isGod) {
+      return [
+        'You are the GOD / ORCHESTRATOR of this hive in ' + lifecycle,
+        `Drive each feature through the lifecycle and ENFORCE the gates — assign each phase to the desk holding the right role; orchestrate, do NOT author or implement. (0) Create ONE feature EPIC card per feature — hive_add_task {title:"Feature <feature>", feature, epic:true} — it carries the milestone checklist (Specify→…→QC) that the phase owners advance with hive_update_task {advanceMilestone} as each artifact lands; the board shows the feature's progress from it. (1) Assign Specify→Clarify→Plan→Tasks to a PLANNER desk (it writes spec.md/plan.md/tasks.md); answer its clarification questions. (2) SPEC/PLAN gate: a REVIEWER reads the artifacts and approves or bounces. (3) Once tasks.md exists, the host engine seeds the implement cards from it automatically (or run hive_import_tasks {feature} if it didn't) — then assign those cards to WORKER desks (P1 first; parallelize independent tasks). (4) CODE gate: a REVIEWER reviews each implemented slice. (5) A QC desk runs tests/lint/security + verifies stories vs spec → sets .qc-passed or files bug tasks. (6) An INTEGRATOR merges only AFTER .qc-passed. Run features as a PIPELINE (one in Plan while another is in QC) and parallelize Implement across workers. COLD ≠ GONE: a desk in hive_list_agents holding a role but showing running:false is COLD (parked), not gone — it wakes when you delegate/message it; treat a cold planner/reviewer/qc/integrator as AVAILABLE and route to it, never stall a feature for lack of a role-holder that exists on the floor. You ALSO have the real SDDP slash-skills — you MAY run /sddp-specify, /sddp-clarify, /sddp-plan, /sddp-tasks, /sddp-analyze, /sddp-implement-qc-loop (they fan out to the sddp-* sub-agents) to execute or accelerate any phase yourself. Monitor the floor via ${root}/fleet.json + ${root}/registry.json; keep board.md + tasks.json accurate; ask the human only for the genuinely critical.`
+      ].join(' ');
+    }
+    if (meta.isAssistant) {
+      // The prep assistant is mode-agnostic — same read-only enrich-and-route contract.
+      return 'You are Michael\'s PREP ASSISTANT. You will be handed short, possibly vague instructions (each begins with "ENRICH TASK:"). For each one: (1) figure out which project it concerns and cd into the most relevant repo — you start in Michael\'s home directory; (2) gather concrete context READ-ONLY (exact file paths, current state, relevant code, conventions, active branch, gotchas) — NEVER modify, create, or delete files; (3) rewrite the instruction into ONE clear, self-contained prompt that Michael can execute autonomously, preserving the user\'s original intent without inventing scope. Then deliver it: write ONE message JSON into your outbox with "to":"god", "act":"request", a short subject, and the finished prompt as the body. Do NOT perform the task yourself — your only output is the improved prompt sent to Michael.';
+    }
+    const roles = meta.roles ?? [];
+    return [
+      lifecycle,
+      roles.includes('planner')
+        ? 'You hold the SDDP PLANNER role: AUTHOR a feature\'s spec → plan → tasks in specs/<feature>/ (you do not implement). Specify: write spec.md (problem, scope, FR-###/TR-### requirements, SC-### success criteria with measurable Given/When/Then; mark unknowns [NEEDS CLARIFICATION]). Clarify: resolve those markers in ONE batch with god/operator, then add a ## Clarifications section. Plan: write plan.md (tech stack, data model, API contracts, ADRs). Tasks: write tasks.md ("- [ ] T### [P?] [US#|OBJ#] {FR-###} Description [after:T###]", grouped by phase, P1 = a viable MVP, every task independently testable). You MAY run /sddp-specify, /sddp-clarify, /sddp-plan, /sddp-tasks to do this. Then tell god it is ready for the spec review.'
+        : '',
+      roles.includes('worker')
+        ? 'You hold the SDDP WORKER role: IMPLEMENT from tasks.md (you do not change the spec). Take a task assigned to you, do EXACTLY that task, respect after:T### ordering, run the build/tests, mark its checkbox [ ]→[X] in tasks.md, commit on your agent/<id> branch, then move the card doing→review. You MAY run /sddp-implement-qc-loop. If a task is wrong/under-specified, do NOT guess — message god to route it back to the planner.'
+        : '',
+      roles.includes('reviewer')
+        ? 'You hold the SDDP REVIEWER role (read-only, two gates). SPEC/PLAN gate: read spec.md/plan.md/tasks.md — complete? testable? every FR-### covered by tasks? Approve or send back to the planner. CODE gate: review an implemented slice before QC — comment via the card, approve to QC/integrate or send back to the worker. You never edit code.'
+        : '',
+      roles.includes('qc')
+        ? 'You hold the SDDP QC role: run the automated QC phase. Run build/tests/lint/security; verify each user story / SC-### against the code + results; write specs/<feature>/qc-report.md. If all pass, create the .qc-passed marker; else file bug tasks ("- [ ] T### [BUG:severity] {FR-###} [category] desc — file:line") into tasks.md and send the work back to the worker(s). You MAY run /sddp-analyze and the QC half of /sddp-implement-qc-loop. You run + verify; you do not implement fixes.'
+        : '',
+      roles.includes('integrator')
+        ? 'You hold the SDDP INTEGRATOR role: merge a feature ONLY after it has .qc-passed. Merge the feature branch into the repo base (git in your shell) and sign its cards off to "done". On conflict, resolve it (conflict-only edits) or send it back.'
+        : ''
+    ].filter(Boolean).join(' ');
+  }
+
+  private injectedPrompt(meta: AgentMeta, dir: string, root: string, semanticMemory: boolean, sddp = false): string {
     const memoryLine = semanticMemory
       ? 'Semantic memory: the whole hive shares a searchable MemPalace at $MEMPALACE_PALACE_PATH. To recall relevant past knowledge across the team, run `mempalace search "<query>"`; run `mempalace wake-up` at the start of a task for a memory digest. Your notes in memory.md are mined into the palace automatically — write durable facts there.'
       : '';
-    const godLine = meta.isGod
-      ? 'You are the GOD / ORCHESTRATOR of this hive — your job is to ORCHESTRATE, not to implement: maintain live situational awareness and delegate the work. (1) AWARENESS — always know what is going on: keep an accurate picture of every agent (active vs archived/idle), the task board, and all in-flight work; drain your inbox continually and triage every other agent\'s requests, answering clarifications so the team runs autonomously. (2) DELEGATE — decompose work and fan it out to the hive agents via their inboxes (route messages and assign owners; do not do their jobs); do NOT take on grunt implementation yourself. (3) OWN ONLY THE IMPORTANT, high-leverage things — task decomposition, dispatch decisions, sign-offs, conflict resolution, branch integration, and final QA — and remain the sole scribe of board.md. You are otherwise fully autonomous — there is NO separate approval queue. For the genuinely critical (destructive actions, spending real money, scope changes, unresolvable conflicts), ask the human directly in your own session and let the tool-permission prompt gate the action; the human approves natively, including remotely from their phone via /remote-control. Keep the team unblocked. When you DISPATCH a task, write it as a 4-part contract so the agent can run autonomously: (1) OBJECTIVE — the concrete goal; (2) OUTPUT — the expected deliverable/format; (3) TOOLS — what to use or avoid, and any references to read instead of re-deriving; (4) BOUNDARIES — scope limits + the definition of done. Pass references (file paths, message ids, board sections), not pasted content — keep dispatches short.'
-        + ` MONITOR the floor by reading ${root}/fleet.json (live per-agent tokens, cost, status, last tool, breaker level, inbox backlog) and ${root}/registry.json — note that running 'claude agents' will NOT list your hive's sibling agents. A full Claude Code command reference is at ${root}/COMMANDS.md (slash commands act ONLY on your own session; CLI commands run in your shell and can target the fleet). You periodically receive scheduler / "Heartbeat" standup requests — on each, review every agent via fleet.json, re-engage anyone stalled, over-budget, or breaker-armed, and keep board.md and tasks.json accurate. Steward the token budget.`
+    // The role line is mode-dependent: standard freeform flow, or — when the floor is in
+    // SDDP mode — the spec-driven lifecycle. A Claude desk additionally has the real
+    // /sddp-* slash-skills (which fan out to the sddp-* sub-agents), so its SDDP prompt
+    // names them as an accelerator a native desk can't use.
+    const godLine = sddp
+      ? this.sddpRoleLine(meta, root)
+      : meta.isGod
+      ? 'You are the GOD / ORCHESTRATOR of this hive — your job is to ORCHESTRATE, not to implement: maintain live situational awareness and delegate the work. (1) AWARENESS — always know what is going on: keep an accurate picture of every agent (active vs archived/idle), the task board, and all in-flight work; drain your inbox continually and triage every other agent\'s requests, answering clarifications so the team runs autonomously. (2) DELEGATE — decompose work and fan it out to the hive agents via their inboxes (route messages and assign owners; do not do their jobs); do NOT take on grunt implementation yourself. (3) OWN ONLY THE IMPORTANT, high-leverage things — task decomposition, dispatch decisions, sign-offs, conflict resolution, branch integration, and final QA — and remain the sole scribe of board.md. You are otherwise fully autonomous — there is NO separate approval queue. For the genuinely critical (destructive actions, spending real money, scope changes, unresolvable conflicts), ask the human directly in your own session and let the tool-permission prompt gate the action; the human approves natively, including remotely from their phone via /remote-control. Keep the team unblocked. COLD ≠ GONE: a desk in your roster holding a role but shown not-running is COLD (parked), not gone — it wakes when you delegate/message it; treat a cold role-holder as AVAILABLE and delegate to it, never unassign or declare "no desk available" for a role a floor desk holds. When you DISPATCH a task, write it as a 4-part contract so the agent can run autonomously: (1) OBJECTIVE — the concrete goal; (2) OUTPUT — the expected deliverable/format; (3) TOOLS — what to use or avoid, and any references to read instead of re-deriving; (4) BOUNDARIES — scope limits + the definition of done. Pass references (file paths, message ids, board sections), not pasted content — keep dispatches short.'
+        + ` MONITOR the floor by reading ${root}/fleet.json (live per-agent tokens, cost, status, last tool, breaker level, inbox backlog) and ${root}/registry.json — note that running 'claude agents' will NOT list your hive's sibling agents. A full Claude Code command reference is at ${root}/COMMANDS.md (slash commands act ONLY on your own session; CLI commands run in your shell and can target the fleet). You periodically receive scheduler / "Heartbeat" standup requests — on each, review every agent via fleet.json, re-engage anyone stalled, over-budget, or breaker-armed, and keep board.md and tasks.json accurate. Steward the token budget. THE FLOW: a worker does its slice + runs tests then sets a card "review"; a reviewer (role-holder, else you) comments and approves it to "integrate"; an integrator (role-holder, else you) re-runs the tests as the merge gate, merges the branch, and signs it off "done" — "done" means tested. The system auto-pings the project's reviewer on "review" and ONE integrator on "integrate"; if no such desk exists it pings you as the standing fallback.`
       : meta.isAssistant
       ? 'You are Michael\'s PREP ASSISTANT. You will be handed short, possibly vague instructions (each begins with "ENRICH TASK:"). For each one: (1) figure out which project it concerns and cd into the most relevant repo — you start in Michael\'s home directory; (2) gather concrete context READ-ONLY (exact file paths, current state, relevant code, conventions, active branch, gotchas) — NEVER modify, create, or delete files; (3) rewrite the instruction into ONE clear, self-contained prompt that Michael can execute autonomously, preserving the user\'s original intent without inventing scope. Then deliver it: write ONE message JSON into your outbox with "to":"god", "act":"request", a short subject, and the finished prompt as the body. Do NOT perform the task yourself — your only output is the improved prompt sent to Michael.'
-      : 'For anything ambiguous, cross-cutting, or needing sign-off, address a message to "god".';
-    const guardrailsLine = 'Guardrails: a circuit breaker watches the floor — a "Circuit breaker: steer/constrain" message means you are looping or overspending, so STOP repeating, summarize what you tried, and follow it. Be token-frugal (a floor-wide or per-agent token budget can pause you). The shared plan has two parts: board.md (freeform; god is the sole scribe) and tasks.json (structured kanban — todo/doing/blocked/done).';
+      : [
+          'As a WORKER, the task board flows doing → (run build/tests) → review → integrate → done. Work ONE card at a time on its OWN branch: for each card, start fresh off the latest trunk and check out the branch named in the card\'s `branch` field (`git checkout -b <card.branch> <trunk>`); commit ONLY that card\'s work there; RUN the tests; then set the card to "review". A reviewer approves it to "integrate", where an integrator merges that branch + signs off. After it merges, take your NEXT card on a fresh branch off the updated trunk — never two cards on one branch. Do NOT advance past "review" or mark a card "done" yourself; if a card comes back to you, fix it on the same branch (merge the latest trunk in first to clear conflicts). For anything ambiguous, address a message to "god".',
+          (meta.roles ?? []).includes('reviewer')
+            ? 'You also hold the REVIEWER role: on a card in "review", read the author\'s branch READ-ONLY (do not change their code), check the tests cover the change and pass, comment on the card, then approve it to "integrate" or send it back to "doing" with exactly what to fix. You never merge or mark "done".'
+            : '',
+          (meta.roles ?? []).includes('integrator')
+            ? 'You also hold the INTEGRATOR role: you GATE + MERGE, you do NOT author. On a card in "integrate", run the test suite as the merge gate, then merge the CARD\'S branch (its `branch` field) into the trunk and mark the card "done"; route conflicts or red tests back to the author (you don\'t resolve conflicts in the trunk — the author rebases on their branch).'
+            : ''
+        ].filter(Boolean).join(' ');
+    const guardrailsLine = 'Guardrails: a circuit breaker watches the floor — a "Circuit breaker: steer/constrain" message means you are looping or overspending, so STOP repeating, summarize what you tried, and follow it. Be token-frugal (a floor-wide or per-agent token budget can pause you). The shared plan has two parts: board.md (freeform; god is the sole scribe) and tasks.json (structured kanban — todo/doing/blocked/review/integrate/done).';
+    // "Know before you attempt": the board transitions this desk's roles allow on the kanban, so it
+    // doesn't try a move the hook/execution gate would reject. Non-god/non-assistant only — the god
+    // line already covers its delegator powers (incl. reassign), which this would contradict.
+    const boardLine = !meta.isGod && !meta.isAssistant ? boardCapabilityLine(meta.roles) : '';
     return [
       `You are "${meta.name}" (${meta.id}), an autonomous agent in a collaborating hive of Claude agents.`,
       `Your private workspace is ${dir}. The shared hive is ${root}. Full protocol: ${root}/PROTOCOL.md.`,
@@ -477,6 +573,7 @@ export class HiveManager {
       guardrailsLine,
       memoryLine,
       godLine,
+      boardLine,
       `Env vars available to you: AGENT_ID, AGENT_NAME, HIVE_ROOT, AGENT_DIR.`
     ].filter(Boolean).join('\n');
   }
@@ -502,11 +599,14 @@ export class HiveManager {
     };
   }
 
-  /** Atomically deliver a message into a recipient agent's inbox. */
-  private deliver(msg: HiveMessage, toId: string): void {
+  /** Atomically deliver a message into a recipient agent's inbox. Returns false when the
+   *  recipient has no inbox (unknown / never-spawned / force-deleted id) so the caller can
+   *  dead-letter rather than silently swallow it. */
+  private deliver(msg: HiveMessage, toId: string): boolean {
     const inbox = join(this.agentDir(toId), 'inbox');
-    if (!existsSync(inbox)) return; // unknown recipient — dropped (logged by caller)
+    if (!existsSync(inbox)) return false; // unknown recipient — caller dead-letters
     this.atomicWriteJson(join(inbox, `${msg.id}.json`), msg);
+    return true;
   }
 
   /** Inject a message directly (used by the orchestrator / UI / tests). */
@@ -526,10 +626,16 @@ export class HiveManager {
     }
     const reg = this.registry();
     const godId = reg.godId ?? 'god';
+    const godExists = !!reg.godId && existsSync(join(this.agentDir(godId), 'inbox'));
     // The hive has no separate human-approval queue — approvals are native to
     // each agent's Claude Code session (and approvable remotely). A message aimed
     // at "human" is handled by the god/orchestrator, the human's proxy here.
     const resolveTo = (to: string): string => (to === 'human' || to === 'god' ? godId : to);
+    // Surface a 'god'/'human' message that can't resolve (no god spawned) instead of
+    // silently dropping it.
+    if ((msg.to === 'god' || msg.to === 'human') && !godExists) {
+      this.appendLog({ kind: 'drop', reason: 'no-god', from: msg.from, to: msg.to, id: msg.id });
+    }
     const targets = msg.to === 'broadcast'
       // The roster for fan-out is the ACTIVE registry: skip the send-only prep
       // assistant and any archived agent (closed tab) so mail never piles into a
@@ -553,7 +659,21 @@ export class HiveManager {
         }, godId);
         continue;
       }
-      this.deliver(msg, t);
+      // If the target has no inbox (unknown / never-spawned / force-deleted id), the message
+      // would silently vanish. Dead-letter a notice to the god so it can reassign/restore —
+      // loop-safe: written straight to the god's inbox, never back through routeMessage, and
+      // skipped when the dead target IS the god.
+      if (!this.deliver(msg, t)) {
+        this.appendLog({ kind: 'drop', reason: 'undeliverable', from: msg.from, to: t, id: msg.id });
+        if (godExists && t !== godId) {
+          this.deliver(this.normalize({
+            to: godId,
+            act: 'inform',
+            subject: `Undeliverable: ${msg.to}`,
+            body: `Couldn't deliver ${msg.from}'s message "${msg.subject}" to "${t}" — no such desk/inbox. Reassign its work to a live desk or restore it.`
+          }, 'system'), godId);
+        }
+      }
     }
     this.appendLog({ kind: 'message', from: msg.from, to: msg.to, act: msg.act, subject: msg.subject, id: msg.id });
     this.emitMessage(msg, targets);
@@ -633,19 +753,203 @@ export class HiveManager {
     return root ? this.readJson(join(root, 'tasks.json'), { tasks: [] }) : { tasks: [] };
   }
 
-  /** Persist the task ledger to hive/tasks.json and commit it. Mirrors the
-   *  board/message persist pattern: write JSON, log the change, single-commit. */
+  /** The current task ledger as a typed array (empty when none). */
+  private taskList(): HiveTask[] {
+    const t = this.tasks() as { tasks?: HiveTask[] } | undefined;
+    return Array.isArray(t?.tasks) ? t!.tasks : [];
+  }
+
+  /** Desks holding `role` "for the task's project": prefer those whose repo matches the
+   *  task's project (the assignee's repo); else any non-archived holder; else — when NO
+   *  dedicated holder exists — the god (who holds integrator+reviewer by default and, as
+   *  `isGod`, can advance any card regardless of role). The card's own assignee is always
+   *  excluded. Returns desk ids, sorted by id so a single-pick is deterministic. */
+  private roleHoldersForTask(role: AgentRole, task: HiveTask, godFallback = true): string[] {
+    const reg = this.registry();
+    const holders = Object.values(reg.agents).filter(
+      (a) => !a.archived && a.id !== task.assignee && (a.roles ?? []).includes(role)
+    );
+    const project = task.assignee ? this.repoFor(task.assignee) : null;
+    const sameProject = project ? holders.filter((a) => this.repoFor(a.id) === project) : [];
+    const chosen = sameProject.length ? sameProject : holders;
+    if (chosen.length) {
+      // Prefer LIVE holders so a card routes to a desk that's actually up — not a dead/idle one
+      // (the operator's "the integrator is there but the god can't find/use it" case). When none
+      // of the eligible holders are running, fall back to all of them (so the work still routes).
+      const running = chosen.filter((a) => this.isRunning(a.id));
+      return (running.length ? running : chosen).map((a) => a.id).sort();
+    }
+    // Zero dedicated holders for the project ⇒ the god is the standing fallback — EXCEPT the SDDP
+    // planner/qc phases (godFallback=false), where the operator's rule is "no role-holder ⇒ nobody
+    // does it" (the god is a delegator that can't author specs or run QC).
+    if (!godFallback) return [];
+    return reg.godId && reg.godId !== task.assignee ? [reg.godId] : [];
+  }
+
+  /** Fire best-effort notifications on task transitions (diff prev→next), from 'system'
+   *  (so the router never drops a self-send): auto-unblocked or sent-back → assignee;
+   *  entered `review` → the project's reviewer(s); entered `integrate` → the integrator. */
+  private notifyTaskTransitions(prev: HiveTask[], next: HiveTask[]): void {
+    const before = new Map(prev.map((t) => [t.id, t]));
+    const ping = (to: string, act: HiveMessage['act'], subject: string, body: string) =>
+      this.send({ to, act, subject, body }, 'system');
+    // A lane with NO live role-holder must not rot silently: log it AND escalate to god + human
+    // (needs_human) so the operator revives a desk or gives an active desk the role. Fires once
+    // per status transition (so a card escalates when it enters the starved lane, not repeatedly).
+    const escalateNoHandler = (role: AgentRole, t: HiveTask, lane: string): void => {
+      this.appendLog({ kind: 'drop', reason: 'no-handler', to: role, id: t.id });
+      this.send({
+        to: 'god', act: 'request', needs_human: true,
+        subject: `No active ${role} — "${t.title}" stuck in ${lane}`,
+        body: `Card "${t.title}" (${t.id}) reached ${lane} but NO active desk holds the ${role} role, so it can't proceed. Revive a ${role} desk, or give an ACTIVE desk the ${role} role (Add-Agent, the desk's role toggle, or restore team).`
+      }, 'system');
+    };
+    for (const t of next) {
+      const was = before.get(t.id);
+      const wasStatus = was?.status;
+
+      // REASSIGNMENT ping (independent of status — a pure reassign doesn't change status, so it
+      // would otherwise be silent). Hand the new assignee the prior work pointer captured on the
+      // card so they can continue from the previous desk's branch instead of redoing it.
+      if (was && was.assignee !== t.assignee && t.assignee) {
+        const where = [was.branch ? `branch \`${was.branch}\`` : null, was.project ? `in ${was.project}` : null].filter(Boolean).join(' ');
+        const prior = was.assignee && where ? ` Prior work is on ${where} (worktree kept) — read it first; if it's worth continuing, git merge/cherry-pick that branch into yours and build on it, else start fresh and note why.` : '';
+        ping(t.assignee, 'request', `Assigned: ${t.title}`,
+          `Task "${t.title}" (${t.id}) was assigned to you${was.assignee ? ` (reassigned from ${was.assignee})` : ''}.${prior}`);
+      }
+
+      if (wasStatus === t.status) continue; // remaining handlers act only on a status change
+
+      if (wasStatus === 'blocked' && t.status === 'todo' && t.assignee) {
+        ping(t.assignee, 'inform', `Unblocked: ${t.title}`,
+          `Task "${t.title}" (${t.id}) is unblocked — its blocker(s) are done. You can resume it.`);
+      }
+      if (t.status === 'review') {
+        const reviewers = this.roleHoldersForTask('reviewer', t);
+        for (const to of reviewers) {
+          ping(to, 'request', `Review: ${t.title}`,
+            `Task "${t.title}" (${t.id}) is ready for REVIEW. Read its branch (read-only), comment via hive_update_task note; approve by setting it to 'integrate', or send it back with status 'doing' and what to fix.`);
+        }
+        // No reviewer AND no god fallback ⇒ the card would sit unwatched — escalate, don't drop.
+        if (reviewers.length === 0) escalateNoHandler('reviewer', t, 'review');
+      }
+      if (t.status === 'integrate') {
+        // SDDP: a feature card can't be merged until QC passes (.qc-passed). If it's missing,
+        // route to a QC desk to run the QC phase FIRST (no god fallback — no qc desk ⇒ nobody;
+        // the integrate gate keeps the card from merging until .qc-passed appears, and the
+        // integrator picks it up on its next scan once it does). Otherwise (no feature, or QC
+        // already passed) ping the integrator as usual.
+        const repo = t.project ?? (t.assignee ? this.repoFor(t.assignee) : null);
+        const fstat = t.feature ? this.featureStatusFor(repo, t.feature) : null;
+        if (t.feature && fstat && !fstat.qcPassed) {
+          // ONE qc desk per feature — multiple would clobber the SAME shared base specs/<feature>/.
+          const to = this.roleHoldersForTask('qc', t, false)[0] ?? null;
+          if (to) {
+            ping(to, 'request', `QC: ${t.title}`,
+              `Feature "${t.feature}" (card ${t.id}) is implemented and awaiting QC before integrate. Run build/tests/lint + verify the stories/SC-### against the spec, write specs/${t.feature}/qc-report.md, then create the .qc-passed marker (or file bug tasks back to the worker).`);
+          }
+          if (!to) escalateNoHandler('qc', t, 'integrate (awaiting QC)');
+        } else {
+          // ONE integrator only (parallel hive_integrate would double-merge). Use REAL
+          // role-holders (godFallback=false): the god counts only if it actually HOLDS the
+          // integrator role — a pure-delegator god does not, so we escalate instead of pinging a
+          // god that can't merge (the operator's "no active integrator" case). roleHoldersForTask
+          // already prefers a LIVE holder, so this routes to the integrator that's actually up.
+          const to = this.roleHoldersForTask('integrator', t, false)[0] ?? null;
+          if (to) {
+            ping(to, 'request', `Integrate: ${t.title}`,
+              `Task "${t.title}" (${t.id}) is approved and ready to INTEGRATE. Find its repo + branch via hive_list_agents, run the test suite as the merge gate, then hive_integrate (preview → apply), resolve any conflict or send it back, then mark it 'done'.`);
+          } else {
+            escalateNoHandler('integrator', t, 'integrate');
+          }
+        }
+      }
+      if (t.status === 'doing' && (wasStatus === 'review' || wasStatus === 'integrate') && t.assignee) {
+        // Hand the worker the actual feedback (newest comment), not just "see the card".
+        const last = t.comments?.at(-1);
+        const feedback = last ? ` Latest feedback (${last.by}): "${last.text}"` : ' See the card comments and address them.';
+        ping(t.assignee, 'inform', `Changes requested: ${t.title}`,
+          `Task "${t.title}" (${t.id}) was sent back to you (from ${wasStatus}).${feedback}`);
+      }
+    }
+
+    // SDDP PLANNER KICKOFF — separate from status transitions: a feature that has cards but no
+    // tasks.md still needs Specify→Plan→Tasks. Ping a planner ONCE per feature (deduped); no god
+    // fallback (no planner desk ⇒ nobody plans). Re-evaluated each write, so a planner added later
+    // gets pinged on the next board change (we only mark a feature nudged once we actually ping).
+    const featureCards = new Map<string, HiveTask>(); // key project::feature → a representative card
+    for (const t of next) {
+      if (!t.feature) continue;
+      const repo = t.project ?? (t.assignee ? this.repoFor(t.assignee) : null);
+      const key = `${repo ?? ''}::${t.feature}`;
+      if (!featureCards.has(key)) featureCards.set(key, t);
+    }
+    for (const [key, t] of featureCards) {
+      const repo = t.project ?? (t.assignee ? this.repoFor(t.assignee) : null);
+      // Host SDDP engine: on every board change, nudge it per feature so it can drive the next
+      // host-milestone's sub-agent. Fire-and-forget (it debounces + locks); never break the write.
+      try { this.pipelineTrigger(repo, t.feature!); } catch { /* best-effort */ }
+      if (this.nudgedPlannerFeatures.has(key)) continue;
+      const fstat = this.featureStatusFor(repo, t.feature!);
+      if (fstat?.hasTasks) { this.nudgedPlannerFeatures.add(key); continue; } // planning done — stop checking
+      // ONE planner per feature — multiple would clobber the SAME shared base specs/<feature>/.
+      const to = this.roleHoldersForTask('planner', t, false)[0] ?? null;
+      if (!to) continue; // no planner ⇒ nobody plans; retry on a later write
+      ping(to, 'request', `Plan feature: ${t.feature}`,
+        `Feature "${t.feature}" needs its spec → plan → tasks before implementation. Author specs/${t.feature}/spec.md (mark unknowns [NEEDS CLARIFICATION] and ask god/operator), then plan.md and tasks.md, in the SHARED base-repo specs/. Use hive_feature_status to track the phase.`);
+      this.nudgedPlannerFeatures.add(key);
+    }
+  }
+
+  /** Persist the task ledger to hive/tasks.json and commit it. Auto-reconciles blockers
+   *  (drops done blockers; flips a fully-unblocked card back to todo) BEFORE persisting,
+   *  then notifies on transitions (unblocked → assignee; entered review → integrator). The
+   *  single chokepoint for both the agent tool path and the renderer IPC. */
   writeTasks(tasks: HiveTask[]): void {
     const root = this.root();
     if (!root) return;
     this.ensureHive();
-    this.writeJson(join(root, 'tasks.json'), { tasks });
-    this.appendLog({ kind: 'tasks', count: tasks.length });
-    this.commit(`hive: tasks (${tasks.length})`);
+    const prev = this.taskList();
+    const next = reconcileBlocked(tasks);
+    this.writeJson(join(root, 'tasks.json'), { tasks: next });
+    this.appendLog({ kind: 'tasks', count: next.length });
+    this.commit(`hive: tasks (${next.length})`);
+    try { this.notifyTaskTransitions(prev, next); } catch (e) { console.error('[hive] task notify failed:', e); }
+  }
+
+  /** Advance a feature EPIC card's milestone checklist (mark `key` done + activate the next),
+   *  used by the host SDDP engine after a step's gate artifact lands. Reuses the shared pure
+   *  `advanceMilestones` transition, then `writeTasks` (which re-notifies → re-triggers the engine
+   *  to chain to the next step). No-op if the card/milestone isn't found. The GATE is the engine's
+   *  responsibility (it only calls this once the artifact exists / the step is skippable). */
+  advanceMilestone(epicId: string, key: string): void {
+    const tasks = this.taskList();
+    const idx = tasks.findIndex((t) => t.id === epicId);
+    if (idx < 0 || !tasks[idx].milestones) return;
+    const advanced = advanceMilestones(tasks[idx].milestones!, key);
+    if (!advanced) return;
+    const next = [...tasks];
+    next[idx] = { ...next[idx], milestones: advanced };
+    this.writeTasks(next);
   }
   memory(id: string): string {
     const p = join(this.agentDir(id), 'memory.md');
     return existsSync(p) ? readFileSync(p, 'utf8') : '';
+  }
+  /** Append a timestamped block to an agent's memory.md and single-commit it. This
+   *  is the single-committer write path behind a native desk's `write_memory` tool
+   *  (Principle III) — it mirrors what a Claude desk does by editing the file with
+   *  its own tools, so a native desk's durable notes survive a reload and are mined
+   *  into the MemPalace exactly the same way. No-op on empty text or no hive root. */
+  appendMemory(id: string, text: string): void {
+    const t = (text ?? '').trim();
+    if (!t || !this.root()) return;
+    const dir = this.agentDir(id);
+    try { mkdirSync(dir, { recursive: true }); } catch { /* exists */ }
+    const block = `\n\n## ${new Date().toISOString()}\n${t}\n`;
+    try { appendFileSync(join(dir, 'memory.md'), block, 'utf8'); } catch { /* noop */ }
+    this.appendLog({ kind: 'memory', agent: id, bytes: t.length });
+    this.commit(`hive: memory (${id})`);
   }
   inbox(id: string): HiveMessage[] {
     return this.listMessages(join(this.agentDir(id), 'inbox'));
@@ -721,6 +1025,56 @@ export class HiveManager {
       usd: sample.usd
     };
     try { appendFileSync(join(root, 'cost-ledger.jsonl'), JSON.stringify(row) + '\n', 'utf8'); } catch { /* noop */ }
+  }
+
+  // — native-events run log (E008 {FR-016/038/040}) —
+
+  /**
+   * The per-agent native AgentEvent run log at
+   * `<hiveRoot>/agents/<agentId>/native-events.jsonl`.
+   *
+   * Mirrors `cost-ledger.jsonl`: a DURABLE, APPEND-ONLY JSONL stream, ONE FILE per
+   * agent, single-writer (this main process). The file is KEYED by `agentId` (one
+   * file each) and SEGMENTED by `sessionId` — the session is not in the path, it
+   * rides each line via the AgentEvent envelope (`{v,agentId,sessionId,ts,kind}`),
+   * so a new session appends to the SAME file (FR-038). It is replayed top-to-
+   * bottom on panel reopen/restart (no rotation/pruning within scale, FR-040).
+   *
+   * Returns null when the hive is disabled (no harnessHome) — the caller treats a
+   * null path as "persistence off", exactly like the cost ledger.
+   */
+  nativeEventsPath(agentId: string): string | null {
+    const root = this.root();
+    if (!root || !agentId) return null;
+    return join(root, 'agents', agentId, 'native-events.jsonl');
+  }
+
+  /**
+   * Append ONE native `AgentEvent` line to the agent's run log (E008 {FR-016/037/
+   * 038/040/043}). Like `appendCostLedger`/`appendLog`: durable immediately
+   * (append-on-event), single-writer (main), naturally ordered by arrival/`ts`.
+   *
+   * 🔒 SECRET-FREE (ADR-0007/FR-041): the persisted line is the `AgentEvent`
+   * envelope + payload AS-IS — this method NEVER injects an API key, auth header,
+   * or any credential at any nesting depth. Credentials ride spawn `env`, never the
+   * AgentEvent bus, so nothing here can leak one (the bridge is the sole caller and
+   * forwards the same untouched event).
+   *
+   * Ensures the agent dir exists (a native worker may not have a hive-provisioned
+   * workspace yet). Best-effort — never throws into the event path. Returns whether
+   * the line was committed to disk, so the caller can order persist-before-forward.
+   */
+  appendNativeEvent(event: AgentEvent): boolean {
+    const agentId = event?.agentId;
+    const path = agentId ? this.nativeEventsPath(agentId) : null;
+    if (!path) return false;
+    try {
+      mkdirSync(join(this.root()!, 'agents', agentId), { recursive: true });
+      appendFileSync(path, JSON.stringify(event) + '\n', 'utf8');
+      return true;
+    } catch {
+      return false; // best-effort — a disk error never breaks the event stream
+    }
   }
 
   // — json + atomic io —

@@ -1,18 +1,24 @@
 import { app, BrowserWindow, clipboard, dialog, ipcMain, powerSaveBlocker, screen, shell, Notification } from 'electron';
 import { spawn } from 'node:child_process';
-import { rmSync, existsSync, readFileSync, readdirSync, statSync, cpSync } from 'node:fs';
-import { join, resolve, sep } from 'node:path';
+import { rmSync, existsSync, readFileSync, readdirSync, statSync, cpSync, mkdirSync, writeFileSync } from 'node:fs';
+import { join, resolve, sep, relative, isAbsolute, dirname } from 'node:path';
 import { PtyManager, type SpawnOptions } from './pty';
 import {
   readConfig, writeConfig, resetConfig, ensureHarnessHome, ensureClaudePermissionsAccepted,
   modelForRole, OPS_STANDUP_MISSION, HEARTBEAT_MISSION, type HarnessConfig, type ScheduledMission
 } from './config';
 import { listDir, readFileText, writeFileText } from './fs';
+import { normalizeRepoPath, normalizedPathSet, buildCacheKey } from './paths';
+import { resolveDeskEnv, perRepoDeskEnv, perAgentDeskEnv } from './deskEnv';
+import { DEFAULT_DESK_ENV, mergeDeskEnv } from '../shared/deskEnv';
 import {
   getBranch, getStatus, getLog, getBranches, getAheadBehind, isRepo,
-  addWorktree, removeWorktree
+  addWorktree, removeWorktree, listWorktrees, planWorktree, type GitWorktree,
+  previewMerge, mergeBranch, agentBranchFor, agentBranchForId, branchCommitsAhead,
+  repoTrunk, worktreeHealth, resetBaseToTrunk, deleteMergedBranch,
+  prepareQcTree as gitPrepareQcTree, shortHash
 } from './git';
-import { HiveManager, type AgentMeta, type HiveMessage, type HiveTask } from './hive';
+import { HiveManager, roleCanEditCode, roleAuthorsCode, roleCanWriteFiles, canIntegrate as rolesCanIntegrate, canReview as rolesCanReview, boardCapabilityLine, type AgentMeta, type HiveMessage, type HiveTask, type AgentRole } from './hive';
 import { HookServer } from './hooks';
 import { CircuitBreaker, type BreakerInput } from './breaker';
 import type { UsageProvider } from './usage';
@@ -25,12 +31,83 @@ import { listIssues, listCIRuns } from './github';
 import { SlackWebhookServer } from './slack';
 import { TelemetryCollector } from './telemetry';
 import { ControlRegistry } from './control';
+import { ClaudeRuntime } from './runtime/claudeRuntime';
+import { NativeRuntime } from './runtime/nativeRuntime';
+import { deniedNativeToolNames } from './runtime/toolGating';
+import { createNativeEventBridge, loadNativeEvents } from './runtime/nativeEventBridge';
+import { makeElectronWorkerTransport } from './runtime/electronWorkerTransport';
+import { makeSpawnSubAgent } from './runtime/subAgentExecutor';
+import { nativeSddpGodPrompt, nativeSddpRolePrompt } from './sddpPrompts';
+import { SddpPipeline } from './sddpPipeline';
+import { executeAgentTool, agentTaskBranch, analyzeCoverage, buildBugTitles, bugSignature, defaultMilestones, epicCardDescription, type AgentToolDeps, type FeatureStatus } from '@jsh562/won-agent-core';
+import { redactConfig, injectionEnvForProvider, keyPresence, setKeyInConfig, clearKeyInConfig, WEB_SEARCH_KEY_ID, type SafeConfig } from './credentials';
+import { setSecretInConfig, clearSecretInConfig, getSecretValue, secretNames } from './secrets';
+import { searchWebDuckDuckGo } from './webSearch';
+import { resolveBashEnv, describeBashEnv } from './bashShell';
+import { listProviders } from '../shared/providerRegistry';
+import { deriveProviderId } from '../shared/assignment';
+import type { AgentInput } from '../shared/providerRuntime';
 
 const isDev = !!process.env.ELECTRON_RENDERER_URL;
 const ptyManager = new PtyManager();
 /** Live PTY id → its hive agent id, recorded at spawn. The pty:kill handler only
  *  gets the PTY id, so this lets a closed tab archive the right registry agent. */
 const ptyToAgent = new Map<string, string>();
+/** E005 {FR-008} — agent id → the providerId DERIVED from the model the agent was
+ *  spawned with (explicit `--model` → defaultModel → role-based). Provider is
+ *  DERIVED from the model via the E002 registry, NOT stored on the agent record
+ *  (DR-1). Recorded at the spawn seam so the E006 native runtime
+ *  (`nativeRuntime.spawn(agentId, providerId?)`) can consume it; E005 records only
+ *  — it does not wire native execution. Absent ⇒ unresolvable/role-based model. */
+const agentProviderIds = new Map<string, string>();
+/** agent id → the resolved model id it runs on (recorded alongside `agentProviderIds` at the
+ *  assign + spawn seams). An ephemeral sub-agent inherits its CALLER's exact model from here, so a
+ *  spawned specialist runs on the same provider+model as the desk that spawned it. */
+const agentModels = new Map<string, string>();
+/** E005 {FR-008} — the providerId derived from an agent's spawned model, or
+ *  `undefined` when none resolved (role-based/unresolvable). The E006 native
+ *  runtime seam reads this to call `nativeRuntime.spawn(agentId, providerId)`. */
+export function providerIdForAgent(agentId: string): string | undefined {
+  return agentProviderIds.get(agentId);
+}
+
+/** E005 {FR-013 / DR-10} — the GOD assignment seam. Records a programmatic
+ *  per-agent provider+model assignment and forwards it to the renderer to apply
+ *  through the SAME agent-update path the operator uses (the renderer store's
+ *  `reassignAgentModel`, which writes `model` + `assignmentSource='explicit'` and
+ *  persists). Provider is DERIVED from the model id, NEVER stored on the record
+ *  (DR-1): here it is only recorded in `agentProviderIds` for the E006 native
+ *  runtime seam, exactly like the spawn path. No separate programmatic path and no
+ *  secret channel — same persistence + warning behavior as an operator pick (the
+ *  renderer's ProviderModelPicker surfaces the capability-gap warning on the next
+ *  open). `modelId` undefined/blank is rejected (an assignment must name a model);
+ *  a stale id is forwarded verbatim and preserved+flagged by the renderer, never
+ *  remapped (DR-5).
+ *
+ *  GOD invokes this via the `agent:assign` IPC channel (see the handler below) or
+ *  by importing this function in-process. Returns the derived providerId (or null
+ *  for an unresolvable/stale model — still recorded as a pending assignment). */
+export function assignAgentModel(agentId: string, modelId: string | undefined):
+  { ok: boolean; providerId: string | null; error?: string } {
+  if (typeof agentId !== 'string' || !agentId.trim()) {
+    return { ok: false, providerId: null, error: 'agentId required' };
+  }
+  const id = (modelId ?? '').trim();
+  if (!id) return { ok: false, providerId: null, error: 'modelId required' };
+  // Derive + record the provider for the E006 native runtime seam (DR-1); a stale
+  // model derives null and records nothing, but the assignment still forwards.
+  const providerId = deriveProviderId(id);
+  if (providerId) agentProviderIds.set(agentId, providerId);
+  else agentProviderIds.delete(agentId);
+  agentModels.set(agentId, id);
+  // Forward to the renderer to apply via the existing agent-update path. The
+  // renderer's useHive subscriber calls reassignAgentModel(agentId, id), so the
+  // GOD path writes the SAME fields and persists the SAME way as an operator pick.
+  // (Distinct channel from the `agent:assign` INVOKE handler — this is the push.)
+  try { liveWebContents()?.send('agent:assigned', { agentId, modelId: id }); }
+  catch { /* window tore down — the recorded providerId still stands */ }
+  return { ok: true, providerId };
+}
 const hive = new HiveManager(
   () => readConfig().harnessHome,
   (channel, payload) => { try { liveWebContents()?.send(channel, payload); } catch { /* window tore down */ } }
@@ -63,12 +140,37 @@ const breaker = new CircuitBreaker(() => {
 // heartbeat mission is disabled (it ships off).
 let fleetTimer: ReturnType<typeof setInterval> | null = null;
 let breakerBeatTimer: ReturnType<typeof setInterval> | null = null;
+// Authoritative "is this desk mid-turn" set — the single source of truth for the live status
+// badge, reconciled to the renderer via `fleet:state` so a missed turn-end can't latch a desk on
+// "working". Fed by BOTH runtimes: native AgentEvents (turn-start/turn-end/stop, at the ingest
+// seam below) and Claude hooks (activity → true, genuine Stop → false). Cleared on desk exit.
+const turnActive = new Set<string>();
+const markTurn = (agentId: string, active: boolean): void => {
+  if (active) turnActive.add(agentId); else turnActive.delete(agentId);
+};
 // Feed the breaker's api_error-storm trip from Oscar's OTel api_error spans —
 // Jim's one breaker input with no on-branch source (telemetry.onApiError seam).
 telemetry.onApiError((agentId) => breaker.recordError(agentId));
+// E001 — provider-runtime seam: one Claude adapter per agent behind the
+// ProviderRuntime port, fed additively by the hook + PTY signals below. The
+// adapter emits the normalized AgentEvent stream; the translator can reproduce
+// the legacy hive:hookEvent payload but its live send stays OFF here, so the
+// existing IPC + autonomy paths are byte-identical (zero behavior change).
+const claudeRuntime = new ClaudeRuntime({
+  usage: usageProvider,
+  ptyWrite: (id, text) => { ptyManager.write(id, text); },
+  ptyKill: (id) => { ptyManager.kill(id); },
+  sessionIdFor: (id) => hive.registry().agents[id]?.sessionId ?? null
+});
+ptyManager.setDataObserver((id, data) => claudeRuntime.ingestPtyData(id, data));
 // HookServer needs BOTH: Oscar's control registry (HITL pause/gate/steer/halt via
 // hook returns) AND Jim's breaker (feed recordToolUse on each PostToolUse).
-const hookServer = new HookServer(hive, () => liveWebContents(), () => readConfig(), control, breaker);
+const hookServer = new HookServer(
+  hive, () => liveWebContents(), () => readConfig(), control, breaker,
+  (p) => claudeRuntime.ingestHook(p),
+  // Claude turn-state → the authoritative turnActive set (parity with native turn events).
+  markTurn
+);
 const memory = new MemoryManager(
   () => readConfig().harnessHome,
   () => { const c = readConfig(); return { enabled: c.semanticMemory !== false, model: c.embeddingModel ?? 'minilm' }; }
@@ -110,6 +212,140 @@ const worktreePaths = new Map<string, string>();
  *  `git worktree remove` from the parent tree, not the worktree itself). */
 const worktreeOrigins = new Map<string, string>();
 
+/** Per-repo merge serialization: all integrations into one repo land on its single base tree, so
+ *  concurrent `git merge` would race the index. This chains merges-into-the-same-repo so two
+ *  integrators (or a double hive_integrate) run one-at-a-time. Keyed by normalized repo path. */
+const repoMergeChains = new Map<string, Promise<unknown>>();
+function withRepoMergeLock<T>(repo: string, fn: () => Promise<T>): Promise<T> {
+  const key = normalizeRepoPath(repo);
+  const prev = repoMergeChains.get(key) ?? Promise.resolve();
+  const run = prev.then(fn, fn); // run regardless of whether the previous merge resolved/rejected
+  repoMergeChains.set(key, run.then(() => {}, () => {})); // keep the chain alive past errors
+  return run;
+}
+
+// Tell the hive how to resolve a desk's *project repo* (used to match a task's
+// reviewer/integrator to the project it belongs to). An isolated desk's cwd is its
+// worktree, so prefer the worktree's ORIGIN repo; otherwise the desk's registry cwd.
+/** Resolve a desk's *project repo*: an isolated desk's cwd is its worktree, so prefer the
+ *  worktree's ORIGIN repo; otherwise the desk's registry cwd. Used both by the hive (to match
+ *  a task's reviewer/integrator to its project) and by the scheduler (per-project missions). */
+function repoForId(id: string): string | null {
+  return worktreeOrigins.get(`pty-${id}`) ?? hive.registry().agents[id]?.cwd ?? null;
+}
+hive.setRepoResolver(repoForId);
+// Is a desk actually RUNNING right now — a live native worker OR a live PTY mapped to it. The
+// single liveness predicate used by the fleet snapshot, the `archived` reconcile, and the hive's
+// "prefer a live role-holder" routing (so the god routes to an integrator that's actually up).
+function isAgentRunning(id: string): boolean {
+  if (nativeRuntime.runtimeFor(id) !== undefined) return true;
+  const livePtys = new Set(ptyManager.list().map((p) => p.id));
+  return [...ptyToAgent.entries()].some(([ptyId, aid]) => aid === id && livePtys.has(ptyId));
+}
+hive.setRunningResolver(isAgentRunning);
+// SDDP: let the hive's planner/qc auto-routing read a feature's real on-disk phase
+// (`<repo>/specs/<feature>/` markers) so it knows when planning is done / QC has passed.
+hive.setFeatureStatusResolver((repo, feature) => scanFeatureStatus(repo, feature));
+
+/**
+ * Reattach-or-isolate a worker desk's git worktree. The desk's worktree path is keyed by its
+ * (slugified) agent id, so a RESTART of a previously-isolated desk must REUSE the existing
+ * worktree — not try to re-create it (which fails because the path is taken, then the desk
+ * silently runs in the shared tree and loses its `agent/<id>` branch). The pure decision lives
+ * in `planWorktree` (git.ts, unit-tested); this wires the real git/fs around it. Best-effort:
+ * any failure returns null (fall back to the shared cwd rather than blocking the spawn).
+ */
+async function provisionWorktree(
+  origCwd: string, agentId: string, forceNew: boolean
+): Promise<{ path: string; origin: string } | null> {
+  try {
+    const wtRoot = join(readConfig().harnessHome ?? origCwd, 'worktrees');
+    const list = await listWorktrees(origCwd);
+    const registered = Array.isArray(list) ? list.map((w) => w.path) : [];
+    const plan = planWorktree({ wtRoot, agentId, origCwd, forceNew, registered, exists: existsSync });
+    if (plan.action === 'skip') return null;
+    if (plan.action === 'reattach') return { path: plan.path, origin: origCwd };
+    // create — base the new agent branch on the repo's TRUNK (never a stray agent/* branch the
+    // base tree might be sitting on, which would poison every new worktree).
+    const baseBranch = await repoTrunk(origCwd);
+    const wt = await addWorktree(origCwd, plan.path, baseBranch);
+    if (wt.ok) return { path: plan.path, origin: origCwd };
+    // Can't isolate (commonly: the desk's branch is checked out in the base tree — a legacy
+    // pre-isolation desk). Degrade to the shared base cwd; this is surfaced in Settings →
+    // Worktrees diagnostics with a one-click "migrate to worktree". Calm note, not an error.
+    console.log(`[worktree] note: ${agentId} runs in the base tree (couldn't isolate${wt.inUse ? ' — its branch is checked out there' : ''}). Fix via Settings → Worktrees.`);
+    return null;
+  } catch (e) {
+    console.error('[worktree] provision failed:', e);
+    return null;
+  }
+}
+
+/**
+ * The single root that holds EVERY desk's redirected build output (`config.buildCacheDir`, else
+ * `<harnessHome>/build-cache`). Heavy, churning, executable build trees (a Rust `target/`, etc.)
+ * are kept OUT of the desks' worktrees and out of the project repo so (a) the user excludes ONE
+ * folder from antivirus instead of every worktree, and (b) worktrees stay light. Null only when
+ * no harnessHome is configured (pre-onboarding) and no explicit dir is set.
+ */
+function buildCacheRoot(): string | null {
+  const cfg = readConfig();
+  if (cfg.buildCacheDir) return cfg.buildCacheDir;
+  return cfg.harnessHome ? join(cfg.harnessHome, 'build-cache') : null;
+}
+
+/** Resolve a prefixed env token: `${env:NAME}` → the host's `process.env`; `${secret:NAME}` → the
+ *  decrypted vault (main only). Backs both the `deskEnv` and `runtimeEnv` tables. Missing → '' so a
+ *  reference never leaves a literal `${…}` in the value (the Settings editor flags unknown secrets). */
+function tokenLookup(prefix: string, name: string): string | undefined {
+  if (prefix === 'env') return process.env[name] ?? '';
+  if (prefix === 'secret') return getSecretValue(readConfig(), name) ?? '';
+  return undefined;
+}
+
+/** The GLOBAL runtime env (proxy / custom CA) — vars for the agent's OWN model + network calls,
+ *  resolved with the token lookup. No path tokens (root=null). Injected into the worker process, the
+ *  Claude PTY, and bash. Empty when unset. */
+function runtimeEnvResolved(): Record<string, string> {
+  const cfg = readConfig();
+  if (!cfg.runtimeEnv || cfg.runtimeEnv.length === 0) return {};
+  const vars = { buildRoot: '', worktreeKey: '', cwd: '', agentId: '', harnessHome: cfg.harnessHome ?? '' };
+  return resolveDeskEnv(cfg.runtimeEnv, null, vars, tokenLookup).env;
+}
+
+/**
+ * The env for one desk — expands the user's token-templated `deskEnv` table (default: cargo) against
+ * this desk's working tree, LAYERED global → per-repo → per-agent (most specific wins), and creates
+ * the managed build dirs. A `${worktreeKey}` value (`<basename>-<shortHash(cwd)>`) keys each distinct
+ * tree (a worktree OR a base repo) to its OWN dir — cargo takes a per-`target` lock, so one builder
+ * per dir avoids the concurrent-build corruption a shared dir would cause; the hash discriminates
+ * same-named repos. `${env:NAME}`/`${secret:NAME}` resolve via `tokenLookup`. Dirs under the root are
+ * created eagerly. Returns `undefined` (inherit the parent env) when there's no cwd or the table
+ * resolves to nothing.
+ */
+function deskEnvFor(cwd: string | null | undefined, agentId: string | null | undefined): Record<string, string> | undefined {
+  if (!cwd) return undefined;
+  const cfg = readConfig();
+  const root = buildCacheRoot();
+  const vars = {
+    buildRoot: root ?? '',
+    worktreeKey: buildCacheKey(cwd),
+    cwd,
+    agentId: agentId ?? '',
+    harnessHome: cfg.harnessHome ?? ''
+  };
+  // Layer: global base ← per-repo override ← per-agent override (each wins by name over the prior).
+  const base = cfg.deskEnv ?? DEFAULT_DESK_ENV;
+  const repoOvr = perRepoDeskEnv(cfg.deskEnvByRepo, agentId ? repoForId(agentId) : null);
+  const agentOvr = perAgentDeskEnv(cfg.deskEnvByAgent, agentId);
+  const entries = mergeDeskEnv(mergeDeskEnv(base, repoOvr), agentOvr);
+  const { env, dirs } = resolveDeskEnv(entries, root, vars, tokenLookup);
+  for (const dir of dirs) {
+    try { mkdirSync(dir, { recursive: true }); } catch { /* best-effort — the tool will surface a write error */ }
+  }
+  return Object.keys(env).length ? env : undefined;
+}
+
 /**
  * Tear down everything tied to a PTY id: archive its hive agent, remove its
  * isolated git worktree, and drop the bookkeeping-map entries. Runs on BOTH an
@@ -124,31 +360,777 @@ const worktreeOrigins = new Map<string, string>();
  * onExit) is a harmless no-op. Best-effort — every step is wrapped so a teardown
  * error can never crash the caller (an IPC handler or node-pty's onExit).
  */
+/** Archive an agent on exit — drop its breaker state and flag it archived in the
+ *  hive. agentId-keyed, so PTY exits and native-worker exits share one lifecycle
+ *  (E003 AD-004). Best-effort. */
+function archiveAgent(agentId: string): void {
+  try { breaker.forget(agentId); } catch { /* best-effort */ }
+  if (hive.enabled()) {
+    try { hive.setArchived(agentId, true); } catch (e) { console.error('[hive] setArchived failed:', e); }
+  }
+}
+
 function teardownPty(id: string): void {
   // 1) Archive the agent — retained + flagged; only live-PTY agents are active.
   const agentId = ptyToAgent.get(id);
   if (agentId) {
     ptyToAgent.delete(id);
-    // Drop breaker state so a dead agent can't leak/zombie a tripped level.
-    try { breaker.forget(agentId); } catch { /* best-effort */ }
-    if (hive.enabled()) {
-      try { hive.setArchived(agentId, true); } catch (e) { console.error('[hive] setArchived failed:', e); }
-    }
+    // E005 — drop the derived-provider record alongside the agent (no leak).
+    agentProviderIds.delete(agentId);
+    agentModels.delete(agentId);
+    // A killed/crashed Claude PTY emits no graceful Stop hook, so clear its turn state here; the
+    // fleet:state reconcile (running:false ⇒ idle) then drops any stale "working" badge.
+    markTurn(agentId, false);
+    archiveAgent(agentId);
   }
-  // 2) Remove the isolated worktree, if any. Non-blocking; errors are logged.
-  const wtPath = worktreePaths.get(id);
-  if (wtPath) {
-    const origCwd = worktreeOrigins.get(id) ?? wtPath;
-    worktreePaths.delete(id);
-    worktreeOrigins.delete(id);
-    void removeWorktree(origCwd, wtPath)
-      .then(r => { if (!r.ok) console.error('[worktree] removeWorktree failed:', r.error); })
-      .catch(e => console.error('[worktree] removeWorktree threw:', e));
-  }
+  // 2) An isolated agent's worktree is INTENTIONALLY KEPT on exit (it was force-removed
+  //    before, which orphaned committed work). The branch + checkout survive so the god
+  //    can integrate it and the operator can review/bulk-delete stale ones from the
+  //    Worktrees panel (Settings). Only drop the live in-memory mapping here; the panel
+  //    lists from `git worktree list`, so on-disk state is the source of truth.
+  worktreePaths.delete(id);
+  worktreeOrigins.delete(id);
   syncKeepAwake();
 }
 // A natural PTY exit must run the same teardown as an explicit kill.
 ptyManager.setExitHandler(teardownPty);
+
+// E008 {FR-016/037/043} — the native-event bridge: the SINGLE-WRITER main→renderer
+// seam for native agent activity. Each native worker's normalized AgentEvent stream
+// is fed in here (via NativeRuntime.onAgentEvent); per event it APPEND-AND-COMMITS
+// the line to the per-agent JSONL run log BEFORE forwarding it to the renderer over
+// the per-agent `agent:event:<agentId>` channel (mirrors `pty:data:<id>`). Main is
+// the sole writer of the log; the renderer subscribes via preload `onAgentEvent` and
+// backfills on reopen via `loadNativeEvents`. Secret-free (ADR-0007): only AgentEvent
+// fields are persisted/forwarded — never a key/header (credentials ride spawn env).
+const nativeEventBridge = createNativeEventBridge({
+  persist: (event) => (hive.enabled() ? hive.appendNativeEvent(event) : false),
+  forward: (event) => {
+    try { liveWebContents()?.send(`agent:event:${event.agentId}`, event); } catch { /* window tore down */ }
+  }
+});
+// SDDP feature scan — read a feature's real markers from `<repo>/specs/<feature>/` so the
+// lifecycle gate + the board phase reflect the FILESYSTEM, not model memory (the key lever for
+// native desks). Returns null when the feature dir doesn't exist (callers fail open). The
+// `feature` is treated as a single path segment (no traversal) — a feature like `../etc` can't
+// escape the repo's specs dir.
+function scanFeatureStatus(repo: string | null, feature: string): FeatureStatus | null {
+  if (!repo) return null;
+  const safe = feature.replace(/[\\/]/g, '_').trim();
+  if (!safe || safe === '.' || safe === '..') return null;
+  const dir = join(repo, 'specs', safe);
+  if (!existsSync(dir)) return null;
+  const has = (f: string) => existsSync(join(dir, f));
+  let hasClarifications = false;
+  const specPath = join(dir, 'spec.md');
+  const hasSpec = existsSync(specPath);
+  if (hasSpec) {
+    try { hasClarifications = /^##\s+Clarifications/im.test(readFileSync(specPath, 'utf8')); } catch { /* unreadable ⇒ treat as none */ }
+  }
+  return {
+    feature: safe,
+    hasSpec,
+    hasClarifications,
+    hasPlan: has('plan.md'),
+    hasTasks: has('tasks.md'),
+    completed: has('.completed'),
+    qcPassed: has('.qc-passed')
+  };
+}
+
+// The native coding toolkit's injected deps: the hive surface (arrow-wrapped to keep
+// `this`), the cwd resolver (= the sandbox root), the memory-append committer, and the
+// bash opt-in (off by default). Built once; cwd + bash are read live per tool call.
+const agentToolDeps: AgentToolDeps = {
+  enabled: () => hive.enabled(),
+  memory: (id) => hive.memory(id),
+  inbox: (id) => hive.inbox(id),
+  send: (partial, from) => hive.send(partial, from),
+  tasks: () => hive.tasks(),
+  writeTasks: (tasks) => hive.writeTasks(tasks),
+  // Roster for hive_list_agents — registry meta enriched with live presence (a native
+  // worker in the runtime, or a live PTY mapped to the desk) so the god delegates with
+  // sight. `isGod` gates the privileged task-board updates (done/reassign/reprioritize).
+  roster: () => {
+    const reg = hive.registry();
+    const livePtys = new Set(ptyManager.list().map((p) => p.id));
+    return Object.values(reg.agents).map((a) => {
+      // Worktree maps are keyed by the spawn id (`pty-<id>` for both Claude PTYs and
+      // native desks). An isolated desk reports its origin repo + agent/<id> branch so
+      // the god can review + integrate it; a non-isolated worker reports its cwd as repo.
+      const wtKey = `pty-${a.id}`;
+      const origin = worktreeOrigins.get(wtKey);
+      const wtPath = worktreePaths.get(wtKey);
+      const isWorker = a.isGod !== true && a.isAssistant !== true;
+      const authors = roleAuthorsCode(a.roles); // only authors have an isolated worktree/branch
+      return {
+        id: a.id,
+        name: a.name,
+        role: a.role,
+        archived: a.archived === true,
+        isGod: a.isGod === true,
+        isAssistant: a.isAssistant === true,
+        roles: a.roles ?? [],
+        running:
+          nativeRuntime.runtimeFor(a.id) !== undefined ||
+          [...ptyToAgent.entries()].some(([ptyId, aid]) => aid === a.id && livePtys.has(ptyId)),
+        repo: origin ?? (isWorker ? a.cwd : undefined),
+        // The desk's worktree home branch when mapped; else the deterministic agent/<id> for an
+        // AUTHOR desk (worktree kept; map cleared on exit) — integrator/reviewer don't isolate, so
+        // they report no branch. (A card's actual per-task branch lives on its `branch` field.)
+        branch: wtPath ? agentBranchFor(wtPath) : (authors ? agentBranchForId(a.id) : undefined)
+      };
+    });
+  },
+  isGod: (id) => {
+    const reg = hive.registry();
+    return reg.agents[id]?.isGod === true || reg.godId === id;
+  },
+  // Holds the `integrator` role? Gates hive_integrate + task sign-off. Read live from the
+  // registry so toggling a role takes effect immediately (no respawn needed for the gate).
+  // Uses the centralized predicate (won-agent-core) shared with the advertised-catalog filter.
+  canIntegrate: (id) => rolesCanIntegrate(hive.registry().agents[id]?.roles),
+  // Holds the `reviewer` role? Lets it approve/send-back a card in `review`.
+  canReview: (id) => rolesCanReview(hive.registry().agents[id]?.roles),
+  // A desk's project repo — stamps a task's `project` on assignment (off-project detection).
+  // (A card's per-task `branch` is now deterministic — `agentTaskBranch(assignee, cardId)` in the
+  // executor — so no host branch resolver is needed.)
+  repoFor: (id) => repoForId(id),
+  // SDDP mode (read live) gates the lifecycle hard-checks in hive_update_task; the feature
+  // scan backs both those gates and the hive_feature_status tool with the real on-disk markers.
+  sddpMode: () => readConfig().sddpMode === true,
+  featureStatus: (repo, feature) => scanFeatureStatus(repo, feature),
+  // Milestone advance gate: does `relPath` exist under <repo>/specs/<feature>/? Generic (covers
+  // data-model.md, contracts/, tasks.md, .qc-passed, …). Feature + relPath are sanitized to stay
+  // inside the feature dir (no traversal). Null repo / missing dir ⇒ false (the gate fails open
+  // only when the dep itself is ABSENT, not when the artifact is known-missing).
+  featureArtifactExists: (repo, feature, relPath) => {
+    if (!repo) return false;
+    const safeFeature = feature.replace(/[\\/]/g, '_').trim();
+    if (!safeFeature || safeFeature === '.' || safeFeature === '..') return false;
+    const base = join(repo, 'specs', safeFeature);
+    const target = join(base, relPath);
+    const rel = relative(base, target);
+    if (rel.startsWith('..') || isAbsolute(rel)) return false; // no escaping the feature dir
+    return existsSync(target);
+  },
+  // hive_import_tasks: parse a feature's tasks.md into its open implement tasks (the `- [ ] T### …`
+  // lines), stripping the [P]/[US#]/{FR-###}/[after:…] annotations down to the human description.
+  // The host owns the fs read; the executor turns each into a feature-tagged card. Feature is
+  // sanitized to a single path segment (no traversal), like scanFeatureStatus.
+  parseFeatureTasks: (repo, feature) => {
+    if (!repo) return [];
+    const safe = feature.replace(/[\\/]/g, '_').trim();
+    if (!safe || safe === '.' || safe === '..') return [];
+    const file = join(repo, 'specs', safe, 'tasks.md');
+    if (!existsSync(file)) return [];
+    let text: string;
+    try { text = readFileSync(file, 'utf8'); } catch { return []; }
+    const out: { taskId?: string; title: string }[] = [];
+    for (const raw of text.split('\n')) {
+      const m = /^\s*-\s*\[ \]\s*(T\d+)\b\s*(.*)$/.exec(raw);
+      if (!m) continue; // only OPEN `- [ ] T###` tasks
+      let rest = m[2].trim();
+      // strip the leading [P]/[US#|OBJ#]/{FR-###} tag tokens
+      for (;;) {
+        const tag = /^(?:\[[^\]]*\]|\{[^}]*\})\s*/.exec(rest);
+        if (!tag) break;
+        rest = rest.slice(tag[0].length);
+      }
+      rest = rest.replace(/\s*\[after:[^\]]*\]\s*$/i, '').trim(); // drop the trailing ordering hint
+      out.push({ taskId: m[1], title: rest || m[1] });
+    }
+    return out;
+  },
+  // SDDP feature-scope WRITE gate: does this desk hold a task card on `feature`? (a sub-agent runs
+  // under its caller's id, so it scopes to the caller's cards). Reads stay free.
+  deskHoldsFeature: (id, feature) => {
+    const ledger = hive.tasks() as { tasks?: HiveTask[] } | undefined;
+    const tasks = Array.isArray(ledger?.tasks) ? ledger!.tasks : [];
+    return tasks.some((t) => t.assignee === id && t.feature === feature);
+  },
+  // May edit code (write_file/edit_file/bash)? Role-driven, NO god/assistant special-case:
+  // the `worker` role (writes features + tests) and the `integrator` role (writes merge-fix
+  // code) grant editing; a reviewer / no-edit-role / assistant desk is read-only. This is the
+  // god's delegation lever — a god holding neither worker nor integrator (e.g. reviewer-only)
+  // physically cannot implement, so it must delegate. Read live so a role toggle applies at once.
+  // NOTE: canEditCode now governs `bash` specifically (incl. the integrator's test/merge gate);
+  // file writes use canWriteFiles below.
+  canEditCode: (id) => {
+    const a = hive.registry().agents[id];
+    if (!a) return true; // unknown desk → don't over-restrict
+    return roleCanEditCode(a.roles);
+  },
+  // May WRITE project files (write_file/edit_file + specs/ artifacts)? AUTHORS only
+  // (worker/planner/qc) — the integrator is a gate+merger (merges host-side, never authors the
+  // trunk) and the reviewer is read-only. Read live so a role toggle applies at once.
+  canWriteFiles: (id) => {
+    const a = hive.registry().agents[id];
+    if (!a) return true; // unknown desk → don't over-restrict
+    return roleCanWriteFiles(a.roles);
+  },
+  // Extra READ roots: every desk may READ any registered project repo + any worktree (to
+  // compare versions or read a peer's branch — the god/reviewer especially need this), while
+  // WRITES stay confined to the desk's own cwd (resolveInsideCwd). Read wide, write narrow.
+  readRoots: () => {
+    const cfg = readConfig();
+    const home = cfg.harnessHome;
+    return Array.from(new Set<string>([
+      ...(home ? [home] : []), // the hive home: every desk reads memory/inbox/board/tasks + peers'
+      ...(cfg.registeredRepos ?? []),
+      ...worktreeOrigins.values(),
+      ...worktreePaths.values(),
+      // Follow where desks actually work, so a roleless god / reviewer can READ a project repo
+      // (or the god workspace) even if it was never registered — mirrors the integrate allow-list.
+      ...Object.values(hive.registry().agents).filter((a) => !a.archived).map((a) => a.cwd),
+      ...(cfg.godWorkspace ? [cfg.godWorkspace] : [])
+    ]));
+  },
+  // A desk may WRITE its OWN hive agent dir (memory.md, inbox/.done, scratch) — ungated by
+  // canEditCode (memory is everyone's). Shared hive files (tasks.json/registry.json) sit in the
+  // hive ROOT, not under agents/<id>, so they stay tool-managed (single-committer).
+  agentDir: (id) => { const r = hive.root(); return r ? join(r, 'agents', id) : null; },
+  // The god's integration seam (hive_integrate): review/merge a worker's branch into its
+  // repo. Scoped for safety to the repos the fleet actually WORKS IN — every desk's cwd, live
+  // worktree origins, the configured god workspace — plus the explicit registered-repos list.
+  // (So a project a desk sits in is integratable without separately "registering" it; an
+  // arbitrary path is still rejected.) Paths are NORMALIZED before comparison so a model-supplied
+  // separator/case/trailing-slash variant still matches. Git runs in main (single-committer);
+  // apply:false previews, true merges (conflicts abort + report).
+  integrate: async (repo, branch, apply) => {
+    const cfg = readConfig();
+    const allowed = normalizedPathSet([
+      ...Object.values(hive.registry().agents).map((a) => a.cwd),
+      ...worktreeOrigins.values(),
+      ...(cfg.registeredRepos ?? []),
+      cfg.godWorkspace
+    ]);
+    if (!allowed.has(normalizeRepoPath(repo))) {
+      return { content: `repo is not a known project (no desk works there, and it is not registered): ${repo}`, success: false };
+    }
+    if (!apply) {
+      const p = await previewMerge(repo, branch);
+      if (!p.ok) return { content: `preview failed: ${p.error}`, success: false };
+      return {
+        content: `Preview — merge ${branch} into ${p.base}:\n\nCommits:\n${p.commits || '(none)'}\n\nFiles:\n${p.diffstat || '(none)'}`,
+        success: true
+      };
+    }
+    // Serialize merges into THIS repo (one base tree → concurrent git merge would race the index),
+    // so two integrators (or a double hive_integrate) can't corrupt it.
+    return withRepoMergeLock(repo, async () => {
+      const m = await mergeBranch(repo, branch);
+      if (!m.ok) {
+        return {
+          content: m.conflict
+            ? `merge CONFLICT — aborted, repo left clean. Send ${branch} back to its author to rebase/resolve.\n${m.error}`
+            : `merge failed: ${m.error}`,
+          success: false
+        };
+      }
+      // Post-merge cleanup: the per-task branch is now in the trunk, so delete the merged branch
+      // (best-effort `git branch -d` — refuses if still checked out / not merged). The worker's
+      // per-DESK worktree persists (reused for its next card). Never fails a successful merge.
+      let cleaned = '';
+      try { if ((await deleteMergedBranch(repo, branch)).ok) cleaned = '; deleted the merged branch'; } catch { /* best-effort */ }
+      return { content: `merged ${branch} into ${m.base}${cleaned}`, success: true };
+    });
+  },
+  appendMemory: (id, text) => hive.appendMemory(id, text),
+  resolveCwd: (id) => hive.registry().agents[id]?.cwd ?? null,
+  bashEnabled: () => readConfig().nativeBashEnabled === true,
+  // Run the bash tool through a real shell (Git Bash on Windows) so ls/grep/find/pipes
+  // work — instead of Node's cmd.exe default. Detected once at startup.
+  bashShell: () => resolveBashEnv().shell,
+  // Redirect heavy build output (Rust `target/`, …) off the desk's worktree into the one
+  // AV-excludable cache root, keyed per working tree. A native desk's bash runs in MAIN, so this
+  // is the seam that reaches its cargo build (the Claude PTY path sets the same var in opts.env).
+  bashEnv: (id) => {
+    // bash gets the desk table PLUS the runtime env (so git/curl honor proxy/CA too).
+    const merged = { ...runtimeEnvResolved(), ...(deskEnvFor(hive.registry().agents[id]?.cwd, id) ?? {}) };
+    return Object.keys(merged).length ? merged : undefined;
+  },
+  // web_search routes through the host (provider + formatting). Free + keyless via
+  // DuckDuckGo; config is read live per call so the operator's enable/disable takes
+  // effect at once. Throws a clear note when disabled — the executor turns that into a
+  // recoverable success:false tool-result.
+  searchWeb: (query, opts) => searchWebDuckDuckGo(query, opts, readConfig()),
+  // The native sub-agent runtime (the Task-tool replica): fork an EPHEMERAL specialist worker with
+  // the named sub-agent's prompt, run it once on `input`, return its final text. The child INHERITS
+  // the caller's provider + credentials, runs caller-scoped (its tools resolve cwd/repo/roles as the
+  // caller via executeNativeToolFor(callerId, …)), and is tightly bounded (deny-list incl. nesting
+  // + integrate + board mutation; low turn/hop caps; a turn budget; the runner adds a wall-clock
+  // timeout + concurrency cap). The sub-run is VISIBLE on the caller's transcript as the
+  // spawn_subagent tool call + its result; the child's token cost ROLLS UP to the caller (below).
+  spawnSubAgent: (callerId, name, input) => spawnSubAgentFor(callerId, name, input)
+};
+
+/**
+ * Fork + run one ephemeral sub-agent AS `callerId` (the native Task-tool replica). Shared by the
+ * `spawn_subagent` TOOL (`agentToolDeps.spawnSubAgent`, no signal) and the SDDP ENGINE (which passes
+ * a `signal` so it can ABORT a step's in-flight run when the operator stops it). Inherits the
+ * caller's provider+model, runs caller-scoped via `executeNativeToolFor(callerId)`, rolls the child's
+ * token cost up to the caller. Never throws — returns `{ success:false }` on any guard/error.
+ *
+ * The host-agnostic body lives in `makeSpawnSubAgent` (runtime/subAgentExecutor.ts); here we inject
+ * the three host edges — the electron worker transport, the caller-scoped tool executor, and the
+ * telemetry cost rollup — over the live `agentProviderIds`/`agentModels`/`config` state. Behaviorally
+ * identical to the previous inline implementation.
+ */
+const spawnSubAgentFor = makeSpawnSubAgent({
+  providerOf: (id) => agentProviderIds.get(id),
+  modelOf: (id) => agentModels.get(id),
+  credentialEnvFor: (providerId) => injectionEnvForProvider(readConfig(), providerId),
+  subAgentModelOverride: () => readConfig().sddpSubAgentModel,
+  envNote: describeBashEnv,
+  transportFactory: (childId, env) => makeElectronWorkerTransport({ agentId: childId, maxOldSpaceMb: 512, env }),
+  executeTool: (callerId, req, cwdOverride) => executeNativeToolFor(callerId, req, cwdOverride),
+  onUsage: (usage) => telemetry.ingestNativeUsage(usage)
+});
+
+// The orchestrator ROLE injected into a NATIVE god's system prompt (Michael on a
+// non-Claude provider). The Claude god gets its role via `--append-system-prompt`
+// (hive.injectedPrompt); a native god has no CLI, so it orchestrates purely through the
+// hive TOOLS — this prompt is written for those (no fleet.json CLI / slash commands).
+// The native god's orchestrator prompt. Integration guidance is CONDITIONAL on the god
+// holding the `integrator` role (it does by default, but the operator can reassign it to a
+// dedicated integrator desk): with the role the god reviews+merges+signs-off; without it,
+// the god delegates integration to whichever desk holds the role.
+function nativeGodPrompt(godRoles: AgentRole[]): string {
+  const godIntegrates = godRoles.includes('integrator');
+  const godReviews = godRoles.includes('reviewer');
+  const godCanEdit = roleCanEditCode(godRoles); // holds worker or integrator
+  return [
+    'You are the GOD / ORCHESTRATOR of this hive of agents (you are "Michael"). Your job is to ORCHESTRATE, not implement: keep awareness of the whole team and delegate the work.',
+    `- YOUR CAPABILITY ROLES RIGHT NOW: ${godRoles.length ? godRoles.join(', ') : 'NONE — pure delegator/orchestrator'}. This is your LIVE role set — trust it over anything your memory says about past roles. ${godCanEdit ? 'Use edit/merge tools only for integration, never to build features.' : 'You hold no edit/integrator role, so write_file/edit_file/bash/hive_integrate are NOT in your toolset — you literally cannot call them. Delegate everything; never re-test whether you "can" integrate or edit.'}`,
+    '- KNOW THE TEAM: before delegating, call hive_list_agents to see who exists, who is running, and each desk\'s roles — assign to the best AVAILABLE desk, never blind.',
+    '- COLD ≠ GONE: a desk in hive_list_agents that holds a role but shows running:false is COLD (parked) — NOT gone. It WAKES the moment you delegate/message it (revive-on-demand). Treat a cold role-holder as AVAILABLE and delegate to it. NEVER unassign a card or declare "no desk available" for a role some floor desk holds — that just strands the work.',
+    '- DELEGATE: decompose a request into slices; for each, hive_add_task (a card assigned to a worker desk) and hive_send_message that desk a short 4-part brief (objective / output / tools+references / boundaries+done). Different slices can go to different desks in parallel. Do NOT do the grunt implementation yourself.',
+    '- THE FLOW (worker → reviewer → integrator): a WORKER writes + commits its slice on its own branch, RUNS the build/tests, and moves the card "doing"→"review". A REVIEWER reads it (read-only, comments only) and either approves it to "integrate" or sends it back to "doing". An INTEGRATOR re-runs the test suite as the merge gate, merges an "integrate" card, and signs it off to "done". "Done" means tested. Keep cards moving along this chain.',
+    '- RUN THE BOARD (light touch): at turn start glance at hive_list_tasks and fix a genuinely stale card with hive_update_task. Do NOT re-run a full board triage / reassignment every turn — only when the board actually changed or you are explicitly nudged (a standup or the operator). A card already assigned to a (possibly cold) role-holder is handled when that desk wakes — don\'t re-triage lanes that are already routed. When several reviewers exist, all are pinged but only the first to advance a card lands; integration is routed to ONE integrator to avoid a double-merge.',
+    godReviews
+      ? '- REVIEW work (you hold the reviewer role): when a card enters "review", read the desk\'s branch (read-only), confirm tests exist + cover the change + the worker\'s reported run is green, comment via a hive_update_task note, then approve it to "integrate" or send it back to "doing" with what to fix.'
+      : '- REVIEW is delegated: prefer a desk holding "reviewer" (auto-pinged on "review"). But if NO reviewer desk exists you are the standing fallback — the system pings YOU, so review it yourself (read-only) and approve to "integrate" or send it back.',
+    godIntegrates
+      ? '- INTEGRATE approved work (you hold the integrator role): each worker commits its slice on its own worktree branch (hive_list_agents shows each desk\'s repo + branch). On an "integrate" card, RUN the test suite as the merge gate, hive_integrate (no apply) to inspect the commits/diff, then hive_integrate apply:true to merge into the repo\'s base — then mark the card "done". A reported conflict (or red tests) means resolve it yourself (you may edit only to resolve the conflict) or send it back to the author. You own sign-off (done/reopen).'
+      : '- INTEGRATION is delegated — you do NOT hold the integrator role, so hive_integrate is NOT in your toolset; never try to merge yourself or "verify" the denial. An "integrate" card routes to a desk holding "integrator" (auto-pinged; a cold one wakes on delegation). If NO integrator desk exists, ask the operator to add one or grant an active desk the integrator role, then move on — do not loop.',
+    '- READ TO ORCHESTRATE: you CAN read any project repo + worktree (read_file/list_dir/grep with the repo/branch paths from hive_list_agents) — use that to decompose work and review branches. Your own working directory is just a neutral home base, not where the projects live.',
+    godCanEdit
+      ? '- DO NOT IMPLEMENT: building feature code is the WORKERS\' job — always delegate it. You hold an editing role, but use write_file/edit_file/bash ONLY to merge / resolve conflicts — never to build a feature slice yourself.'
+      : '- YOU CANNOT EDIT CODE: you hold no edit role, so write_file / edit_file / bash / hive_integrate are NOT in your toolset (you literally can\'t call them). If a card needs implementation, reassign it to a worker (hive_update_task assignee) or — if none exists — tell the operator which desk to spawn, then move on. Never try to do the work yourself; delegate.',
+    '- A DEV CARD IS NOT YOURS TO CODE: if a card assigned to you needs implementation, reassign it to a worker — you own orchestration, not the coding. A card stays with its assigned worker through review and send-back (the code lives on that worker\'s `agent/<id>` worktree branch); only reassign a worker\'s card if that worker is genuinely gone, and then hand the branch over explicitly.',
+    '- IF NO WORKER DESKS ARE ALIVE to take the work, do NOT attempt it yourself — tell the operator exactly which team/desks to spawn, then orchestrate once they are up.',
+    '- COORDINATE: answer agents\' questions so the team runs autonomously; read a peer\'s memory with hive_read_memory when you need context; record durable decisions with write_memory.',
+    'The human operator is watching this transcript and can message you directly — surface anything genuinely critical to them.'
+  ].join('\n');
+}
+
+// Injected into a desk that holds the `reviewer` role. A reviewer is READ-ONLY: it cannot
+// edit code or run bash (the toolkit denies write_file/edit_file/bash for a pure reviewer) —
+// it comments and routes the card.
+const NATIVE_AGENT_REVIEWER_PROMPT = [
+  'You also hold the REVIEWER role: you REVIEW other desks\' finished work — you READ and COMMENT, you do NOT change code (write_file/edit_file/bash are blocked for you).',
+  '- You are PINGED automatically when a card enters "review"; you should ALSO, on each wake, scan hive_list_tasks for cards in "review" and review them — don\'t wait to be asked. If several reviewers exist you may all look, but only the first to advance the card lands — so check it\'s still in "review" before acting.',
+  '- hive_list_agents shows each desk\'s repo + worktree branch. Read the branch\'s diff/files (read_file/list_dir/grep — read-only). CHECK THE TESTS: confirm tests exist, cover the change, and the worker recorded a green run (you cannot run them yourself — you are read-only). Leave your feedback as a hive_update_task `note` (it becomes an attributed comment on the card; the worker is handed it automatically on send-back).',
+  '- APPROVE: when it\'s good (and tested), hive_update_task the card to "integrate" (an integrator will merge it). REQUEST CHANGES: send it back with status "doing" and a `note` of exactly what to fix. You never merge and never mark "done".'
+].join('\n');
+
+// Injected into a NON-god desk that holds the `integrator` role (a dedicated integrator).
+// The integrator is a GATE + MERGER, not an author: it runs in the base tree on the trunk (no
+// isolated worktree), keeps `bash` for the test gate + `hive_integrate`, but has NO write_file/
+// edit_file — it never authors the trunk; conflicts go back to the author.
+const NATIVE_AGENT_INTEGRATOR_PROMPT = [
+  'You also hold the INTEGRATOR role: you GATE + MERGE other desks\' approved work and sign it off — you do NOT author or re-implement it. You run in the base tree on the trunk; you have no write_file/edit_file (you merge host-side, you don\'t edit the trunk).',
+  '- You are PINGED automatically when a card enters "integrate" (one integrator per card, no double-merge); you should ALSO, on each wake, scan hive_list_tasks for cards in "integrate" and merge them.',
+  '- Merge the CARD\'S branch (its `branch` field on the card / hive_list_tasks). FIRST run the test suite (bash) as the merge gate — if red, send the card back to its author (status "doing") with a `note`; don\'t merge red work. If green: hive_integrate (no apply) to inspect commits + diff, then hive_integrate apply:true to merge that branch into the trunk, then hive_update_task it to "done".',
+  '- A merge conflict aborts cleanly (the trunk is left untouched) — send the card back to its author (status "doing", with a `note`) to rebase/resolve on their own branch and resubmit. You do not resolve conflicts in the trunk yourself.'
+].join('\n');
+
+// Injected into a NON-god desk that holds the `worker` role (standard mode). Workers author code
+// on a PER-CARD branch off the trunk — so each card integrates independently and the next card
+// starts clean (never two cards on one branch).
+const NATIVE_AGENT_WORKER_PROMPT = [
+  'You hold the WORKER role: you implement ONE card at a time on its OWN branch.',
+  '- For each card, work on the branch named in the card\'s `branch` field (from hive_list_tasks). Start it fresh off the latest trunk: `git fetch`/update, then `git checkout -b <card.branch> <trunk>` (e.g. master/main). Commit ONLY that card\'s work there.',
+  '- Run the build/tests, then move the card "doing"→"review". A reviewer approves it to "integrate" and an integrator merges that branch into the trunk. After it merges, start your NEXT card on a fresh branch off the (now-updated) trunk — never pile two cards on one branch.',
+  '- If a card comes back to you (send-back / conflict), it\'s the same branch + context — fix it there and resubmit; merge the latest trunk into your branch first to clear conflicts.'
+].join('\n');
+
+// ─── SPEC-DRIVEN (SDDP) mode prompts ─────────────────────────────────────────
+// The SDDP native role prompts (god + planner/worker/reviewer/qc/integrator) live in
+// `./sddpPrompts.ts` (a pure, side-effect-free module so they are unit-testable). They drive the
+// sub-agent runtime: the god creates the feature EPIC card; planner/qc/worker spawn_subagent their
+// specialists per phase and advance the epic's milestone checklist. `nativeSddpGodPrompt` +
+// `nativeSddpRolePrompt` are consumed below in `workerEnv`.
+
+// A native worker (or an ephemeral sub-agent) requests a tool; MAIN executes it against the
+// GOVERNED, cwd-sandboxed toolkit so a native desk is a full hive peer with parity to a Claude
+// desk. Every call is routed through the SAME guardrails a Claude desk hits: (1) the permission
+// gate (operator pause/halt/gated-tool deny); (2) the circuit breaker (loop/cost guard); (3)
+// executeAgentTool (single-committer I/O, cwd-sandboxed, bash opt-in). Extracted as a named
+// function so the sub-agent runner can route a CHILD's tool calls through it under the CALLER's id
+// (caller-scoped cwd/repo/roles) — same governance, same single-committer.
+async function executeNativeToolFor(
+  id: string,
+  req: { toolCallId: string; toolName: string; toolInput: unknown },
+  cwdOverride?: string
+): Promise<{ content: string; success: boolean }> {
+  if (control.shouldHalt(id)) return { content: 'halted by operator', success: false };
+  const decision = control.toolDecision(id, req.toolName);
+  if (decision.deny) return { content: decision.reason ?? 'denied by operator', success: false };
+  // The attempt is recorded BEFORE execution, so a desk hammering an identical denied tool
+  // still feeds the breaker's loop guard.
+  breaker.recordToolUse(id, req.toolName, req.toolInput);
+  // cwdOverride (host-driven QC): run the child's tools in the QC-integration worktree instead of the
+  // caller's own cwd — its filesystem/bash resolve there, and it's added as a read root. (specs/ still
+  // anchors to repoFor() so qc-report.md lands in the shared base specs/<feature>/.)
+  const deps = cwdOverride
+    ? { ...agentToolDeps, resolveCwd: () => cwdOverride, readRoots: (rid: string) => [cwdOverride, ...(agentToolDeps.readRoots?.(rid) ?? [])] }
+    : agentToolDeps;
+  const result = await executeAgentTool(deps, id, req);
+  // Visibility (#edit-gate): make a read-only role denial observable in the main log, so
+  // "is the god actually writing?" is a fact, not a guess.
+  if (!result.success && (req.toolName === 'write_file' || req.toolName === 'edit_file' || req.toolName === 'bash')
+      && /read-only/.test(result.content)) {
+    console.log(`[edit-gate] denied ${req.toolName} for ${id} roles=[${(hive.registry().agents[id]?.roles ?? []).join(',')}]`);
+  }
+  return result;
+}
+
+// E003 — native (non-Claude) agents run in isolated utilityProcess workers,
+// fronted by the ProviderRuntime port. The drain runs in MAIN (single-committer
+// hive); a worker exit reuses the same archive path as a PTY exit (AD-004).
+const nativeRuntime = new NativeRuntime({
+  drainForStop: (id) => (hive.enabled() ? hive.drainForStop(id) : { block: false }),
+  // A native worker requests a tool; MAIN executes it through the governed, cwd-sandboxed toolkit
+  // (permission gate → circuit breaker → executeAgentTool). See `executeNativeToolFor` above.
+  executeToolFor: executeNativeToolFor,
+  // A native worker exit is TRANSIENT, not a retire: the desk is revive-on-demand and stays on
+  // the operator's floor, so do NOT archive it (archiving would hide a still-wanted role-holder
+  // from the god's routing). Clear its turn state + drop its breaker counters; the desk reads as
+  // "cold" (archived:false, not running) and revives when the god delegates to it. Only an
+  // explicit operator KILL (onKill → hive:setArchived) retires a native desk. (Claude PTYs keep
+  // archiving via teardownPty — they aren't revive-on-demand.)
+  onWorkerExit: (id) => { markTurn(id, false); try { breaker.forget(id); } catch { /* best-effort */ } syncKeepAwake(); },
+  usageFor: (id) => usageProvider.getAgentUsage(id),
+  credentialEnvFor: (providerId) => injectionEnvForProvider(readConfig(), providerId),
+  // Per-desk native preamble additions (the worker prepends these to its system prompt):
+  // the shell/OS note for every desk; the orchestrator ROLE for a native god (with its
+  // integration guidance conditional on the god holding the `integrator` role); and the
+  // INTEGRATOR preamble for a dedicated (non-god) integrator desk. Identity + roles come
+  // from the hive registry (set at ensureAgent / setRoles).
+  workerEnv: (id) => {
+    // Runtime env (proxy / custom CA) first, so the worker PROCESS — which makes the model API call —
+    // inherits HTTPS_PROXY / NODE_EXTRA_CA_CERTS / … (the worker also wires undici's ProxyAgent from it).
+    const env: Record<string, string> = { ...runtimeEnvResolved(), NATIVE_AGENT_ENV_NOTE: describeBashEnv() };
+    const agent = hive.registry().agents[id];
+    const roles = agent?.roles ?? [];
+    // SDDP mode is a WHOLESALE switch: when on, desks get the spec-driven preamble set
+    // instead of the standard role prompts (a desk is either standard or SDDP, never mixed).
+    const sddp = readConfig().sddpMode === true;
+    if (agent?.isGod) {
+      env.NATIVE_AGENT_GOD_PROMPT = sddp ? nativeSddpGodPrompt(roles) : nativeGodPrompt(roles);
+    } else {
+      if (sddp) {
+        // One SDDP preamble assembled from the roles the desk holds (planner/worker/
+        // reviewer/qc/integrator). agentWorker prepends it to the system prompt.
+        env.NATIVE_AGENT_SDDP_PROMPT = nativeSddpRolePrompt(roles);
+      } else {
+        // A non-god desk can hold worker and/or reviewer and/or integrator; inject each role's
+        // preamble so its responsibilities are spelled out (a desk may hold several).
+        if (roles.includes('worker')) env.NATIVE_AGENT_WORKER_PROMPT = NATIVE_AGENT_WORKER_PROMPT;
+        if (roles.includes('reviewer')) env.NATIVE_AGENT_REVIEWER_PROMPT = NATIVE_AGENT_REVIEWER_PROMPT;
+        if (roles.includes('integrator')) env.NATIVE_AGENT_INTEGRATOR_PROMPT = NATIVE_AGENT_INTEGRATOR_PROMPT;
+      }
+      // "Know before you attempt": the board transitions THIS desk may make on hive_update_task
+      // (which can't be hidden like an integrator-only tool — every role needs some of it), so it
+      // stops attempting moves the execution gate would reject. Non-god only — the god's own
+      // prompt covers its delegator powers (incl. reassign), which this line would contradict.
+      env.NATIVE_AGENT_BOARD_LINE = boardCapabilityLine(roles);
+    }
+    // Advertise only the tools this desk can actually use: drop the code-editing tools for a
+    // read-only desk and hive_integrate for a non-integrator, so the model never SEES (and never
+    // attempts) a tool the execution gate would deny — no "called a denied tool, re-verify" loops.
+    const deny = deniedNativeToolNames(roles);
+    if (deny.length) env.NATIVE_AGENT_DENY_TOOLS = deny.join(',');
+    return env;
+  },
+  // E007 T011/T017 {FR-008/011} — forward each native worker's usage + tool spans
+  // into the loopback collector's gen_ai.* branch (single-writer in main, AD-002),
+  // so a DeepSeek/Minimax desk produces the SAME AgentUsageSample + ToolSpan as a
+  // Claude desk and reaches telemetry parity through the unchanged consumers.
+  telemetry,
+  // E008 T004/T005 {FR-016/037/043} — forward each native worker's AgentEvent
+  // stream into the single-writer bridge (persist-then-forward over `agent:event`).
+  onAgentEvent: (event) => {
+    // Authoritative native turn state (parity with the Claude hook path): a turn opens on
+    // turn-start and closes on turn-end / stop (incl. the synthetic stop on kill/exit), so the
+    // live status badge can't latch on "working" after a missed final event.
+    if (event.kind === 'turn-start') markTurn(event.agentId, true);
+    else if (event.kind === 'turn-end' || event.kind === 'stop') markTurn(event.agentId, false);
+    nativeEventBridge.ingest(event);
+  },
+  maxConcurrent: 15,
+  maxOldSpaceMb: 512
+});
+
+// Desks holding `role` that the host engine can run sub-agents AS (a SPAWNED native desk:
+// non-anthropic provider + a recorded model). Used to auto-assign the epic OWNER (a planner).
+function usableDesksForRole(role: AgentRole): string[] {
+  const agents = hive.registry().agents;
+  return Object.values(agents)
+    .filter((a) => a.archived !== true && (a.roles ?? []).includes(role))
+    .map((a) => a.id)
+    .filter((id) => { const p = agentProviderIds.get(id); return !!p && p !== 'anthropic' && !!agentModels.get(id); });
+}
+// Desks holding `role` (any non-archived — they run their own loop), for assigning WORK to (workers).
+function desksForRole(role: AgentRole): string[] {
+  const agents = hive.registry().agents;
+  return Object.values(agents).filter((a) => a.archived !== true && (a.roles ?? []).includes(role)).map((a) => a.id);
+}
+
+/** QC-integration worktree path → its origin repo (so `removeQcTree` can `git worktree remove` from
+ *  the repo, not the throwaway tree). Set by `prepareQcTree`, cleared by `removeQcTree`. */
+const qcTreeRepo = new Map<string, string>();
+
+/** Safe absolute path of a `specs/<feature>/<relPath>` artifact (sanitized feature segment + no dir
+ *  traversal), or null. Shared by the engine's analyze read/write deps (mirrors featureArtifactExists). */
+function featureFilePath(repo: string | null, feature: string, relPath: string): string | null {
+  if (!repo) return null;
+  const safe = feature.replace(/[\\/]/g, '_').trim();
+  if (!safe || safe === '.' || safe === '..') return null;
+  const base = join(repo, 'specs', safe);
+  const target = join(base, relPath);
+  const rel = relative(base, target);
+  if (rel.startsWith('..') || isAbsolute(rel)) return null; // no escaping the feature dir
+  return target;
+}
+
+// Host-driven SDDP engine — when the floor is in SDDP mode, it DRIVES the sub-agents per phase
+// (the milestone checklist is the program; this is the interpreter). It runs each host-driven
+// milestone's specialist AS the feature epic's owner desk (inheriting its provider/model + holding
+// the feature card), gates on the real artifact, and advances — chaining via writeTasks. Wired to
+// the hive's board-change trigger below. All host concerns are the same deps the toolkit uses.
+const sddpPipeline = new SddpPipeline({
+  enabled: () => readConfig().sddpMode === true,
+  autopilot: () => readConfig().sddpAutopilot === true,
+  listTasks: () => {
+    const ledger = hive.tasks() as { tasks?: HiveTask[] } | undefined;
+    return Array.isArray(ledger?.tasks) ? ledger!.tasks : [];
+  },
+  repoForEpic: (epic) => epic.project ?? (epic.assignee ? repoForId(epic.assignee) : null),
+  // Usable owner = a SPAWNED native (non-Claude) desk with a recorded model — so the host can run
+  // the phase specialists as it (creds + model), and it holds the feature card (the epic itself).
+  ownerUsable: (id) => {
+    const provider = agentProviderIds.get(id);
+    return !!provider && provider !== 'anthropic' && !!agentModels.get(id);
+  },
+  featureArtifactExists: (repo, feature, relPath) => agentToolDeps.featureArtifactExists!(repo, feature, relPath),
+  spawnSubAgent: (callerId, name, input, signal) => spawnSubAgentFor(callerId, name, input, signal),
+  advanceMilestone: (epicId, key) => hive.advanceMilestone(epicId, key),
+  // Seed the implement cards from tasks.md (deterministic — the same parse hive_import_tasks uses):
+  // one feature-tagged `todo` card per task, ROUND-ROBIN ASSIGNED to worker desks (P5b) — falling
+  // back to unassigned when no worker desks exist (the god then routes them).
+  seedImplementCards: (epic) => {
+    const repo = epic.project ?? (epic.assignee ? repoForId(epic.assignee) : null);
+    const feature = epic.feature;
+    if (!feature) return 0;
+    const parsed = agentToolDeps.parseFeatureTasks?.(repo, feature) ?? [];
+    if (parsed.length === 0) return 0;
+    const ledger = hive.tasks() as { tasks?: HiveTask[] } | undefined;
+    const existing = Array.isArray(ledger?.tasks) ? ledger!.tasks : [];
+    const workers = desksForRole('worker'); // round-robin across worker desks (cold ones wake on assign)
+    const now = new Date().toISOString();
+    const created: HiveTask[] = parsed.map((p, i) => {
+      const id = `task-${Date.now()}-${existing.length + i}`;
+      const assignee = workers.length ? workers[i % workers.length] : undefined;
+      return {
+        id,
+        title: p.taskId ? `${p.taskId} ${p.title}`.trim() : p.title,
+        assignee,
+        status: 'todo',
+        dependsOn: [],
+        project: assignee ? (repoForId(assignee) ?? repo ?? undefined) : (repo ?? undefined),
+        branch: assignee ? agentTaskBranch(assignee, id) : undefined,
+        feature,
+        priority: 0,
+        createdAt: now
+      };
+    });
+    hive.writeTasks([...existing, ...created]);
+    return created.length;
+  },
+  // Auto-assign helpers (P5b): the engine picks a usable planner desk to OWN the epic (run sub-agents
+  // as), and assigns it via assignCard.
+  findDeskForRole: (role) => usableDesksForRole(role as AgentRole)[0] ?? null,
+  assignCard: (cardId, deskId) => {
+    const ledger = hive.tasks() as { tasks?: HiveTask[] } | undefined;
+    const tasks = Array.isArray(ledger?.tasks) ? ledger!.tasks : [];
+    const idx = tasks.findIndex((t) => t.id === cardId);
+    if (idx < 0) return;
+    const next = [...tasks];
+    next[idx] = { ...next[idx], assignee: deskId, project: repoForId(deskId) ?? next[idx].project };
+    hive.writeTasks(next);
+  },
+  // ANALYZE deps — mechanical requirement→task coverage (pure check in won-agent-core) + read/write of
+  // the analysis report. All path-safe to specs/<feature>/ (no traversal), like featureArtifactExists.
+  analyzeFeature: (repo, feature) => {
+    const read = (rel: string): string => {
+      const p = featureFilePath(repo, feature, rel);
+      if (!p || !existsSync(p)) return '';
+      try { return readFileSync(p, 'utf8'); } catch { return ''; }
+    };
+    return { uncovered: analyzeCoverage(read('spec.md'), read('tasks.md')).uncovered };
+  },
+  featureArtifactText: (repo, feature, relPath) => {
+    const p = featureFilePath(repo, feature, relPath);
+    if (!p || !existsSync(p)) return null;
+    try { return readFileSync(p, 'utf8'); } catch { return null; }
+  },
+  writeFeatureArtifact: (repo, feature, relPath, content) => {
+    const p = featureFilePath(repo, feature, relPath);
+    if (!p) return;
+    try { mkdirSync(dirname(p), { recursive: true }); writeFileSync(p, content, 'utf8'); }
+    catch (e) { console.error('[sddp-pipeline] writeFeatureArtifact failed:', e); }
+  },
+  // CHECKLIST GATE (P2): mechanical completion across specs/<feature>/checklists/*.md (`- [ ]` vs
+  // `- [X]`). total === 0 ⇒ no checklists ⇒ the gate is N/A.
+  checklistStatus: (repo, feature) => {
+    const dir = featureFilePath(repo, feature, 'checklists');
+    if (!dir || !existsSync(dir)) return { total: 0, checked: 0 };
+    let total = 0, checked = 0;
+    try {
+      for (const f of readdirSync(dir)) {
+        if (!f.endsWith('.md')) continue;
+        for (const line of readFileSync(join(dir, f), 'utf8').split('\n')) {
+          if (/^\s*-\s*\[ \]/.test(line)) total++;
+          else if (/^\s*-\s*\[[xX]\]/.test(line)) { total++; checked++; }
+        }
+      }
+    } catch { /* best-effort — an unreadable checklist dir ⇒ what we counted so far */ }
+    return { total, checked };
+  },
+  // HOST-DRIVEN QC (P4): build a QC-integration worktree (merge the feature's implement branches off
+  // trunk), run the QC sub-agents IN it, tear it down. `qcTreeRepo` maps tree path → origin repo so
+  // removeQcTree can run `git worktree remove` from the repo.
+  prepareQcTree: async (epic) => {
+    const repo = epic.project ?? (epic.assignee ? repoForId(epic.assignee) : null);
+    const feature = epic.feature;
+    if (!repo || !feature) return { ok: false, path: null, conflicts: [] };
+    const ledger = hive.tasks() as { tasks?: HiveTask[] } | undefined;
+    const branches = [...new Set((ledger?.tasks ?? [])
+      .filter((t) => t.feature === feature && t.id !== epic.id && t.branch)
+      .map((t) => t.branch!))];
+    const base = await repoTrunk(repo);
+    const root = join(readConfig().harnessHome ?? repo, 'qc-worktrees');
+    const path = join(root, `${feature.replace(/[\\/]/g, '_')}-${shortHash(normalizeRepoPath(repo))}`);
+    const res = await gitPrepareQcTree(repo, path, base, branches);
+    if (!res.ok) return { ok: false, path: null, conflicts: res.conflicts };
+    qcTreeRepo.set(path, repo);
+    return { ok: true, path, conflicts: res.conflicts };
+  },
+  removeQcTree: (path) => {
+    const repo = qcTreeRepo.get(path);
+    if (repo) { void removeWorktree(repo, path); qcTreeRepo.delete(path); }
+  },
+  spawnSubAgentInTree: (callerId, name, input, treePath, signal) => spawnSubAgentFor(callerId, name, input, signal, treePath),
+  sddpPolicy: () => {
+    const c = readConfig().sddpConfig ?? {};
+    return { qcStrictness: c.qcStrictness ?? 'standard', coverageTarget: c.coverageTarget, maxQcIterations: c.maxQcIterations ?? 10 };
+  },
+  // BUG LOOP (P5): file bug-task cards from a failed QC report (the [BUG:…] lines it emitted, else one
+  // generic card), round-robin to workers. attempt drives the escalation tag (≥3 ESCALATED;
+  // ≥maxQcIterations DEFERRED). The titles carry `[BUG` so openBugCards can gate the loop on them.
+  seedBugCards: (epic, report, attempt) => {
+    const repo = epic.project ?? (epic.assignee ? repoForId(epic.assignee) : null);
+    const feature = epic.feature;
+    if (!feature) return 0;
+    const max = readConfig().sddpConfig?.maxQcIterations ?? 10;
+    const found = report.split('\n').map((l) => l.trim()).filter((l) => /\[BUG:/i.test(l));
+    const findings = found.length ? found : [`[BUG:ERROR] QC failed for ${feature} — see specs/${feature}/qc-report.md`];
+    const ledger = hive.tasks() as { tasks?: HiveTask[] } | undefined;
+    const existing = Array.isArray(ledger?.tasks) ? ledger!.tasks : [];
+    // Recurrence: signatures of every prior [BUG card for this feature (done cards from earlier
+    // attempts are how the same finding gets re-tagged [RECURRING] when it comes back).
+    const priorSigs = new Set(existing
+      .filter((t) => t.feature === feature && /\[BUG/i.test(t.title))
+      .map((t) => bugSignature(t.title)));
+    const titles = buildBugTitles(findings, priorSigs, attempt, max); // [BUG:sev] [RECURRING?] [ESCALATED?] [DEFERRED?] …
+    const workers = desksForRole('worker');
+    const now = new Date().toISOString();
+    const created: HiveTask[] = titles.map((title, i) => {
+      const id = `bug-${Date.now()}-${existing.length + i}`;
+      const assignee = workers.length ? workers[i % workers.length] : undefined;
+      return {
+        id, title,
+        assignee, status: 'todo', dependsOn: [],
+        project: assignee ? (repoForId(assignee) ?? repo ?? undefined) : (repo ?? undefined),
+        branch: assignee ? agentTaskBranch(assignee, id) : undefined,
+        feature, priority: 1, createdAt: now
+      } as HiveTask;
+    });
+    hive.writeTasks([...existing, ...created]);
+    return created.length;
+  },
+  openBugCards: (epic) => {
+    const ledger = hive.tasks() as { tasks?: HiveTask[] } | undefined;
+    return (ledger?.tasks ?? []).filter((t) => t.feature === epic.feature && t.status !== 'done' && /\[BUG/i.test(t.title)).length;
+  },
+  escalate: (feature, message) => {
+    try { hive.send({ to: 'god', act: 'request', needs_human: true, subject: `SDDP pipeline — ${feature}`, body: message }, 'system'); }
+    catch (e) { console.error('[sddp-pipeline] escalate failed:', e); }
+  },
+  // Clarify questions → the operator/god (needs_human). They answer + advance the clarify milestone.
+  askHuman: (feature, questions) => {
+    try { hive.send({ to: 'god', act: 'query', needs_human: true, subject: `Clarify — ${feature}`, body: `Feature "${feature}" needs clarification before planning. Answer these, fold them into specs/${feature}/spec.md (## Clarifications), then advance the clarify milestone (hive_update_task advanceMilestone:'clarify'):\n\n${questions}` }, 'system'); }
+    catch (e) { console.error('[sddp-pipeline] askHuman failed:', e); }
+  },
+  // BOOTSTRAP (before-Specify): read a bootstrapped repo's already-written project plan.
+  projectPlanText: (repo) => {
+    if (!repo) return null;
+    const p = join(repo, 'specs', 'project-plan.md');
+    if (!existsSync(p)) return null;
+    try { return readFileSync(p, 'utf8'); } catch { return null; }
+  },
+  // BOOTSTRAP: seed one feature EPIC card (with the full milestone checklist) for a pending plan epic,
+  // owned by a usable planner desk when one exists (the engine runs the phase specialists AS it). The
+  // description carries the epic's intent + PRD/SAD refs so the bootstrap-aware spec step grounds it.
+  // Mirrors seedImplementCards (host owns the card write). Idempotency is enforced upstream by the
+  // engine (skips epics already carded by their E### id).
+  seedFeatureEpic: (repo, epic, feature) => {
+    const ledger = hive.tasks() as { tasks?: HiveTask[] } | undefined;
+    const existing = Array.isArray(ledger?.tasks) ? ledger!.tasks : [];
+    const owner = usableDesksForRole('planner')[0];
+    const card: HiveTask = {
+      id: `epic-${Date.now()}-${existing.length}`,
+      title: `${epic.epicId} ${epic.title}`.trim(),
+      description: epicCardDescription(epic),
+      assignee: owner,
+      status: 'doing',
+      dependsOn: [],
+      project: owner ? (repoForId(owner) ?? repo ?? undefined) : (repo ?? undefined),
+      feature,
+      milestones: defaultMilestones(),
+      priority: epic.priority === 'P1' ? 0 : epic.priority === 'P3' ? 2 : 1,
+      createdAt: new Date().toISOString()
+    };
+    hive.writeTasks([...existing, card]);
+  },
+  log: (m) => console.log(m)
+});
+// BOOTSTRAP auto-seed (thin trigger): turn each registered repo's `specs/project-plan.md` into feature
+// epic cards when SDDP mode is on. Idempotent (the engine skips already-carded epics), so it's safe to
+// call on enable, on board activity, and at startup. The god can still create epics too.
+function seedAllFeaturesFromPlan(): void {
+  if (readConfig().sddpMode !== true) return;
+  for (const repo of new Set([...(readConfig().registeredRepos ?? []), ...worktreeOrigins.values()])) {
+    try { sddpPipeline.seedFeaturesFromPlan(repo); } catch (e) { console.error('[sddp-pipeline] seedAllFeaturesFromPlan failed:', e); }
+  }
+}
+// The hive fires this per feature on every board change (fire-and-forget); the engine debounces. Also
+// (idempotently) seed any pending plan epics for the repo, so a bootstrapped repo's backlog fills in as
+// soon as there's board activity (the startup + enable passes cover a cold repo with no activity yet).
+hive.setPipelineTrigger((repo, feature) => { sddpPipeline.seedFeaturesFromPlan(repo); sddpPipeline.schedule(repo, feature); });
 
 /** Keep the system from suspending the harness while agents are running.
  *  Windows Modern Standby suspends desktop apps (and their child `claude`
@@ -198,6 +1180,38 @@ function clearMissionTimers(): void {
  *  interval. Each tick dispatches the mission to its target agent and stamps
  *  lastFiredAt back into config. Called on boot (after the router starts) and
  *  after every missions:save. */
+/** Dispatch a mission once: send its body to its target(s) — the single `to` recipient, or,
+ *  when `project` is set, EVERY non-archived desk whose project repo matches (per-project
+ *  scoping) — then run auto-compact and stamp lastFiredAt. Shared by the interval timer and
+ *  the on-demand "fire now" IPC. Best-effort; never throws into the timer. */
+function fireMission(m: ScheduledMission): void {
+  try {
+    if (hive.enabled()) {
+      const targets = m.project
+        ? Object.values(hive.registry().agents)
+            .filter((a) => !a.archived && repoForId(a.id) === m.project)
+            .map((a) => a.id)
+        : [m.to];
+      for (const to of targets) {
+        hive.send({ to, act: 'request', subject: m.label, body: m.body }, 'scheduler');
+      }
+    }
+    // Auto-compact: do NOT jam /compact into busy terminals. Hand it to the renderer, which
+    // queues a /compact per agent (deduped — never two at once) and delivers it only when
+    // that agent goes idle (its drain loop), so a working agent compacts between steps.
+    if (m.autoCompact) {
+      try { liveWebContents()?.send('mission:autoCompact'); } catch { /* window gone */ }
+    }
+    const current = readConfig().missions ?? [];
+    const next = current.map((x) => (x.id === m.id ? { ...x, lastFiredAt: Date.now() } : x));
+    writeConfig({ missions: next });
+    // Let the SCHEDULES panel refresh its "last fired" without a reload (#2.3).
+    try { liveWebContents()?.send('missions:updated'); } catch { /* window gone */ }
+  } catch (e) {
+    console.error('[scheduler] mission', m.id, e);
+  }
+}
+
 function syncMissions(): void {
   clearMissionTimers();
   const missions = readConfig().missions ?? [];
@@ -207,29 +1221,7 @@ function syncMissions(): void {
     // with an adaptive cadence. Registered into the same missionTimers map so
     // clearMissionTimers() tears it down identically on quit/reset.
     if (m.kind === 'heartbeat') { armHeartbeat(m); continue; }
-    const fire = (): void => {
-      try {
-        if (hive.enabled()) {
-          hive.send({ to: m.to, act: 'request', subject: m.label, body: m.body }, 'scheduler');
-        }
-        // Auto-compact: do NOT jam /compact into busy terminals. Hand it to the
-        // renderer, which queues a /compact per agent (deduped — never two at
-        // once) and delivers it only when that agent goes idle (its drain loop),
-        // so a working agent compacts between steps, never mid-step.
-        if (m.autoCompact) {
-          try { liveWebContents()?.send('mission:autoCompact'); } catch { /* window gone */ }
-        }
-        const current = readConfig().missions ?? [];
-        const next = current.map((x) =>
-          x.id === m.id ? { ...x, lastFiredAt: Date.now() } : x
-        );
-        writeConfig({ missions: next });
-        // Let the SCHEDULES panel refresh its "last fired" without a reload (#2.3).
-        try { liveWebContents()?.send('missions:updated'); } catch { /* window gone */ }
-      } catch (e) {
-        console.error('[scheduler] mission', m.id, e);
-      }
-    };
+    const fire = (): void => fireMission(m);
     // Honor lastFiredAt so a partially-elapsed interval is not restarted from
     // zero on reboot or when an unrelated mission is edited: wait only the time
     // remaining until the next due fire, then settle into a steady interval.
@@ -423,8 +1415,31 @@ function writeFleetSnapshot(): void {
     const snap = telemetry.snapshot();
     const usageById = new Map(snap.usage.map((u) => [u.agentId, u]));
     const now = Date.now();
+    // Live runtime truth for each desk (a live native worker or PTY) — the single source of truth
+    // for status + archived (reconciled below). Computed once over the live PTY set per beat.
+    const livePtys = new Set(ptyManager.list().map((p) => p.id));
+    const isRunning = (id: string): boolean =>
+      nativeRuntime.runtimeFor(id) !== undefined ||
+      [...ptyToAgent.entries()].some(([ptyId, aid]) => aid === id && livePtys.has(ptyId));
+    // Reconcile drift: a desk that is actually RUNNING must never read as archived — otherwise the
+    // god's role routing (`roleHoldersForTask` filters `!archived`) can't see a live integrator/etc.
+    // Only fix the running⇒not-archived direction (archiving a dead desk stays an exit action), and
+    // only write when it actually changes (no commit churn).
+    for (const [id, a] of Object.entries(reg.agents)) {
+      if (a.archived && isRunning(id)) {
+        try { hive.setArchived(id, false); } catch (e) { console.error('[fleet] un-archive failed:', e); }
+      }
+    }
+    // Push the authoritative live state (running + in-a-turn) to the renderer so a stale "working"
+    // badge self-heals (the renderer reconciles status from this — see useHive `fleet:state`).
+    try {
+      const liveState = Object.keys(reg.agents)
+        .filter((id) => !reg.agents[id].archived || isRunning(id))
+        .map((id) => ({ id, running: isRunning(id), inTurn: turnActive.has(id) }));
+      liveWebContents()?.send('fleet:state', liveState);
+    } catch { /* window tore down */ }
     const agents = Object.entries(reg.agents)
-      .filter(([, a]) => !a.archived)
+      .filter(([id, a]) => !a.archived || isRunning(id))
       .map(([id, a]) => {
         const u = usageById.get(id);
         const spans = snap.spans[id] ?? [];
@@ -438,7 +1453,9 @@ function writeFleetSnapshot(): void {
           isAssistant: !!a.isAssistant,
           breaker: breaker.levelFor(id),
           tokens,
-          usd: u ? Number(u.usd.toFixed(4)) : 0,
+          // `u.usd === null` = unpriced (unknown model): surface null, never $0,
+          // so the fleet snapshot doesn't read an unpriced desk as free (FR-006).
+          usd: u && u.usd != null ? Number(u.usd.toFixed(4)) : null,
           lastTool: spans.length ? spans[spans.length - 1].tool : null,
           lastActiveSecAgo: u ? Math.round((now - u.ts) / 1000) : null,
           inboxBacklog: hive.inboxBacklog(id)
@@ -641,45 +1658,43 @@ ipcMain.handle('pty:spawn', async (_evt, opts: SpawnOptions & { hive?: AgentMeta
   if (!opts || typeof opts.id !== 'string' || typeof opts.cwd !== 'string' || typeof opts.command !== 'string') {
     return { ok: false, error: 'invalid SpawnOptions' };
   }
-  // Git isolation: when requested and the cwd is a real repo, give this agent
-  // its own worktree on an `agent/<id>` branch so it can't clobber other agents'
-  // (or the user's) working tree. Best-effort — a failure falls back to the
-  // shared cwd rather than blocking the spawn.
-  if (opts.isolate === true && await isRepo(opts.cwd)) {
-    try {
-      const origCwd = opts.cwd;
-      const wtRoot = join(readConfig().harnessHome ?? origCwd, 'worktrees');
-      // The id is renderer-supplied (validated only as a string). Slugify it so a
-      // crafted id can't inject path separators, then assert the resolved path
-      // stays under the worktrees root (defends against bare '..' that slugify
-      // leaves intact). If it would escape, bail isolation → fall back to cwd.
-      const seg = (opts.hive?.id ?? opts.id).replace(/[^A-Za-z0-9._-]/g, '-');
-      const wtPath = join(wtRoot, seg);
-      if (!resolve(wtPath).startsWith(resolve(wtRoot) + sep)) {
-        console.error('[worktree] refusing unsafe worktree path for id:', opts.hive?.id ?? opts.id);
-      } else {
-        const br = await getBranch(origCwd);
-        const baseBranch = 'current' in br && br.current ? br.current : 'main';
-        const wt = await addWorktree(origCwd, wtPath, baseBranch);
-        if (wt.ok) {
-          opts.cwd = wtPath;
-          worktreePaths.set(opts.id, wtPath);
-          worktreeOrigins.set(opts.id, origCwd);
-        } else {
-          console.error('[worktree] addWorktree failed:', wt.error);
-        }
-      }
-    } catch (e) {
-      console.error('[worktree] isolation failed:', e);
+  // Git isolation: only code AUTHORS (worker/planner/qc) get their own `agent/<id>` worktree —
+  // they author on their own branch. The INTEGRATOR + REVIEWER do NOT isolate: the integrator
+  // merges branches into the base/trunk host-side (hive_integrate→mergeBranch) and the reviewer
+  // is read-only, so both run in the base tree on the trunk (the integration target). A RESTART
+  // of an already-isolated desk REATTACHES to its existing worktree (planWorktree, independent of
+  // forceNew). Best-effort — a failure falls back to the shared cwd. (god/assistant never isolate
+  // — neutral home, not a project repo. A desk with no explicit roles defaults to worker.)
+  const roles = opts.hive?.roles ?? [];
+  const isAuthorDesk = !!opts.hive && !opts.hive.isGod && !opts.hive.isAssistant
+    && (roles.length === 0 || roleAuthorsCode(roles));
+  if (isAuthorDesk && await isRepo(opts.cwd)) {
+    const wt = await provisionWorktree(opts.cwd, opts.hive?.id ?? opts.id, /* forceNew (always isolate) */ true);
+    if (wt) {
+      opts.cwd = wt.path;
+      worktreePaths.set(opts.id, wt.path);
+      worktreeOrigins.set(opts.id, wt.origin);
     }
+  }
+  // Redirect this desk's build output (Rust `target/`, …) off its (now-final) cwd into the one
+  // AV-excludable cache root — so a Claude author/base-tree desk's cargo build doesn't churn
+  // `target/` inside the worktree or the repo. (Native desks get the same var via `bashEnv`.)
+  if (opts.hive && !opts.hive.isGod && !opts.hive.isAssistant) {
+    // Claude desk gets the runtime env (proxy/CA for the Claude CLI's own calls) + the desk table.
+    const envAdds = { ...runtimeEnvResolved(), ...(deskEnvFor(opts.cwd, opts.hive.id) ?? {}) };
+    if (Object.keys(envAdds).length) opts.env = { ...(opts.env ?? {}), ...envAdds };
   }
   // If the agent carries hive metadata, provision its workspace and inject the
   // identity + protocol (extra --append-system-prompt args + AGENT_* env).
   if (opts.hive && hive.enabled()) {
+    // Ensure the agent's working dir exists before it spawns there — chiefly the god's
+    // dedicated workspace (a sibling of the hive bookkeeping), which won't exist on the
+    // first run. A no-op for an existing project cwd / the harness home.
+    try { mkdirSync(opts.cwd, { recursive: true }); } catch { /* best-effort */ }
     try {
       const inj = hive.ensureAgent(
         { ...opts.hive, cwd: opts.cwd },
-        { semanticMemory: memory.active(), theme: readConfig().terminalTheme ?? 'light' }
+        { semanticMemory: memory.active(), theme: readConfig().terminalTheme ?? 'light', sddp: readConfig().sddpMode === true }
       );
       opts.args = [...(opts.args ?? []), ...inj.args];
       // Point the agent's mempalace CLI at the shared palace (no-op if inactive).
@@ -694,11 +1709,54 @@ ipcMain.handle('pty:spawn', async (_evt, opts: SpawnOptions & { hive?: AgentMeta
   if (opts.hive) {
     const cfg = readConfig();
     const args = opts.args ?? [];
-    // Model precedence: an explicit per-agent --model (from the renderer) wins;
-    // else the user's global defaultModel; else the role-based default tier.
-    if (!args.includes('--model')) {
+    // Model precedence (UNCHANGED, DR-8): an explicit per-agent --model (from the
+    // renderer) wins; else the user's global defaultModel; else the role-based
+    // default tier. Track the explicit value so we can record its provider below.
+    const explicitIdx = args.indexOf('--model');
+    const explicitModel = explicitIdx >= 0 ? args[explicitIdx + 1] : undefined;
+    if (explicitIdx < 0) {
       const m = cfg.defaultModel ?? modelForRole(opts.hive);
       if (m) args.push('--model', m);
+    }
+    // E005 {FR-008} — derive + record the providerId for the resolved model (the
+    // explicit --model when present, else the precedence result just pushed) so the
+    // E006 native runtime seam can consume it. Provider is DERIVED, never stored on
+    // the agent record (DR-1); an unresolvable/role-based model derives null and we
+    // simply record nothing. This does NOT change spawn behavior (Claude/PTY path
+    // is unaffected) — it only records a derivation for downstream.
+    const resolvedModel = explicitModel ?? cfg.defaultModel ?? modelForRole(opts.hive);
+    const providerId = deriveProviderId(resolvedModel);
+    if (providerId) agentProviderIds.set(opts.hive.id, providerId);
+    else agentProviderIds.delete(opts.hive.id);
+    if (resolvedModel) agentModels.set(opts.hive.id, resolvedModel);
+    // E006 {FR-008} — spawn router: a desk assigned to a NATIVE provider (a derived
+    // providerId that is not Claude/anthropic) LAUNCHES on that provider via the
+    // native worker + the adapter selected from the injected env, NOT the Claude PTY
+    // path. A Claude/anthropic desk (or an unresolvable/role-based model) falls
+    // through to the existing PTY spawn below, unchanged.
+    if (providerId && providerId !== 'anthropic') {
+      // T021 {FR-008} — missing-key guard: nativeRuntime.spawn returns
+      // 'needs-credentials' when no key is stored (E004 presence false); surface a
+      // clear "needs credentials" state to the operator rather than a broken loop.
+      const spawnRes = nativeRuntime.spawn(opts.hive.id, providerId, resolvedModel ?? undefined);
+      if (!spawnRes.ok) {
+        if (spawnRes.error === 'needs-credentials') {
+          try {
+            liveWebContents()?.send('agent:needsCredentials', {
+              agentId: opts.hive.id,
+              providerId,
+              model: resolvedModel ?? null
+            });
+          } catch { /* window tore down — the operator still sees the failed spawn */ }
+          // Drop the PTY→agent record we never created and report the gap.
+          ptyToAgent.delete(opts.id);
+          return { ok: false, error: `needs credentials for provider "${providerId}"` };
+        }
+        return { ok: false, error: spawnRes.error };
+      }
+      // Native desk launched on its provider; the Claude PTY path is bypassed.
+      // (No PTY ⇒ no keep-awake change here; native exit teardown runs syncKeepAwake.)
+      return { ok: true, native: true };
     }
     // Coarse runaway cap.
     if (typeof cfg.maxTurns === 'number' && cfg.maxTurns > 0 && !args.includes('--max-turns')) {
@@ -742,6 +1800,48 @@ ipcMain.handle('pty:kill', (_evt, id: string) => {
 });
 ipcMain.handle('pty:list', () => ptyManager.list());
 
+// ─── IPC: worktrees (review + bulk cleanup) ─────────────────────────────────-
+// Isolated agents' worktrees are KEPT on exit (so committed work survives for the god
+// to integrate); this surface lets the operator review + delete stale ones. Origins are
+// the registered repos plus any live worktree origins this session; each repo's worktrees
+// are enumerated from git itself (the source of truth, survives restarts).
+ipcMain.handle('git:listWorktrees', async (): Promise<Array<GitWorktree & { repo: string }>> => {
+  const origins = new Set<string>([...(readConfig().registeredRepos ?? []), ...worktreeOrigins.values()]);
+  const out: Array<GitWorktree & { repo: string }> = [];
+  for (const repo of origins) {
+    const res = await listWorktrees(repo);
+    if (Array.isArray(res)) for (const w of res) { if (!w.isMain) out.push({ ...w, repo }); }
+  }
+  return out;
+});
+ipcMain.handle('git:removeWorktree', async (_evt, repo: unknown, wtPath: unknown) => {
+  if (typeof repo !== 'string' || typeof wtPath !== 'string') return { ok: false, error: 'invalid args' };
+  return removeWorktree(repo, wtPath);
+});
+// How many commits a worktree's branch is ahead of its repo base — for the unmerged-delete
+// warning in Settings → Worktrees (deleting a kept worktree shouldn't silently lose work).
+ipcMain.handle('git:branchAhead', async (_evt, repo: unknown, branch: unknown) => {
+  if (typeof repo !== 'string' || typeof branch !== 'string') return 0;
+  return branchCommitsAhead(repo, branch);
+});
+// Per-worktree/agent health for the Settings → Worktrees diagnostics table (read-only): branch,
+// dirty/unmerged counts, and problem flags per worktree, for every registered repo + live origin.
+ipcMain.handle('git:worktreeHealth', async () => {
+  const repos = new Set<string>([...(readConfig().registeredRepos ?? []), ...worktreeOrigins.values()]);
+  const out = [];
+  for (const repo of repos) {
+    try { out.push(await worktreeHealth(repo)); } catch { /* skip an unreadable repo */ }
+  }
+  return out;
+});
+// Recovery: put the base tree back on its trunk (stashes any uncommitted state first). When the
+// freed branch belongs to an author desk, it re-isolates onto it on next spawn; an integrator/
+// reviewer just runs in the base on the trunk.
+ipcMain.handle('git:resetBaseToTrunk', async (_evt, repo: unknown) => {
+  if (typeof repo !== 'string') return { ok: false, stashed: false, error: 'invalid args' };
+  return resetBaseToTrunk(repo);
+});
+
 // ─── IPC: clipboard ─────────────────────────────────────────────────────────
 ipcMain.handle('app:copyToClipboard', (_evt, text: unknown) => {
   if (typeof text !== 'string') return { ok: false, error: 'invalid text' };
@@ -768,24 +1868,105 @@ ipcMain.handle('dialog:chooseFolder', async (evt) => {
   return { ok: true as const, path: res.filePaths[0] };
 });
 
-// ─── IPC: Terminal.app at a folder ──────────────────────────────────────────
-ipcMain.handle('terminal:openAtFolder', async (_evt, cwd: unknown) => {
-  if (typeof cwd !== 'string' || cwd.length === 0) return { ok: false, error: 'invalid cwd' };
-  return new Promise<{ ok: boolean; error?: string }>((resolve) => {
-    const p = spawn('open', ['-a', 'Terminal', cwd]);
-    let err = '';
-    p.stderr.on('data', (d) => { err += d.toString(); });
-    p.on('error', (e) => resolve({ ok: false, error: e.message }));
-    p.on('close', (code) => {
-      if (code === 0) resolve({ ok: true });
-      else resolve({ ok: false, error: err.trim() || `open exited ${code}` });
-    });
+// ─── IPC: open a desk's working directory (folder / editor / terminal) ───────
+// Cross-platform actions on an agent's cwd. `folder:reveal` + `folder:openInEditor` use a
+// detached child + resolve immediately (the launcher exits even though the app stays open).
+
+/** Launch a detached process; resolve ok unless the spawn itself errors (ENOENT). */
+function launch(cmd: string, args: string[], opts: { cwd?: string; shell?: boolean } = {}): Promise<{ ok: boolean; error?: string }> {
+  return new Promise((resolve) => {
+    try {
+      const p = spawn(cmd, args, { detached: true, stdio: 'ignore', windowsHide: false, ...opts });
+      p.on('error', (e) => resolve({ ok: false, error: e.message }));
+      p.unref();
+      // No 'close' wait — a launcher (open/explorer/wt) exits fast; treat a clean spawn as ok.
+      setTimeout(() => resolve({ ok: true }), 150);
+    } catch (e) {
+      resolve({ ok: false, error: e instanceof Error ? e.message : String(e) });
+    }
   });
+}
+
+ipcMain.handle('folder:reveal', async (_evt, cwd: unknown) => {
+  if (typeof cwd !== 'string' || !cwd) return { ok: false, error: 'invalid cwd' };
+  const err = await shell.openPath(cwd); // '' on success
+  return err ? { ok: false, error: err } : { ok: true };
+});
+
+ipcMain.handle('folder:openInEditor', async (_evt, cwd: unknown) => {
+  if (typeof cwd !== 'string' || !cwd) return { ok: false, error: 'invalid cwd' };
+  // VS Code's `code` launcher (a .cmd shim on Windows → needs shell:true). Fall back to
+  // revealing the folder if `code` isn't on PATH.
+  const res = await launch('code', [cwd], { shell: process.platform === 'win32' });
+  if (res.ok) return res;
+  const err = await shell.openPath(cwd);
+  return err ? { ok: false, error: `no 'code' on PATH; ${err}` } : { ok: true };
+});
+
+ipcMain.handle('terminal:openAtFolder', async (_evt, cwd: unknown) => {
+  if (typeof cwd !== 'string' || !cwd) return { ok: false, error: 'invalid cwd' };
+  if (process.platform === 'darwin') return launch('open', ['-a', 'Terminal', cwd]);
+  if (process.platform === 'win32') {
+    // Prefer Windows Terminal (`wt -d <cwd>`); fall back to a cmd window at the folder.
+    const wt = await launch('wt', ['-d', cwd], { shell: true });
+    return wt.ok ? wt : launch('cmd', ['/c', 'start', 'cmd', '/k', `cd /d "${cwd}"`], { shell: true });
+  }
+  const xterm = await launch('x-terminal-emulator', ['--working-directory', cwd]);
+  return xterm.ok ? xterm : launch('xdg-open', [cwd]);
 });
 
 // ─── IPC: config ────────────────────────────────────────────────────────────
-ipcMain.handle('config:get', (): HarnessConfig => readConfig());
-ipcMain.handle('config:update', (_evt, patch: Partial<HarnessConfig>) => writeConfig(patch));
+// E004 — config:get is REDACTED: the renderer never receives provider key values,
+// only presence (providerKeyPresence). Keys live in config.json + a worker's
+// spawn env, never anywhere the renderer can read.
+ipcMain.handle('config:get', (): SafeConfig => redactConfig(readConfig()));
+ipcMain.handle('config:update', (_evt, patch: Partial<HarnessConfig>) => {
+  writeConfig(patch);
+  // Turning SDDP mode on (or adding repos while it's on) → auto-seed feature epics from each
+  // bootstrapped repo's project plan, so a hands-off run starts without the operator creating cards.
+  if (patch.sddpMode === true || (patch.registeredRepos && readConfig().sddpMode === true)) seedAllFeaturesFromPlan();
+});
+
+// E004 — provider credentials. Set/clear validate against the E002 registry; the
+// renderer only ever learns presence, never values.
+ipcMain.handle('credentials:set', (_evt, providerId: unknown, key: unknown) => {
+  if (typeof providerId !== 'string' || typeof key !== 'string' || !key) return { ok: false, error: 'invalid' };
+  try {
+    // The web-search API key is a reserved non-provider credential (redacted like any
+    // key); allow it alongside the registry provider ids.
+    const known = [...listProviders().map((p) => p.id), WEB_SEARCH_KEY_ID];
+    writeConfig({ providerKeys: setKeyInConfig(readConfig(), providerId, key, known).providerKeys });
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+});
+ipcMain.handle('credentials:clear', (_evt, providerId: unknown) => {
+  if (typeof providerId !== 'string') return { ok: false, error: 'invalid' };
+  writeConfig({ providerKeys: clearKeyInConfig(readConfig(), providerId).providerKeys });
+  return { ok: true };
+});
+ipcMain.handle('credentials:presence', () => keyPresence(readConfig(), [...listProviders().map((p) => p.id), WEB_SEARCH_KEY_ID]));
+
+// Secret vault — named secrets referenced from env tables via ${secret:NAME}. Encrypted at rest
+// (safeStorage); the renderer only ever learns the NAMES, never the values (mirrors credentials).
+ipcMain.handle('secrets:list', () => secretNames(readConfig()));
+ipcMain.handle('secrets:set', (_evt, name: unknown, value: unknown) => {
+  if (typeof name !== 'string' || !name.trim() || name.includes('}') || typeof value !== 'string' || !value) {
+    return { ok: false, error: 'invalid name or value' };
+  }
+  try {
+    writeConfig({ secrets: setSecretInConfig(readConfig(), name.trim(), value).secrets });
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+});
+ipcMain.handle('secrets:clear', (_evt, name: unknown) => {
+  if (typeof name !== 'string') return { ok: false, error: 'invalid' };
+  writeConfig({ secrets: clearSecretInConfig(readConfig(), name).secrets });
+  return { ok: true };
+});
 ipcMain.handle('config:ensureHome', (_evt, path: unknown) => {
   if (typeof path !== 'string' || path.length === 0) return { ok: false, error: 'invalid path' };
   return ensureHarnessHome(path);
@@ -903,6 +2084,16 @@ ipcMain.handle('git:aheadBehind', (_evt, cwd: unknown) => {
 ipcMain.handle('hive:registry', () => hive.registry());
 ipcMain.handle('hive:board', () => hive.board());
 ipcMain.handle('hive:tasks', () => hive.tasks());
+// SDDP: a feature's on-disk phase (markers under <repo>/specs/<feature>/), for the kanban
+// feature-phase banner. Read-only; null when no repo/feature dir. `feature` is sanitized to a
+// single path segment inside scanFeatureStatus.
+ipcMain.handle('hive:featureStatus', (_evt, repo: unknown, feature: unknown) => {
+  if (typeof feature !== 'string' || !feature.trim()) return null;
+  return scanFeatureStatus(typeof repo === 'string' ? repo : null, feature);
+});
+// SDDP host engine's per-feature live status (the active step + running/waiting/paused/blocked) for
+// the milestone-pill monitor. Read-only; in-memory (not persisted).
+ipcMain.handle('pipeline:status', () => sddpPipeline.statusAll());
 ipcMain.handle('hive:log', (_evt, n: unknown) => hive.logTail(typeof n === 'number' ? n : 200));
 ipcMain.handle('hive:memory', (_evt, id: unknown) => (typeof id === 'string' ? hive.memory(id) : ''));
 ipcMain.handle('hive:inbox', (_evt, id: unknown) => (typeof id === 'string' ? hive.inbox(id) : []));
@@ -921,6 +2112,15 @@ ipcMain.handle('hive:setArchived', (_evt, id: unknown, archived: unknown) => {
   if (typeof id !== 'string') return { ok: false, error: 'invalid id' };
   if (!hive.enabled()) return { ok: false, error: 'hive disabled (no harnessHome)' };
   hive.setArchived(id, archived === true);
+  return { ok: true };
+});
+ipcMain.handle('hive:setRoles', (_evt, id: unknown, roles: unknown) => {
+  if (typeof id !== 'string') return { ok: false, error: 'invalid id' };
+  if (!hive.enabled()) return { ok: false, error: 'hive disabled (no harnessHome)' };
+  const valid = Array.isArray(roles)
+    ? roles.filter((r): r is AgentRole => r === 'worker' || r === 'reviewer' || r === 'integrator' || r === 'planner' || r === 'qc')
+    : [];
+  hive.setRoles(id, valid);
   return { ok: true };
 });
 
@@ -991,6 +2191,7 @@ ipcMain.handle('app:confirmClose', () => {
   try { reflector.stop(); } catch (e) { console.error('[quit] reflector.stop:', e); }
   try { persist.close(); } catch (e) { console.error('[quit] persist.close:', e); }
   try { ptyManager.killAll(); } catch (e) { console.error('[quit] killAll:', e); }
+  try { nativeRuntime.killAll(); } catch (e) { console.error('[quit] nativeRuntime killAll:', e); }
   app.quit();
 });
 ipcMain.handle('app:cancelClose', () => {
@@ -1051,6 +2252,63 @@ ipcMain.handle('telemetry:spans', (_evt, agentId: unknown) =>
   typeof agentId === 'string' ? telemetry.getSpans(agentId) : []);
 ipcMain.handle('telemetry:snapshot', () => telemetry.snapshot());
 
+// ─── IPC: native run-log replay (E008 T005 {FR-016/039/042}) ──────────────────
+// Backfill the persisted native AgentEvent stream when a panel (re)opens or the app
+// restarts. A READ-ONLY pass over the append-only log (main is the sole writer):
+// the renderer folds the returned events into the SAME views it builds from the
+// live `agent:event` stream, so reopen reconstructs the run deterministically.
+// Missing/partial/corrupt/truncated each degrade to a best-effort array, never an
+// error (graceful degradation, FR-016/042).
+ipcMain.handle('agent:loadEvents', (_evt, agentId: unknown) => {
+  if (typeof agentId !== 'string' || !agentId) return [];
+  return loadNativeEvents(hive.enabled() ? hive.nativeEventsPath(agentId) : null);
+});
+
+// ─── IPC: operator input/steer to a native agent (E008 T022 {FR-015/021}) ─────
+// The renderer-reachable native send seam — the native-desk peer of `pty:write`
+// for a Claude desk. Routes an operator turn into the running native worker via
+// the ProviderRuntime port (`runtimeFor(agentId).send(AgentInput)`, AD-004).
+//
+// Prompt-vs-steer routing (FR-021): a PLAIN PROMPT is delivered as
+// `{ kind:'operator' }` (a typed turn); a STEER is delivered as `{ kind:'steer' }`
+// — mid-run guidance — AND mirrored into the ControlRegistry so a native desk's
+// control snapshot reflects the steer the same way the Claude `control:steer`
+// seam does (operator-control parity). The two kinds reach the worker through
+// distinct `AgentInput.kind`s so each is handled unambiguously.
+//
+// Fail-soft ack (FR-022): returns `{ ok:false, error }` when there is no native
+// runtime for the agent (worker missing/not started) so the renderer can surface
+// distinct not-delivered feedback rather than appearing to send silently. The
+// Claude `pty:write` path is untouched — this is an additive native branch.
+ipcMain.handle('native:send', (_evt, agentId: unknown, input: unknown): { ok: boolean; error?: string } => {
+  if (typeof agentId !== 'string' || !agentId) return { ok: false, error: 'invalid agentId' };
+  const raw = (input ?? {}) as { kind?: unknown; text?: unknown };
+  const text = typeof raw.text === 'string' ? raw.text : '';
+  if (!text.trim()) return { ok: false, error: 'empty input' };
+  // Only operator/steer reach this seam from the panel; drain is hive-internal.
+  const kind: AgentInput['kind'] = raw.kind === 'steer' ? 'steer' : 'operator';
+
+  const runtime = nativeRuntime.runtimeFor(agentId);
+  if (!runtime) return { ok: false, error: 'no native runtime for agent' };
+
+  // A steer is mirrored into the operator-control registry (parity with the
+  // Claude `control:steer` surface) and ALSO delivered to the worker as the
+  // native steer seam — native agents have no hook boundary, so the worker
+  // `send({kind:'steer'})` is where the guidance actually lands.
+  if (kind === 'steer') control.steer(agentId, text);
+  runtime.send({ kind, text });
+  return { ok: true };
+});
+
+// ─── IPC: stop ONE native worker (operator kill, peer to `pty:kill`) ──────────
+// The renderer routes a stop by runtime kind: a native desk (incl. the god) → here;
+// a Claude desk → `pty:kill`. Killing fires the worker's exit teardown (archive), so a
+// stopped native worker is gone until respawned (revive-on-demand, or the god's Start).
+ipcMain.handle('native:kill', (_evt, agentId: unknown): { ok: boolean; error?: string } => {
+  if (typeof agentId !== 'string' || !agentId) return { ok: false, error: 'invalid agentId' };
+  return nativeRuntime.kill(agentId);
+});
+
 // ─── IPC: circuit-breaker state (Lane A #6 policy → this lane's avatars/meter) ─
 // Lane A's breaker calls this with a BreakerState; we fan it out to the renderer
 // on `control:breakerState`, where the avatar adapter gives it precedence over
@@ -1109,6 +2367,16 @@ ipcMain.handle('missions:save', (_evt, missions) => {
   });
   writeConfig({ missions: merged });
   syncMissions();
+  return { ok: true };
+});
+// Fire a mission immediately (the SCHEDULES "fire now" button), independent of its
+// interval — dispatches its body to the target(s) right now. lastFiredAt updates, so the
+// next interval fire shifts accordingly. (Heartbeat fires on its own adaptive beat, but a
+// manual fire still drops its prompt into god's inbox, which is a useful nudge.)
+ipcMain.handle('missions:fireNow', (_evt, id: unknown) => {
+  const m = (readConfig().missions ?? []).find((x) => x.id === id);
+  if (!m) return { ok: false, error: 'no such mission' };
+  fireMission(m);
   return { ok: true };
 });
 
@@ -1182,6 +2450,20 @@ ipcMain.handle('slack:setConfig', (_evt, patch: unknown) => {
   return { ok: true };
 });
 
+// E005 {FR-013 / DR-10} — the GOD assignment seam over IPC. GOD assigns a
+// provider+model to an agent through the SAME mechanism as the operator: this
+// records the derived provider and forwards the model to the renderer, which
+// applies it via the existing agent-update path (reassignAgentModel). Provider is
+// derived, never stored (DR-1); no secret channel. Args are validated at the
+// boundary (defensive coding) before delegating to assignAgentModel.
+ipcMain.handle('agent:assign', (_evt, agentId: unknown, modelId: unknown) => {
+  if (typeof agentId !== 'string') return { ok: false, providerId: null, error: 'invalid agentId' };
+  if (modelId != null && typeof modelId !== 'string') {
+    return { ok: false, providerId: null, error: 'invalid modelId' };
+  }
+  return assignAgentModel(agentId, typeof modelId === 'string' ? modelId : undefined);
+});
+
 /** Start every hive-bound background service against the current harnessHome.
  *  Called on boot, and again to recover in place if a folder-change copy fails
  *  (config:changeHome tears these down before copying). No-op without a home. */
@@ -1220,6 +2502,9 @@ app.whenReady().then(() => {
   try { persist.open(); } catch (e) { console.error('[db] open failed:', e); }
   // Bootstrap the hive (if harnessHome is configured) and start the message router.
   bootstrapHiveServices();
+  // If SDDP mode is already on at boot, auto-seed feature epics from each bootstrapped repo's project
+  // plan (idempotent) — so a cold, already-bootstrapped repo's backlog is picked up without any action.
+  try { seedAllFeaturesFromPlan(); } catch (e) { console.error('[sddp-pipeline] startup seed failed:', e); }
   createWindow();
   // Auto-start the Slack webhook server when configured. Best-effort: a tunnel
   // failure (offline) is logged, not fatal. The tunnel URL is ephemeral and

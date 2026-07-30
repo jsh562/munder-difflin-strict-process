@@ -58,7 +58,7 @@ export const space = {
 export const type = {
   display: '"Press Start 2P", monospace',
   ui: '"Pixelify Sans", system-ui, sans-serif',
-  mono: '"VT323", "JetBrains Mono", monospace'
+  mono: '"Departure Mono", "Cascadia Mono", Consolas, monospace'
 } as const;
 
 export const tileSize = 32; // px — the world is built from 32×32 tiles

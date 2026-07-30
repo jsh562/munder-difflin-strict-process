@@ -18,8 +18,10 @@
     "paths": {
       "@/*": ["src/renderer/src/*"],
       "@brand/*": ["docs/*"],
-      "@shared/*": ["src/shared/*"]
+      "@shared/*": ["src/shared/*"],
+      "@jsh562/won-agent-core": ["packages/won-agent-core/src/index.ts"]
     }
   },
-  "include": ["src/renderer/**/*", "src/preload/index.d.ts", "src/shared/**/*"]
+  "include": ["src/renderer/**/*", "src/preload/index.d.ts", "src/shared/**/*"],
+  "exclude": ["src/**/__tests__/**", "src/**/*.test.ts"]
 }

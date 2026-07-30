@@ -2,6 +2,8 @@ import { create } from 'zustand';
 import type { AccentColorName } from '@/design/tokens';
 import type { OfficeCharacterName } from '@/scene/office/cast';
 import type { StatusKind } from '@/components/PixelBadge';
+import { isNativeRuntimeDesk } from '@/lib/runtimeKind';
+import { restartSigOf, type RestartSig } from '@/lib/restartSig';
 
 export type ToolKind =
   | 'Read' | 'Edit' | 'Write' | 'Bash' | 'WebFetch' | 'WebSearch'
@@ -9,6 +11,13 @@ export type ToolKind =
 
 export type StationKind =
   | 'shelf' | 'terminal' | 'web' | 'board' | 'mailbox' | 'mcp' | 'desk';
+
+/** E005 — the persisted half of an AgentAssignment's provenance. `'explicit'` =
+ *  the operator/GOD picked the model directly; `'fleet-default'` = inherited from
+ *  the house default at creation. Absent ⇒ the role-based fallback (never persisted
+ *  as `'role-based'`, DR-8/DR-9). The provider is DERIVED from `model`, never stored
+ *  (DR-1). Mirrors `StoredAssignmentSource` in `src/shared/assignment.ts`. */
+export type AssignmentSource = 'explicit' | 'fleet-default';
 
 export interface BlockReason {
   summary: string;                 // short headline shown on banner
@@ -21,6 +30,11 @@ export interface BlockReason {
     send?: string;
   }>;
 }
+
+/** Capability roles (mirror of the won-agent-core `AgentRole`; declared locally so the store
+ *  doesn't reach into the package). worker = writes code; reviewer = reads + COMMENTS only
+ *  (read-only); integrator = merges (hive_integrate) + signs tasks off. */
+export type AgentRole = 'worker' | 'reviewer' | 'integrator' | 'planner' | 'qc';
 
 export interface Agent {
   id: string;
@@ -53,9 +67,21 @@ export interface Agent {
   /** the model this agent runs on (e.g. 'claude-sonnet-4-6[1m]'); drives the
    *  model selector + the --model arg used when (re)spawning the agent */
   model?: string;
+  /** E005 — provenance of this agent's `model` (DR-9): `'explicit'` when the
+   *  operator/GOD picked it, `'fleet-default'` when inherited from the house
+   *  default at creation. Absent ⇒ role-based fallback. Additive + independently
+   *  keyed (never touches E004's `providerKeys`, HINT-004); the provider is
+   *  derived from `model`, not stored here (DR-1). Survives the localStorage
+   *  round-trip via the `PersistedAgent` mapping below. */
+  assignmentSource?: AssignmentSource;
   /** the last prompt the user submitted to this agent in Claude Code —
    *  shown on the floor as a card above the seated avatar */
   lastPrompt?: string;
+  /** Capability roles layered on the agent (separate from the god/assistant identity):
+   *  `worker` = writes code; `reviewer` = reads + comments only (read-only); `integrator`
+   *  = merges (hive_integrate) + signs tasks off. The god holds `integrator` + `reviewer`
+   *  by default; both are reassignable. Persisted; the registry is the source of truth. */
+  roles?: AgentRole[];
   /** the orchestrator ("god") agent — seated in Michael's room, runs the floor */
   isGod?: boolean;
   /** Michael's prep assistant ("Dwight") — enriches prompts and forwards them to
@@ -73,6 +99,11 @@ export interface Agent {
    *  (in the store's `archivedAgents` list + the hive registry) but flagged and
    *  kept off the floor; only live-PTY agents are 'active'. */
   archived?: boolean;
+  /** Snapshot of the restart-required settings ([[restartSig]]) this desk was SPAWNED under,
+   *  stamped in `addAgent` (and re-stamped on restart). Compared to the live config to flag a
+   *  desk running with outdated settings (e.g. SDDP toggled after it spawned). Absent ⇒ spawned
+   *  before this feature; treated as fresh (never flagged) until its next restart. */
+  spawnSig?: RestartSig;
 }
 
 export interface FeedEntry {
@@ -92,13 +123,18 @@ export interface QueuedMessage {
   ts: number;
 }
 
-export type SidebarTab = 'terminal' | 'files' | 'messages' | 'traces';
+export type SidebarTab = 'terminal' | 'structured' | 'files' | 'messages' | 'traces';
 
 /** Lifecycle of the god agent ("Michael") bootstrap on launch.
  *  'booting' until his PTY is confirmed live, then 'ready' (or 'failed' if the
  *  spawn errored). The empty-floor UI shows a loader while 'booting' so users
  *  don't see the "add agent" prompt before Michael has clocked in. */
-export type GodStatus = 'booting' | 'ready' | 'failed';
+export type GodStatus = 'booting' | 'ready' | 'failed' | 'stopped';
+
+/** Operator intent for the god worker: 'running' = auto-spawn + keep alive (default);
+ *  'stopped' = killed by the operator and kept down until Start. Persisted so a Stop
+ *  survives a reload (otherwise effect #1 would respawn Michael on the next mount). */
+export type GodDesired = 'running' | 'stopped';
 
 interface State {
   agents: Agent[];
@@ -115,11 +151,28 @@ interface State {
   selectedId: string | null;
   feeds: Record<string, string[]>;
   addAgentOpen: boolean;
+  /** When the Add-Agent dialog is opened from a specific project repo row, the workspace to
+   *  preselect (cleared on close). Lets the matrix "add agent here" staff a repo in one click. */
+  addAgentInitialCwd?: string;
   fullscreenAgentId: string | null;
   fullscreenFilePath: string | null;
+  /** When true, the big task board is open over the office (center area). */
+  tasksBoardOpen: boolean;
   sidebarWidth: number;
   sidebarTab: SidebarTab;
   godStatus: GodStatus;
+  /** The house fleet-default model id (config.defaultModel), mirrored here so the
+   *  runtime-kind check (native vs Claude) can apply the SAME fallback the main spawn
+   *  router does (agent.model ?? fleet default) for model-less desks like the god. */
+  fleetDefaultModel: string | null;
+  /** Per-floor spec-driven (SDDP) mode, mirrored from config so role chips, the Add-Agent
+   *  modal, and the kanban can scope planner/qc + the feature-phase banner to it. */
+  sddpMode: boolean;
+  /** The other restart-required config values ([[restartSig]]), mirrored from config so the
+   *  renderer can detect a desk running with outdated settings (these only apply on respawn).
+   *  `sddpMode` above is the third. */
+  autoMode: boolean;
+  terminalTheme: 'light' | 'dark';
   /** Per-agent outgoing message queue (agent id → messages awaiting delivery).
    *  Lets the user keep "talking" to a busy agent: messages park here and are
    *  drained to the terminal one-by-one once the agent is free. */
@@ -134,8 +187,42 @@ interface State {
   toolCounts: Record<string, number>;
   bumpToolCount: (id: string) => void;
   setGodStatus: (status: GodStatus) => void;
+  /** Operator intent for the god (persisted): a Stop sets 'stopped' so useHive's boot
+   *  effect leaves Michael down across reloads until Start sets 'running'. */
+  godDesired: GodDesired;
+  setGodDesired: (d: GodDesired) => void;
+  /** Per-agent operator PAUSE flag (renderer mirror of main's control.pause). When on,
+   *  the agent's tool calls are denied in main AND the renderer's inbox-wake (#3) and
+   *  queue-drain (#4) leave it alone, so a paused agent truly idles. */
+  paused: Record<string, boolean>;
+  setPaused: (id: string, on: boolean) => void;
+  /** Per-agent LIVENESS (id → has a live worker right now), mirrored from main's `fleet:state`
+   *  push. Drives the warm●/cold○ dot: warm = live worker; a desk on the floor with no entry or
+   *  `false` is cold (parked, revives on delegation). Distinct from `status` (what it's DOING). */
+  liveness: Record<string, boolean>;
+  setLiveness: (map: Record<string, boolean>) => void;
   select: (id: string) => void;
   updateAgent: (id: string, patch: Partial<Agent>) => void;
+  /** E005 {FR-003} — re-assign an existing desk to an explicit model (DR-1 state
+   *  machine: explicit/fleet-default → explicit). Overwrites `model` and sets
+   *  `assignmentSource='explicit'`, then PERSISTS the roster so the new binding
+   *  survives the localStorage round-trip (SC-006). The provider is DERIVED from
+   *  `model`, never stored here (DR-1). A stale model id is preserved verbatim —
+   *  this helper never resolves or remaps it (DR-5). No-op for an unknown id. */
+  reassignAgentModel: (id: string, modelId: string | undefined) => void;
+  /** E005 {FR-004} — revert a desk to inheriting the fleet default (DR-1 state
+   *  machine: explicit → fleet-default). Re-resolves the CURRENT fleet default onto
+   *  `model` and sets `assignmentSource='fleet-default'` (re-inherit, DR-4), then
+   *  PERSISTS. Pass the current default id (read from `cth.fleetDefault.get()` /
+   *  config `defaultModel`); `undefined` clears the desk back to the role-based
+   *  fallback (no `model`, no `assignmentSource`). No-op for an unknown id. */
+  revertAgentToFleetDefault: (id: string, fleetDefaultModelId: string | undefined) => void;
+  /** Set an agent's capability roles (worker / integrator) and PERSIST. Pair with the
+   *  `hiveSetRoles` IPC so the registry (the gate's source of truth) matches. */
+  setAgentRoles: (id: string, roles: AgentRole[]) => void;
+  /** Set an agent's working directory and PERSIST (mirrors the registry cwd a respawn
+   *  rewrites). Used by the "change workspace" control. */
+  setAgentCwd: (id: string, cwd: string) => void;
   pushFeed: (id: string, line: string) => void;
   addAgent: (agent: Agent) => void;
   removeAgent: (id: string) => void;
@@ -158,10 +245,20 @@ interface State {
   /** Clear an agent's entire pending queue. */
   clearQueue: (agentId: string) => void;
   setAddAgentOpen: (open: boolean) => void;
+  /** Open the Add-Agent dialog preselected to a project repo (the matrix "add agent here"). */
+  openAddAgentForRepo: (cwd: string) => void;
   setFullscreen: (id: string | null) => void;
   setFullscreenFile: (path: string | null) => void;
+  setTasksBoardOpen: (on: boolean) => void;
   setSidebarWidth: (px: number) => void;
   setSidebarTab: (tab: SidebarTab) => void;
+  setFleetDefaultModel: (m: string | null) => void;
+  setSddpMode: (on: boolean) => void;
+  setAutoMode: (on: boolean) => void;
+  setTerminalTheme: (theme: 'light' | 'dark') => void;
+  /** Re-stamp a desk's `spawnSig` from the current live mirror after a successful respawn
+   *  (restartDesk doesn't touch the store record), so a just-restarted desk reads as fresh. */
+  markAgentRespawned: (id: string) => void;
   /** Drop persisted agents whose PTY is no longer alive in the main process.
    *  Called once at startup so a renderer reload (e.g. after the laptop sleeps)
    *  restores still-running agents and only removes truly-dead ones. */
@@ -176,6 +273,7 @@ const LS_RESTORABLE = 'cth.restorableAgents';
 const LS_SELECTED = 'cth.selectedId';
 const LS_QUEUES = 'cth.messageQueues';
 const LS_ENRICH = 'cth.enrichEnabled';
+const LS_GOD_DESIRED = 'cth.godDesired';
 
 // Fields that are large or transient — not worth persisting across reloads.
 // contextTokens/contextLimit describe a LIVE session; persisting them showed a
@@ -319,7 +417,7 @@ const initialSidebarWidth = (() => {
 const initialSidebarTab: SidebarTab = (() => {
   try {
     const v = window.localStorage.getItem(LS_SIDEBAR_TAB);
-    if (v === 'files' || v === 'terminal' || v === 'messages' || v === 'traces') return v;
+    if (v === 'files' || v === 'terminal' || v === 'structured' || v === 'messages' || v === 'traces') return v;
   } catch { /* noop */ }
   return 'terminal';
 })();
@@ -331,6 +429,9 @@ const initialSelectedId = loadPersistedSelectedId(initialAgents);
 const initialQueues = loadPersistedQueues();
 const initialEnrichEnabled: boolean = (() => {
   try { return window.localStorage.getItem(LS_ENRICH) === '1'; } catch { return false; }
+})();
+const initialGodDesired: GodDesired = (() => {
+  try { return window.localStorage.getItem(LS_GOD_DESIRED) === 'stopped' ? 'stopped' : 'running'; } catch { return 'running'; }
 })();
 
 let queuedSeq = 0;
@@ -350,9 +451,14 @@ export const useStore = create<State>((set) => ({
   addAgentOpen: false,
   fullscreenAgentId: null,
   fullscreenFilePath: null,
+  tasksBoardOpen: false,
   sidebarWidth: initialSidebarWidth,
   sidebarTab: initialSidebarTab,
   godStatus: 'booting',
+  fleetDefaultModel: null,
+  sddpMode: false,
+  autoMode: true,
+  terminalTheme: 'light',
   messageQueues: initialQueues,
   enrichEnabled: initialEnrichEnabled,
   setEnrichEnabled: (on) => {
@@ -363,14 +469,84 @@ export const useStore = create<State>((set) => ({
   bumpToolCount: (id) =>
     set((s) => ({ toolCounts: { ...s.toolCounts, [id]: (s.toolCounts[id] ?? 0) + 1 } })),
   setGodStatus: (status) => set({ godStatus: status }),
+  godDesired: initialGodDesired,
+  setGodDesired: (d) => {
+    try { window.localStorage.setItem(LS_GOD_DESIRED, d); } catch { /* noop */ }
+    set({ godDesired: d });
+  },
+  paused: {},
+  setPaused: (id, on) => set((s) => ({ paused: { ...s.paused, [id]: on } })),
+  liveness: {},
+  setLiveness: (map) => set({ liveness: map }),
   select: (id) => set((s) => { persistAgents(s.agents, id); return { selectedId: id }; }),
+  // E005 INVARIANT (DR-4/DR-9/SC-004) — an agent's `model`/`assignmentSource` are a
+  // creation-time SNAPSHOT of the fleet default (or an explicit pick), frozen onto
+  // the record. The store NEVER re-derives an existing agent's model from the
+  // current fleet default: `addAgent` appends the already-resolved record (the
+  // drawer snapshots via resolveEffectiveModel, T017), and `updateAgent` applies
+  // only the explicit patch it is given. Therefore changing `config.defaultModel`
+  // later mutates NO existing agent — the change is non-retroactive (FR-006).
   updateAgent: (id, patch) =>
     set((s) => ({ agents: s.agents.map(a => a.id === id ? { ...a, ...patch } : a) })),
+  // E005 {FR-003} — re-assign per desk. Unlike `updateAgent` (used for transient
+  // run-state that needn't survive a reload), an assignment is a DURABLE choice, so
+  // we PERSIST the roster after applying it (SC-006 round-trip). The model id is
+  // stored verbatim — a stale id is preserved, never resolved/remapped (DR-5); the
+  // provider is derived from `model` downstream, never stored (DR-1).
+  reassignAgentModel: (id, modelId) =>
+    set((s) => {
+      if (!s.agents.some((a) => a.id === id)) return s;
+      const agents = s.agents.map((a) =>
+        a.id === id ? { ...a, model: modelId, assignmentSource: 'explicit' as const } : a
+      );
+      persistAgents(agents, s.selectedId);
+      return { agents };
+    }),
+  // E005 {FR-004} — revert to fleet default. Re-inherit the CURRENT default by
+  // snapshotting the passed-in id onto the record and marking the source
+  // 'fleet-default' (DR-4); an absent default clears the desk to the role-based
+  // fallback (no model / no source). PERSISTED like a re-assignment.
+  revertAgentToFleetDefault: (id, fleetDefaultModelId) =>
+    set((s) => {
+      if (!s.agents.some((a) => a.id === id)) return s;
+      const trimmed = (fleetDefaultModelId ?? '').trim();
+      const hasDefault = trimmed.length > 0;
+      const agents = s.agents.map((a) =>
+        a.id === id
+          ? hasDefault
+            ? { ...a, model: trimmed, assignmentSource: 'fleet-default' as const }
+            : { ...a, model: undefined, assignmentSource: undefined }
+          : a
+      );
+      persistAgents(agents, s.selectedId);
+      return { agents };
+    }),
+  setAgentRoles: (id, roles) =>
+    set((s) => {
+      if (!s.agents.some((a) => a.id === id)) return s;
+      const agents = s.agents.map((a) => (a.id === id ? { ...a, roles } : a));
+      persistAgents(agents, s.selectedId);
+      return { agents };
+    }),
+  setAgentCwd: (id, cwd) =>
+    set((s) => {
+      if (!s.agents.some((a) => a.id === id)) return s;
+      const agents = s.agents.map((a) => (a.id === id ? { ...a, cwd, project: cwd.split(/[\\/]/).filter(Boolean).pop() ?? a.project } : a));
+      persistAgents(agents, s.selectedId);
+      return { agents };
+    }),
   pushFeed: (id, line) =>
     set((s) => ({ feeds: { ...s.feeds, [id]: [...(s.feeds[id] ?? []), line] } })),
   addAgent: (agent) =>
     set((s) => {
-      const agents = [...s.agents, agent];
+      // Stamp the restart-required settings this desk is spawning under (the live mirror), so
+      // a later change to one of them flags this desk as needing a restart. A caller that already
+      // set spawnSig (e.g. a restore carrying its own) keeps it.
+      const stamped: Agent = {
+        ...agent,
+        spawnSig: agent.spawnSig ?? restartSigOf({ sddpMode: s.sddpMode, autoMode: s.autoMode, terminalTheme: s.terminalTheme })
+      };
+      const agents = [...s.agents, stamped];
       // Re-spawning an archived agent un-archives it: an id is active xor archived.
       const archivedAgents = s.archivedAgents.filter((a) => a.id !== agent.id);
       // A live (re)spawn also consumes any restorable entry for the same id.
@@ -465,14 +641,21 @@ export const useStore = create<State>((set) => ({
   reconcileWithLivePtys: (livePtyIds) =>
     set((s) => {
       const live = new Set(livePtyIds);
-      // Keep agents with no PTY (synthetic) or whose PTY is still alive.
-      const agents = s.agents.filter((a) => !a.ptyId || live.has(a.ptyId));
+      // A NATIVE desk (DeepSeek/Minimax) is routed to the native runtime and never
+      // owns a real PTY, so it must NOT be reconciled against the live-PTY list — it
+      // stays listed (alive or cold) and revives on demand when delegated to / messaged
+      // (the inbox-wake loop + composer respawn it). This also rescues records still
+      // persisted with a STALE fake ptyId from before the AddAgentModal fix.
+      const isNative = (a: Agent) => isNativeRuntimeDesk(a, s.fleetDefaultModel);
+      // Keep agents with no PTY (synthetic), a still-alive PTY, or any native desk.
+      const agents = s.agents.filter((a) => !a.ptyId || live.has(a.ptyId) || isNative(a));
       if (agents.length === s.agents.length) return s;
-      // Workers whose terminal died with the previous session become restorable
-      // (full spawn recipe retained) instead of silently vanishing. God and the
-      // assistant are excluded — they auto-respawn at boot.
+      // Claude workers whose terminal died with the previous session become restorable
+      // (full spawn recipe retained) instead of silently vanishing. God, the assistant,
+      // and native desks are excluded — god/assistant auto-respawn at boot, native desks
+      // are kept above and revive on demand.
       const dead = s.agents.filter(
-        (a) => a.ptyId && !live.has(a.ptyId) && !a.isGod && !a.isAssistant
+        (a) => a.ptyId && !live.has(a.ptyId) && !a.isGod && !a.isAssistant && !isNative(a)
       );
       const restorableAgents = [
         ...s.restorableAgents.filter((r) => !dead.some((d) => d.id === r.id)),
@@ -487,9 +670,11 @@ export const useStore = create<State>((set) => ({
       persistRestorable(restorableAgents);
       return { agents, feeds, selectedId, restorableAgents };
     }),
-  setAddAgentOpen: (open) => set({ addAgentOpen: open }),
+  setAddAgentOpen: (open) => set(open ? { addAgentOpen: true } : { addAgentOpen: false, addAgentInitialCwd: undefined }),
+  openAddAgentForRepo: (cwd) => set({ addAgentOpen: true, addAgentInitialCwd: cwd }),
   setFullscreen: (id) => set({ fullscreenAgentId: id }),
   setFullscreenFile: (path) => set({ fullscreenFilePath: path }),
+  setTasksBoardOpen: (on) => set({ tasksBoardOpen: on }),
   setSidebarWidth: (px) => {
     const clamped = Math.min(1200, Math.max(320, Math.round(px)));
     try { window.localStorage.setItem(LS_SIDEBAR_WIDTH, String(clamped)); } catch { /* noop */ }
@@ -498,7 +683,19 @@ export const useStore = create<State>((set) => ({
   setSidebarTab: (tab) => {
     try { window.localStorage.setItem(LS_SIDEBAR_TAB, tab); } catch { /* noop */ }
     set({ sidebarTab: tab });
-  }
+  },
+  setFleetDefaultModel: (m) => set({ fleetDefaultModel: (m ?? '').trim() || null }),
+  setSddpMode: (on) => set({ sddpMode: on }),
+  setAutoMode: (on) => set({ autoMode: on }),
+  setTerminalTheme: (theme) => set({ terminalTheme: theme }),
+  markAgentRespawned: (id) =>
+    set((s) => {
+      if (!s.agents.some((a) => a.id === id)) return s;
+      const sig = restartSigOf({ sddpMode: s.sddpMode, autoMode: s.autoMode, terminalTheme: s.terminalTheme });
+      const agents = s.agents.map((a) => (a.id === id ? { ...a, spawnSig: sig } : a));
+      persistAgents(agents, s.selectedId);
+      return { agents };
+    })
 }));
 
 export function selectedAgent(s: State): Agent | undefined {

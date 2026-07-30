@@ -1,11 +1,24 @@
 import { useEffect, useRef } from 'react';
 import { useStore, type Agent, type StationKind, type ToolKind } from '@/store/store';
 import { buildSpawnCommand, ASSISTANT_MODEL, type HarnessConfig } from '@/store/config';
+import { deriveProviderId } from '@shared/assignment';
+import { isNativeRuntimeDesk } from '@/lib/runtimeKind';
+import { respawnNativeWorker } from '@/lib/nativeRespawn';
+import { reconcileTurnStatus } from '@/lib/agentStatus';
 
 const GOD_ID = 'god';
 const GOD_PTY = `pty-${GOD_ID}`;
 const ASSISTANT_ID = 'assistant';
 const ASSISTANT_PTY = `pty-${ASSISTANT_ID}`;
+
+/** The native god's dedicated working directory: a `workspace` sibling of the hive
+ *  bookkeeping under the harness home, so its file writes never mix with the registry,
+ *  board, or per-agent memory. Main `mkdir`s it at spawn. Built with the harness home's
+ *  own path separator so the displayed/sandboxed path stays consistent on Windows. */
+function godWorkspace(harnessHome: string): string {
+  const sep = harnessHome.includes('\\') ? '\\' : '/';
+  return `${harnessHome.replace(/[\\/]+$/, '')}${sep}workspace`;
+}
 
 // How long to let Claude Code's TUI finish booting before we type the first
 // thing into Michael's terminal, and how long to PAUSE after the /remote-control
@@ -29,6 +42,29 @@ const INITIAL_GOD_PROMPT = [
   '4. Skim COMMANDS.md (hive root) for the Claude Code commands you can use — and run `mempalace wake-up` for a memory digest if the CLI is available.',
   'Then begin orchestrating: triage requests, delegate work to the team, and keep everyone unblocked. You are fully autonomous — there is no approval queue, so handle tool-permission prompts in this session yourself (the human can approve them remotely from their phone).'
 ].join('\n');
+
+// A NATIVE (DeepSeek/Minimax) god has no Claude CLI — no slash commands, COMMANDS.md,
+// `claude agents`, or fleet.json CLI monitoring. It orchestrates purely through the hive
+// TOOLS, so its orientation is written for those. (Its persistent orchestrator ROLE is
+// injected host-side into the native system prompt; this is just the kickoff.)
+const INITIAL_GOD_PROMPT_NATIVE = [
+  "You're online as Michael, the orchestrator of the hive. Get oriented, then run the floor:",
+  '1. Read your own memory (hive_read_memory) and review the shared task board (hive_list_tasks).',
+  '2. Delegate work to the team with hive_send_message (to a specific desk, or "broadcast"); track it with hive_add_task.',
+  '3. Record durable decisions and context with write_memory so future-you remembers.',
+  'Orchestrate, do not implement: triage, dispatch, resolve conflicts, and keep everyone unblocked.'
+].join('\n');
+
+// The wake nudge for a NATIVE (DeepSeek/Minimax) desk that has unread inbox mail.
+// Unlike the Claude nudge it doesn't reference the inbox/.done/ filesystem convention
+// — a native desk acts through the hive TOOLS, and its end-of-turn drain delivers the
+// actual message CONTENT (hive.drainForStop). This text is just the kick that starts a
+// turn on an idle worker; sending it to a busy worker is a harmless no-op (its `send`
+// drops while running and its own drain covers the mail). The native god is woken the
+// same way so it sees its team's replies and keeps orchestrating.
+const NATIVE_INBOX_WAKE =
+  'You have new hive inbox message(s) — review and act on them now. ' +
+  'Act autonomously; only message the orchestrator (god) if you genuinely need a decision.';
 
 // Scheduled auto-compact command (from the ops standup). Queued per agent and
 // delivered when idle, so it never interrupts a working agent. The focus
@@ -95,6 +131,9 @@ const TOOL_STATION: Record<string, { station: StationKind; carry?: ToolKind }> =
   Glob: { station: 'shelf', carry: 'Glob' },
   WebFetch: { station: 'web', carry: 'WebFetch' },
   WebSearch: { station: 'web', carry: 'WebSearch' },
+  // Native (DeepSeek/Minimax) desks call the toolkit's `web_search` — walk it to the
+  // same web portal as Claude's WebSearch.
+  web_search: { station: 'web', carry: 'WebSearch' },
   TodoWrite: { station: 'board', carry: 'TodoWrite' },
   // #5A — delegating to a sub-agent reads as "handing off at the outbox".
   Task: { station: 'mailbox', carry: 'TodoWrite' }
@@ -136,6 +175,10 @@ export function useHive(config: HarnessConfig | null): void {
   const bootGraceUntil = useRef<Record<string, number>>({});
   // Reactive so the assistant bootstrap (effect #1b) re-runs once Michael is ready.
   const godStatus = useStore((s) => s.godStatus);
+  // Operator intent for the god (persisted). When 'stopped', the boot effect leaves
+  // Michael down (and the inbox-wake won't revive him); flipping it back to 'running'
+  // (the Start button) re-runs the boot effect and respawns him.
+  const godDesired = useStore((s) => s.godDesired);
   // #5C/#7C.4 — latest circuit-breaker level per agent. When 'constrained'/
   // 'stopped' the avatar is pinned to 'looping' and hook events must NOT flip it
   // back to 'working' (the flicker the spec calls out); only a genuine Stop clears it.
@@ -144,6 +187,10 @@ export function useHive(config: HarnessConfig | null): void {
   // 1) Bootstrap the god agent (source of truth = live PTYs, to dodge restarts).
   useEffect(() => {
     if (!config?.onboardingComplete || !config.harnessHome) return;
+    // Operator stopped Michael — keep him down (don't spawn, don't show the boot
+    // loader). The Start button flips godDesired to 'running', which re-runs this
+    // effect (godDesired is a dep) and respawns him.
+    if (godDesired === 'stopped') { useStore.getState().setGodStatus('stopped'); return; }
     let cancelled = false;
     const timers: ReturnType<typeof setTimeout>[] = [];
     useStore.getState().setGodStatus('booting');
@@ -161,17 +208,27 @@ export function useHive(config: HarnessConfig | null): void {
 
       const command = buildSpawnCommand(config, config.defaultModel);
       const [exe, ...args] = command.trim().split(/\s+/);
-      const res = await window.cth.spawnPty({
-        id: GOD_PTY,
-        cwd: config.harnessHome!,
-        command: exe,
-        args,
-        cols: 100,
-        rows: 30,
-        hive: { id: GOD_ID, name: 'Michael', cwd: config.harnessHome!, isGod: true, role: 'orchestrator (god)' }
-      });
+      // A native god (a non-anthropic fleet default) is routed to the native runtime and
+      // has NO real PTY. Its record therefore carries NO ptyId — otherwise the live-PTY
+      // reconcile (which drops agents whose ptyId isn't an alive PTY) would delete it on
+      // every renderer reload. The runtime kind (native trace vs Claude PTY) is derived
+      // from the model, not the ptyId.
+      const godIsNative = !!config.defaultModel && deriveProviderId(config.defaultModel) !== 'anthropic';
+      // A NATIVE god gets its OWN working directory — a sibling of the hive bookkeeping
+      // (registry.json, board.md, agents/<id>/memory.md, inboxes) — so anything it
+      // writes/builds (its tools are cwd-sandboxed) can't pollute that state. It still
+      // orchestrates through the hive TOOLS, which are host-mediated and cwd-independent.
+      // (A Claude god keeps the harness home: its orientation reads hive-root files.)
+      const godCwd = godIsNative
+        ? (config.godWorkspace?.trim() || godWorkspace(config.harnessHome!))
+        : config.harnessHome!;
+      // Seed the god's capability roles from the PERSISTED registry — the renderer rebuilds the
+      // god fresh each boot, so without this its roles reset to the default integrator+reviewer
+      // in the UI/matrix even though the registry persists the operator's choice. Undefined on a
+      // first run (no persisted god) ⇒ the default applies.
+      let godRoles: Agent['roles'];
+      try { godRoles = (await window.cth.hiveRegistry())?.agents?.[GOD_ID]?.roles; } catch { /* best-effort */ }
       if (cancelled) { godSpawning.current = false; return; }
-      if (!res.ok) { godSpawning.current = false; useStore.getState().setGodStatus('failed'); return; }
       const god: Agent = {
         id: GOD_ID,
         name: 'Michael',
@@ -180,31 +237,62 @@ export function useHive(config: HarnessConfig | null): void {
         description: 'god — runs the floor, triages requests, escalates only critical calls to you',
         project: 'hive',
         tmuxTarget: '',
-        cwd: config.harnessHome!,
+        cwd: godCwd,
         status: 'idle',
         action: 'running the floor',
         progress: 0,
         currentStation: 'desk',
-        ptyId: GOD_PTY,
+        ptyId: godIsNative ? undefined : GOD_PTY,
         command: command.trim(),
         model: config.defaultModel,
         isGod: true,
+        roles: godRoles,
         recentTextTs: Date.now()
       };
+      const res = await window.cth.spawnPty({
+        id: GOD_PTY,
+        cwd: godCwd,
+        command: exe,
+        args,
+        cols: 100,
+        rows: 30,
+        hive: { id: GOD_ID, name: 'Michael', cwd: godCwd, isGod: true, role: 'orchestrator (god)', roles: godRoles }
+      });
+      if (cancelled) { godSpawning.current = false; return; }
+      if (!res.ok) {
+        godSpawning.current = false;
+        // On a renderer reload the native god worker survives in MAIN, so the respawn
+        // reports "native worker exists" — it's already running + oriented, so RESTORE
+        // the record (refreshing model/ptyId) instead of failing, and skip the kickoff.
+        // A real failure (e.g. needs-credentials) still surfaces as 'failed'.
+        if (godIsNative && /worker exists/i.test(res.error ?? '')) {
+          useStore.getState().addAgent(god);
+          useStore.getState().setGodStatus('ready');
+        } else {
+          useStore.getState().setGodStatus('failed');
+        }
+        return;
+      }
       useStore.getState().addAgent(god);
       useStore.getState().setGodStatus('ready');
+      // Allow a later deliberate re-run (the Start button after a Stop) to spawn again;
+      // within one mount the listPtys / "worker exists" checks above still dedupe.
+      godSpawning.current = false;
 
-      // Fresh spawn → kick Michael off once his TUI is up. First enable remote
-      // control so the human can approve permission prompts from their phone
-      // (best-effort — a failed/unknown slash command just prints to his terminal
-      // and is harmless), PAUSE so it lands on its own line, then hand him the
-      // orientation prompt. Both go through the per-pty submit chain, so they're
-      // strictly sequential and can't jam together; the boot-grace window keeps
-      // the inbox-wake/drain loops off Michael until he's oriented. Restored
-      // sessions (the live-PTY branch above) skip this.
+      // Fresh spawn → kick Michael off once his runtime is up. For a CLAUDE god: enable
+      // remote control (best-effort) then hand him the orientation prompt over the PTY,
+      // strictly sequenced; the boot-grace window keeps the inbox-wake/drain loops off
+      // him until oriented. For a NATIVE god (no PTY): the Claude-only kickoff can't
+      // reach it, so drive it through the native send seam — orientation lands as the
+      // worker's first input (its orchestrator ROLE is injected host-side).
       bootGraceUntil.current[GOD_ID] = Date.now() + BOOT_GRACE_MS;
       timers.push(setTimeout(() => {
         if (cancelled) return;
+        if (godIsNative) {
+          window.cth.nativeSend(GOD_ID, { kind: 'operator', text: INITIAL_GOD_PROMPT_NATIVE })
+            .catch(() => { /* worker may not be ready/alive — best-effort */ });
+          return;
+        }
         // settleMs pauses the chain ~1.5s after /remote-control before the
         // orientation prompt is submitted next.
         submitToPty(GOD_PTY, '/remote-control', REMOTE_CONTROL_SETTLE_MS).catch(() => { /* best-effort */ });
@@ -212,7 +300,7 @@ export function useHive(config: HarnessConfig | null): void {
       }, GOD_BOOT_MS));
     }, 1200);
     return () => { cancelled = true; clearTimeout(t); timers.forEach(clearTimeout); };
-  }, [config?.onboardingComplete, config?.harnessHome]);
+  }, [config?.onboardingComplete, config?.harnessHome, config?.godWorkspace, godDesired]);
 
   // 1b) Bootstrap Michael's prep assistant ("Dwight") — only after Michael is
   //     ready, and only once. Same live-PTY idempotency + spawn-guard as #1.
@@ -349,6 +437,79 @@ export function useHive(config: HarnessConfig | null): void {
     });
   }, []);
 
+  // 2e) Drive NATIVE desk status from the live AgentEvent stream. Claude desks get
+  //     status from hook events (#2); a native desk's store status was otherwise FROZEN
+  //     (so the god read "idle" while working). turn-start → 'working'; turn-end/stop →
+  //     'idle'. Left untouched while the desk is paused, a stopped god, or breaker-armed
+  //     so those operator/guard states stick (displayStatus layers pause/stop on top).
+  //     Keyed on the native id set so it re-subscribes when desks come/go.
+  const nativeIds = useStore((s) =>
+    s.agents.filter((a) => isNativeRuntimeDesk(a, s.fleetDefaultModel)).map((a) => a.id).sort().join(',')
+  );
+  useEffect(() => {
+    if (!config?.onboardingComplete || !nativeIds) return;
+    const offs = nativeIds.split(',').map((id) =>
+      window.cth.onAgentEvent?.(id, (e) => {
+        if (e.kind !== 'turn-start' && e.kind !== 'turn-end' && e.kind !== 'stop') return;
+        const { updateAgent, agents, paused, godDesired: desired } = useStore.getState();
+        if (!agents.some((a) => a.id === id)) return;
+        if (paused[id]) return;                              // operator paused — keep it
+        if (id === GOD_ID && desired === 'stopped') return;  // stopped god stays down
+        const lvl = breakerLevel.current[id];
+        if (lvl === 'constrained' || lvl === 'stopped') return; // breaker pins 'looping'
+        updateAgent(id, e.kind === 'turn-start'
+          ? { status: 'working', action: 'working' }
+          : { status: 'idle', action: 'idle' });
+      })
+    );
+    return () => offs.forEach((off) => off?.());
+  }, [config?.onboardingComplete, nativeIds]);
+
+  // 2f) RECONCILE status against main's authoritative live state (the safety net for both
+  //     runtimes). The event paths above (#2 Claude hooks, #2e native AgentEvents) give instant
+  //     updates but a MISSED terminal event (crash / killed PTY / dropped turn-end) latches a desk
+  //     on "working". Main pushes per-desk { running, inTurn } on the fleet beat; here we correct
+  //     the working↔idle turn state: dead ⇒ idle, else working iff in a turn. We ONLY touch the
+  //     working/idle pair, never clobbering blocked/compacting/looping or the pause/stop overrides
+  //     (displayStatus layers those on top). Honors pause / stopped-god / breaker pins like #2e.
+  useEffect(() => {
+    return window.cth.onFleetState?.((state) => {
+      const { updateAgent, agents, paused, godDesired: desired, setLiveness } = useStore.getState();
+      // Mirror per-desk liveness (warm = live worker) for the warm●/cold○ dot.
+      setLiveness(Object.fromEntries(state.map((s) => [s.id, s.running])));
+      for (const s of state) {
+        const a = agents.find((x) => x.id === s.id);
+        if (!a) continue;
+        if (paused[s.id]) continue;                              // operator paused — leave it
+        if (s.id === GOD_ID && desired === 'stopped') continue;  // stopped god stays down
+        const lvl = breakerLevel.current[s.id];
+        if (lvl === 'constrained' || lvl === 'stopped') continue; // breaker pins 'looping'
+        // Surgical: only correct a stuck working/idle; never overwrite other meaningful statuses.
+        const next = reconcileTurnStatus(a.status, s.running, s.inTurn);
+        if (next) updateAgent(s.id, { status: next, action: next });
+      }
+    });
+  }, []);
+
+  // 2g) Boot floor→registry sync: a native desk the operator keeps on the floor is NOT retired,
+  //     even when its worker is currently cold (revive-on-demand). Earlier sessions wrongly
+  //     archived a native desk on EVERY worker exit, so the god's roster (built from the registry)
+  //     read still-wanted role-holders as archived/unavailable. Un-archive the floor's native
+  //     desks ONCE on boot so they show as AVAILABLE (cold); idempotent (main's setArchived no-ops
+  //     when unchanged) and LAZY (does not respawn — they wake when the god delegates to them).
+  const didUnarchiveFloor = useRef(false);
+  useEffect(() => {
+    if (!config?.onboardingComplete || didUnarchiveFloor.current) return;
+    didUnarchiveFloor.current = true;
+    const { agents, fleetDefaultModel } = useStore.getState();
+    for (const a of agents) {
+      if (a.isGod || a.isAssistant) continue;
+      if (isNativeRuntimeDesk(a, fleetDefaultModel)) {
+        void window.cth.hiveSetArchived(a.id, false).catch(() => { /* best-effort */ });
+      }
+    }
+  }, [config?.onboardingComplete]);
+
   // 2c) Context gauge backfill: poll each live agent's current context size
   //     (tokens) from its session transcript — only until the status line
   //     (effect 2d) has delivered exact numbers for that agent.
@@ -391,36 +552,69 @@ export function useHive(config: HarnessConfig | null): void {
     });
   }, []);
 
-  // 3) Wake idle agents holding unread inbox messages. The assistant is
-  //    send-only (it never receives inbox mail), so it's excluded.
+  // 3) Wake idle agents holding unread inbox messages so collaboration doesn't
+  //    stall while an agent sits at its prompt. Two runtime kinds, one dedup map:
+  //    - CLAUDE desk: nudge by typing into its PTY, gated on idle/waiting so we
+  //      never jam a busy input line.
+  //    - NATIVE desk (DeepSeek/Minimax — no PTY, INCLUDING a native god): kick its
+  //      worker via nativeSend. An idle worker turns the kick into a turn whose
+  //      end-of-turn drain delivers the message content; a BUSY worker drops the
+  //      kick (its `send` guard) and its own drain delivers the mail — so the
+  //      native path needs NO idle gate. That matters: a native desk's store
+  //      status is never updated, so it can't be trusted as an idle signal.
+  //    Without this, a native worker (or a native god) only ever drained its inbox
+  //    at the end of an active turn — an idle one never started one, so delegated
+  //    work and replies sat unread forever (god ended up doing the work himself).
+  //    The send-only assistant never receives inbox mail, so it's excluded.
   useEffect(() => {
     if (!config?.onboardingComplete) return;
+
     const iv = setInterval(async () => {
       const now = Date.now();
-      const agents = useStore.getState().agents.filter(
-        (a) => a.ptyId && !a.isAssistant && (a.status === 'idle' || a.status === 'waiting')
-          // Don't type into an agent still running its boot sequence — the nudge
-          // would collide with /remote-control + the orientation prompt.
-          && (bootGraceUntil.current[a.id] ?? 0) < now
-      );
+      const { fleetDefaultModel: fleetDefault, paused, godDesired: desired } = useStore.getState();
+      const agents = useStore.getState().agents.filter((a) => {
+        if (a.isAssistant) return false;
+        // Operator paused this desk, or stopped the god — leave it alone (and never let
+        // the native respawn-on-no-runtime resurrect a deliberately stopped god).
+        if (paused[a.id]) return false;
+        if (a.id === GOD_ID && desired === 'stopped') return false;
+        // Don't disturb an agent still running its boot sequence (the nudge would
+        // collide with /remote-control + the orientation prompt on a Claude god).
+        if ((bootGraceUntil.current[a.id] ?? 0) >= now) return false;
+        // Native desk (no PTY): no idle gate — sending to a busy worker is a no-op.
+        if (isNativeRuntimeDesk(a, fleetDefault)) return true;
+        // Claude desk: only when idle/waiting (typing into a busy TUI jams it).
+        return !!a.ptyId && (a.status === 'idle' || a.status === 'waiting');
+      });
       for (const a of agents) {
         try {
           const inbox = await window.cth.hiveInbox(a.id);
           // Dedup by the newest message id, not the count — a count can oscillate
           // as messages drain and re-arrive, which would re-nudge for the same set.
-          const newest = inbox.length
-            ? inbox.map((m) => m.id).sort().slice(-1)[0]
-            : '';
-          if (newest && nudged.current[a.id] !== newest) {
+          const newest = inbox.length ? inbox.map((m) => m.id).sort().slice(-1)[0] : '';
+          if (!newest) { nudged.current[a.id] = ''; continue; }
+          if (nudged.current[a.id] === newest) continue;
+
+          if (a.ptyId) {
+            // CLAUDE desk — type the nudge into its terminal.
             nudged.current[a.id] = newest;
             await submitToPty(
-              a.ptyId!,
+              a.ptyId,
               'You have new hive inbox message(s) — read your inbox, act on them now, and move handled ones to inbox/.done/. Act autonomously; only message god if you genuinely need a decision.'
             );
-          } else if (!newest) {
-            nudged.current[a.id] = '';
+          } else {
+            // NATIVE desk — kick its worker; the end-of-turn drain delivers content.
+            const res = await window.cth.nativeSend(a.id, { kind: 'operator', text: NATIVE_INBOX_WAKE });
+            if (res.ok) {
+              nudged.current[a.id] = newest; // delivered — don't re-kick for this set
+            } else if (/no native runtime/i.test(res.error ?? '')) {
+              // Worker is down but the mail is in its inbox — bring it back. Leave
+              // `nudged` UNSET so the next tick (worker alive + idle) sends the wake.
+              respawnNativeWorker(a, config);
+            }
+            // Other transient errors: leave nudged unset, retry next tick.
           }
-        } catch { /* ignore */ }
+        } catch { /* ignore — try again next tick */ }
       }
     }, 4000);
     return () => clearInterval(iv);
@@ -438,9 +632,10 @@ export function useHive(config: HarnessConfig | null): void {
     // gated on the target being idle + off cooldown. Keyed cooldown per target so
     // strict one-by-one delivery holds. Returns true if it dispatched.
     const dispatch = (srcId: string, target: Agent | undefined, wrap?: (t: string) => string): boolean => {
-      const { messageQueues, removeQueuedMessage } = useStore.getState();
+      const { messageQueues, removeQueuedMessage, paused } = useStore.getState();
       const next = messageQueues[srcId]?.[0];
       if (!next || !target?.ptyId || target.status !== 'idle') return false;
+      if (paused[target.id]) return false; // operator paused — hold the queue
       const now = Date.now();
       // Hold queued messages until the target finishes its boot sequence.
       if ((bootGraceUntil.current[target.id] ?? 0) >= now) return false;
@@ -523,4 +718,18 @@ export function useHive(config: HarnessConfig | null): void {
       }
     });
   }, [config?.onboardingComplete]);
+
+  // E005 {FR-013 / DR-10} — apply a GOD-forwarded assignment through the SAME
+  // agent-update path the operator uses: `reassignAgentModel` writes `model` +
+  // `assignmentSource='explicit'` and persists (survives restart). The provider was
+  // already derived + recorded main-side; the renderer only stores the model id
+  // (DR-1). The desk's PTY keeps its current `--model` until next (re)spawn — this
+  // records the assignment; live hot-swap is out of scope for E005 (CAP-019).
+  useEffect(() => {
+    return window.cth.agent.onAgentAssign(({ agentId, modelId }) => {
+      const { agents, reassignAgentModel } = useStore.getState();
+      if (!agents.some((a) => a.id === agentId)) return;
+      reassignAgentModel(agentId, modelId);
+    });
+  }, []);
 }

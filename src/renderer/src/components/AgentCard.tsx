@@ -22,6 +22,17 @@ export interface AgentCardProps {
   isGod?: boolean;
   /** The prep assistant. Same size as every other card (no special sizing). */
   isAssistant?: boolean;
+  /** This desk is running with settings that changed since it spawned ([[restartSig]]) —
+   *  shows a ⟳ marker that restarts the desk on click (applies the change). */
+  needsRestart?: boolean;
+  /** Tooltip for the ⟳ marker (which settings changed). */
+  needsRestartReason?: string;
+  /** Restart just this desk (re-injects its prompt with the current settings). */
+  onRestart?: () => void;
+  /** Liveness (warm/cold) for the dot beside the badge: true = a live worker (warm); false =
+   *  on the floor with no live worker (cold — parked, wakes on delegation); undefined = unknown
+   *  yet (no fleet tick) → no dot. Distinct from `status` (what it's doing). */
+  warm?: boolean;
   onClick?: () => void;
 }
 
@@ -29,7 +40,7 @@ const fmtK = (n: number): string => `${Math.round(n / 1000)}k`;
 
 export function AgentCard({
   name, character, accent, status, project, action, progress = 0,
-  contextTokens, contextLimit, selected, isGod, onClick
+  contextTokens, contextLimit, selected, isGod, needsRestart, needsRestartReason, onRestart, warm, onClick
 }: AgentCardProps) {
   // The god is always framed (stands out from the row); others only when selected.
   const framed = isGod || selected;
@@ -70,7 +81,37 @@ export function AgentCard({
                 overflow: 'hidden',
                 textOverflow: 'ellipsis'
               }}>{name.toUpperCase()}</span>
-              <PixelBadge status={status} />
+              <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexShrink: 0 }}>
+                {/* Liveness dot: ● warm (live worker) vs ○ cold (parked — wakes on delegation).
+                    Hidden until liveness is known (no fleet tick yet). */}
+                {warm !== undefined && (
+                  <span
+                    title={warm
+                      ? 'warm — a live worker is running'
+                      : 'cold — no live worker; wakes when delegated to (revive-on-demand)'}
+                    style={{
+                      width: 8, height: 8, borderRadius: '50%', flexShrink: 0,
+                      background: warm ? 'var(--cth-mint)' : 'transparent',
+                      boxShadow: `inset 0 0 0 ${warm ? 1 : 1.5}px ${warm ? 'var(--cth-ink-900)' : 'var(--cth-ink-500)'}`
+                    }}
+                  />
+                )}
+                {needsRestart && (
+                  <span
+                    role="button"
+                    tabIndex={-1}
+                    title={needsRestartReason ?? 'Settings changed since this desk spawned — click to restart and apply'}
+                    onClick={(e) => { e.stopPropagation(); onRestart?.(); }}
+                    style={{
+                      display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                      minWidth: 16, height: 16, padding: '0 4px', cursor: 'pointer',
+                      background: 'var(--cth-coral-light)', boxShadow: 'inset 0 0 0 1px var(--cth-coral)',
+                      fontSize: 10, lineHeight: '16px', color: 'var(--cth-ink-900)'
+                    }}
+                  >⟳</span>
+                )}
+                <PixelBadge status={status} />
+              </div>
             </div>
 
             <div style={{

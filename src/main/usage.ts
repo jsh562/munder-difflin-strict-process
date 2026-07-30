@@ -47,9 +47,12 @@ export interface AgentUsageSample {
   cacheCreation: number;
   /** Normalized base model id (no `[1m]` suffix), or null if unknown. */
   model: string | null;
-  /** Claude-precomputed cost (live path) / transcript-fallback estimate (interim).
-   *  Never recomputed by a consumer. */
-  usd: number;
+  /** Registry-computed cost (the single seam source). `null` = UNPRICED — the
+   *  model id is unknown to the price registry, so no price is billed and the
+   *  parity warning is the flag (FR-006/FR-014). A `null` `usd` MUST be excluded
+   *  from billed totals by every consumer — never read as 0. Never recomputed
+   *  downstream (FR-002). */
+  usd: number | null;
 }
 
 /** The seam both backends implement. */

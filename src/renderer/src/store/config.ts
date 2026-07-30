@@ -15,6 +15,13 @@ export interface ScheduledMission {
   quietThresholdMs?: number;
 }
 
+/** One token-templated per-desk env var (mirrors src/shared/deskEnv.ts DeskEnvEntry).
+ *  Structurally identical to the shared type, so values flow between them without conversion. */
+export interface DeskEnvEntry {
+  name: string;
+  value: string;
+}
+
 /** Circuit-breaker thresholds (mirrors src/main/config.ts CircuitBreakerConfig). */
 export interface CircuitBreakerConfig {
   enabled?: boolean;
@@ -27,6 +34,20 @@ export interface CircuitBreakerConfig {
 export interface HarnessConfig {
   onboardingComplete: boolean;
   harnessHome: string | null;
+  /** Optional working directory for a native god (else `<harnessHome>/workspace`). */
+  godWorkspace?: string;
+  /** Single root for all desks' redirected build output (else `<harnessHome>/build-cache`). */
+  buildCacheDir?: string;
+  /** Token-templated per-desk env vars (GLOBAL base; else the built-in CARGO_TARGET_DIR default). */
+  deskEnv?: DeskEnvEntry[];
+  /** Per-repo env overrides (keyed by repo path) layered on the global `deskEnv`. */
+  deskEnvByRepo?: Record<string, DeskEnvEntry[]>;
+  /** Per-agent env overrides (keyed by agent id) layered on global + per-repo. */
+  deskEnvByAgent?: Record<string, DeskEnvEntry[]>;
+  /** Runtime env (global) — proxy / custom CA for the agent's own model + network calls. */
+  runtimeEnv?: DeskEnvEntry[];
+  /** Secret-vault NAMES from `config:get` (values never cross the bridge). */
+  secretNames?: string[];
   registeredRepos: string[];
   autoMode: boolean;
   defaultCommand: string;
