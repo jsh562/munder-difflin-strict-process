@@ -1,5 +1,6 @@
 packages/agent-core/
 packages/
+sddp27/
 node_modules/
 node_modules
 out/
@@ -21,3 +22,5 @@ build/AuthKey_*.p8
 
 # heavy hero source — only the compressed hero.mp4/.webm are deployed
 docs/media/*.mov
+
+munder-difflin 2026-07-21/
